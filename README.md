@@ -34,8 +34,8 @@ To get started, you will also need:
 ## Basic drive mount using ATABoy
 
 1. Connect the IDE ribbon cable to the drive and ATAboy (Note Pin 1 orientation, usually marked by a stripe on the cable)
-2. Power the drive using external supply
-3. Connect ATAboy to your computer via USB
+2. Connect ATAboy to your computer via USB
+3. Power the drive using external supply
 4. Connect to serial console with terminal of choice ([PuTTY](https://www.chiark.greenend.org.uk/~sgtatham/putty/latest.html) shown).  9600 8N1, no flow control.  You should see an Award BIOS "inspired" text-based UI appear in the terminal.
 5. Enter the "Auto Detect & Set Geometry" menu
 6. Choose default, or enter geometry manually if needed
