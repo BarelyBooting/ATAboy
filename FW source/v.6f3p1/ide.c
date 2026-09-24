@@ -1015,7 +1015,7 @@ int ide_manual_chs(uint8_t heads, uint8_t spt, uint8_t *status) {
     // nothing is written to a busy master. FFh: no device 0 (for a slave,
     // go on and look at it).
     uint32_t t0 = ms_now();
-    while (((st = ide_read_reg(7)) & 0x80) && st != 0xFF) {
+    while ((st = ide_read_reg(7)) != 0xFF && (st & 0x80)) {
         if (ms_passed(t0, IDE_MCHS_READY_MS)) { *status = st; return IDE_MCHS_BUSY; }
         busy_wait_us_32(10);
     }

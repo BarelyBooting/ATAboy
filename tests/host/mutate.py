@@ -579,6 +579,8 @@ MUTANTS = [
      '        if (!(st & 0x80) && (st & 0x40)) break;\n        if (ms_passed(t0, IDE_MCHS_READY_MS)) { *status = st; return IDE_MCHS_BUSY; }'),
     ('ide mchs: the probe\'s 10 s for spin-up (the CP3044 may take 40)', 'ide.h',
      '#define IDE_MCHS_READY_MS   45000', '#define IDE_MCHS_READY_MS   10000'),
+    ('ide mchs: a slave waits 45 s on an absent master (FFh on device 0)', 'ide.c',
+     '    while ((st = ide_read_reg(7)) != 0xFF && (st & 0x80)) {', '    while ((st = ide_read_reg(7)) & 0x80) {'),
     ('ide mchs: FFh taken as a busy drive', 'ide.c',
      '        if (st == 0xFF) { *status = st; return IDE_MCHS_NO_DEVICE; }\n', ''),
     ('ide mchs: a stale ERR is 0x91\'s answer (no started rule)', 'ide.c',
