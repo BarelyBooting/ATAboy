@@ -24,6 +24,38 @@ static uint64_t total_sectors(void) {
 }
 
 // ---------------------------------------------------------------------------
+//  Busy flag for core 1 (review finding L3)
+// ---------------------------------------------------------------------------
+// True while an MSC callback that may use the IDE bus is running: READ(10),
+// WRITE(10), and ATA PASS-THROUGH through the SCSI callback. They run on
+// core 0 inside tud_task(). Unmounting (is_mounted = false, on core 1) stops
+// new commands from reaching the drive, but not one already running, which
+// can take ~41 s on a failing sector. Core 1 checks this before it reboots
+// into the ROM bootloader (menus.c, firmware update).
+//
+// Core 0 sets the flag and then reads is_mounted; core 1 clears is_mounted
+// and then reads the flag. A full barrier sits between the write and the
+// read on each side, so at least one core sees the other's write: either
+// core 1 sees the flag and waits, or the callback sees "not mounted" and
+// never touches the drive.
+static volatile bool msc_ide_busy = false;
+
+bool usb_msc_ide_busy(void) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);    // after the caller's is_mounted = false
+    return msc_ide_busy;
+}
+
+static void msc_busy_begin(void) {
+    msc_ide_busy = true;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);    // before the callback reads is_mounted
+}
+
+static void msc_busy_end(void) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);    // after the callback's last bus access
+    msc_ide_busy = false;
+}
+
+// ---------------------------------------------------------------------------
 //  MSC Required Callbacks
 // ---------------------------------------------------------------------------
 
@@ -70,8 +102,8 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition,
 //  READ10 — block transfer with partial first/last sector handling
 // ---------------------------------------------------------------------------
 
-int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
-                          void *buffer, uint32_t bufsize) {
+static int32_t read10(uint8_t lun, uint32_t lba, uint32_t offset,
+                      void *buffer, uint32_t bufsize) {
     (void)lun;
 #if ATABOY_SAT
     sat_sense_forget();     // this command may set sense of its own
@@ -160,12 +192,20 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     return (int32_t)bufsize;
 }
 
+int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
+                          void *buffer, uint32_t bufsize) {
+    msc_busy_begin();
+    int32_t r = read10(lun, lba, offset, buffer, bufsize);
+    msc_busy_end();
+    return r;
+}
+
 // ---------------------------------------------------------------------------
 //  WRITE10 — block transfer with partial first/last read-modify-write
 // ---------------------------------------------------------------------------
 
-int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
-                           uint8_t *buffer, uint32_t bufsize) {
+static int32_t write10(uint8_t lun, uint32_t lba, uint32_t offset,
+                       uint8_t *buffer, uint32_t bufsize) {
     (void)lun;
 #if ATABOY_SAT
     sat_sense_forget();     // this command may set sense of its own
@@ -233,6 +273,14 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     }
 
     return (int32_t)bufsize;
+}
+
+int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
+                           uint8_t *buffer, uint32_t bufsize) {
+    msc_busy_begin();
+    int32_t r = write10(lun, lba, offset, buffer, bufsize);
+    msc_busy_end();
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +357,12 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
 #if ATABOY_SAT
     case 0xA1:  // ATA PASS-THROUGH (12)
     case 0x85:  // ATA PASS-THROUGH (16)
-        return sat_scsi(lun, scsi_cmd, buffer, host_bufsize);
+    {
+        msc_busy_begin();
+        int32_t r = sat_scsi(lun, scsi_cmd, buffer, host_bufsize);
+        msc_busy_end();
+        return r;
+    }
 #endif
 
     default:

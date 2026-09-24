@@ -126,6 +126,10 @@ struct SimDrive {
     int data_reads = 0;                     // data register reads, any phase
     int hob_selects = 0;                    // Device Control writes with HOB set
     std::map<uint8_t, int> cmd_count;
+    // Set by a test: called at every command; each command sent while it
+    // returns false is counted.
+    bool   (*busy_probe)() = nullptr;
+    int      cmds_while_not_busy = 0;
 
     static uint8_t pattern(uint32_t lba, int i) {
         uint32_t x = lba * 2654435761u + (uint32_t)i * 40503u + 0x9E37u;
@@ -320,6 +324,7 @@ struct SimDrive {
 
     void command(uint8_t c, uint64_t now) {
         commands++; cmd_count[c]++;
+        if (busy_probe && !busy_probe()) cmds_while_not_busy++;
         if (status & 0x88) violations++;       // command written while BSY or DRQ
         status_at_cmd = status; cmd_at = now;
         intrq = false;                         // writing the command register releases INTRQ

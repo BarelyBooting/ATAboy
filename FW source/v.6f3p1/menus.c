@@ -12,6 +12,7 @@
 #include "pico/bootrom.h"
 #include "ide.h"
 #include "config.h"
+#include "fwupdate.h"
 #include "pico/util/queue.h"
 
 // ---------------------------------------------------------------------------
@@ -23,6 +24,7 @@ extern queue_t cdc_rx_queue;
 extern volatile bool cdc_connected;
 extern volatile bool is_mounted;
 extern volatile bool media_changed_waiting;
+extern bool usb_msc_ide_busy(void);     // usb.c: an MSC command is using the IDE bus
 
 static void cdc_putchar(char c) {
     queue_add_blocking(&cdc_tx_queue, &c);
@@ -344,9 +346,9 @@ static void update_main_menu(void) {
 
     cdc_printf("\033[19;3H ESC: Quit to Main Menu                         "
                BOX_ARRU " " BOX_ARRD " " BOX_ARRR " " BOX_ARRL ": Select Item");
-    // B (firmware update) only works with nothing mounted, so only offer it then.
+    // Ctrl+F (firmware update) only works with nothing mounted, so only offer it then.
     cdc_puts(is_mounted ? "\033[20;3H F10: Save Current Setup to EEPROM               Enter: Select"
-                        : "\033[20;3H F10: Save Current Setup to EEPROM   B: Firmware Update   Enter: Select");
+                        : "\033[20;3H F10: Save Current Setup to EEPROM  Ctrl+F: Firmware Update  Enter: Select");
 
     draw_hdd_status();
 }
@@ -821,6 +823,46 @@ static void try_auto_mount(void) {
 }
 
 // ---------------------------------------------------------------------------
+//  Firmware update mode (decisions in fwupdate.h)
+// ---------------------------------------------------------------------------
+
+// Ctrl+F on the main menu with nothing mounted opens the prompt. True if it did.
+static bool fwupdate_key(int k) {
+    if (!fwupdate_key_opens_prompt(current_screen == SCREEN_MAIN, is_mounted, k)) return false;
+    current_screen = SCREEN_CONFIRM;
+    confirm_type = 5;
+    return true;
+}
+
+// Y at the prompt: reboot into the RP2350 ROM bootloader (USB drive and
+// picotool, the mode BOOTSEL gives), or come back with a message saying why
+// not. A USB command that started before the drive was unmounted may still
+// be running on core 0; wait for it, up to FWUPDATE_WAIT_MS, Esc cancels.
+static void fwupdate_confirmed(void) {
+    uint32_t t0 = to_ms_since_boot(get_absolute_time());
+    bool told = false;
+    for (;;) {
+        uint32_t waited = to_ms_since_boot(get_absolute_time()) - t0;
+        fwupdate_step_t step = fwupdate_step(is_mounted, usb_msc_ide_busy(), waited);
+        if (step == FWUPDATE_GO) {
+            cdc_puts("\033[2J\033[1;1H" RESET "Rebooting into firmware update mode...\r\n");
+            sleep_ms(300);                  // let core 0 send it before the reset
+            reset_usb_boot(0, 0);           // does not return
+            return;
+        }
+        if (step == FWUPDATE_WAIT) {
+            if (!told) { draw_confirm_box("Waiting for a USB command to finish (Esc: cancel)"); told = true; }
+            if (cdc_getchar_timeout_us(20000) == KEY_ESC) return;
+            continue;
+        }
+        draw_confirm_box(step == FWUPDATE_REFUSE_MOUNTED ? "Drive mounted, update not started. Press a key"
+                                                         : "USB still busy, update not started. Press a key");
+        while (get_input() == -1) tight_loop_contents();
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  Core 1 entry point
 // ---------------------------------------------------------------------------
 
@@ -975,15 +1017,10 @@ void core1_entry(void) {
                 else if (confirm_type == 3) { is_mounted = true; media_changed_waiting = true; current_screen = SCREEN_MOUNTED; }
                 else if (confirm_type == 4) { is_mounted = false; media_changed_waiting = true; current_screen = SCREEN_MAIN; }
                 else if (confirm_type == 5) {
-                    // Reboot into the RP2350 ROM bootloader (USB drive + picotool),
-                    // so new firmware can be loaded without holding BOOTSEL. Only
-                    // reachable from the main menu with nothing mounted; checked
-                    // again here in case that changed while the prompt was up.
-                    if (!is_mounted) {
-                        cdc_puts("\033[2J\033[1;1H" RESET "Rebooting into firmware update mode...\r\n");
-                        sleep_ms(300);                  // let core 0 send it before the reset
-                        reset_usb_boot(0, 0);           // does not return
-                    }
+                    // Reboot into the ROM bootloader, so new firmware can be
+                    // loaded without holding BOOTSEL. Mounted state and any
+                    // USB command still running are checked again here.
+                    fwupdate_confirmed();
                     current_screen = SCREEN_MAIN;
                 }
                 needs_full_redraw = true;
@@ -996,11 +1033,9 @@ void core1_entry(void) {
         }
 
         if (k == KEY_F10) { confirm_return_screen = current_screen; current_screen = SCREEN_CONFIRM; confirm_type = 1; trigger_overlay = true; needs_full_redraw = true; continue; }
-        // B on the main menu, nothing mounted: ask before rebooting into the
-        // ROM bootloader for a firmware update.
-        if (current_screen == SCREEN_MAIN && !is_mounted && (k == 'b' || k == 'B')) {
-            current_screen = SCREEN_CONFIRM; confirm_type = 5; trigger_overlay = true; needs_full_redraw = true; continue;
-        }
+        // Ctrl+F on the main menu, nothing mounted: ask before rebooting into
+        // the ROM bootloader for a firmware update.
+        if (fwupdate_key(k)) { trigger_overlay = true; needs_full_redraw = true; continue; }
 
         if (current_screen == SCREEN_MAIN) {
             if (k == KEY_UP) {

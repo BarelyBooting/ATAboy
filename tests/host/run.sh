@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build and run the host tests against the firmware sources.
+# Build and run the host tests against the firmware sources: test_read (ide.c,
+# usb.c, sat.c against the simulated drive), then test_fwupdate (menus.c).
 #   tests/host/run.sh [firmware source dir]
 # CXX picks the compiler (default g++). Any C++17 compiler should do.
 set -e
@@ -17,3 +18,9 @@ ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function $defs \
     -I "$here/mock" -I "$here" -I "$src" \
     -o "$out/test_read" "$here/test_read.cpp"
 "$out/test_read"
+# Firmware update mode: fwupdate.h and menus.c (see test_fwupdate.cpp).
+# (menus.c's upstream debug code puts two ifs on a line; that warning is off.)
+${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation $defs \
+    -I "$here/mock" -I "$here" -I "$src" \
+    -o "$out/test_fwupdate" "$here/test_fwupdate.cpp"
+"$out/test_fwupdate"

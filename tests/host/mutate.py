@@ -230,19 +230,60 @@ MUTANTS = [
      '#endif\n    if (!is_mounted || config.drive_write_protected) return -1;'),
     ('SAT: HOB bytes read with HOB clear', 'ide.c',
      '        ide_write_control(0x80);\n        r->hob_count', '        ide_write_control(0x00);\n        r->hob_count'),
+    # --- M3, L1, L3: firmware update mode (fwupdate.h, menus.c, usb.c) ---
+    ('update key opens the prompt on any screen', 'fwupdate.h',
+     'return on_main_menu && !mounted && key == FWUPDATE_KEY;', 'return !mounted && key == FWUPDATE_KEY;'),
+    ('update key opens the prompt while mounted (review M3)', 'fwupdate.h',
+     'return on_main_menu && !mounted && key == FWUPDATE_KEY;', 'return on_main_menu && key == FWUPDATE_KEY;'),
+    ('update key back to B, which a split Down arrow gives (review L1)', 'fwupdate.h',
+     '#define FWUPDATE_KEY        0x06', "#define FWUPDATE_KEY        'B'"),
+    ('Y reboots while a drive is mounted (review M3)', 'fwupdate.h',
+     '    if (mounted) return FWUPDATE_REFUSE_MOUNTED;\n', ''),
+    ('Y reboots while a USB command is running (review L3)', 'fwupdate.h',
+     '    if (!usb_busy) return FWUPDATE_GO;\n    return waited_ms', '    return FWUPDATE_GO;\n    return waited_ms'),
+    ('Y waits for ever on a USB command that never ends', 'fwupdate.h',
+     'return waited_ms < FWUPDATE_WAIT_MS ? FWUPDATE_WAIT : FWUPDATE_REFUSE_BUSY;', 'return FWUPDATE_WAIT;'),
+    ('menus: update key taken on every screen', 'menus.c',
+     'fwupdate_key_opens_prompt(current_screen == SCREEN_MAIN, is_mounted, k)', 'fwupdate_key_opens_prompt(true, is_mounted, k)'),
+    ('menus: update key taken as if nothing were mounted (review M3)', 'menus.c',
+     'fwupdate_key_opens_prompt(current_screen == SCREEN_MAIN, is_mounted, k)', 'fwupdate_key_opens_prompt(current_screen == SCREEN_MAIN, false, k)'),
+    ('menus: the update prompt never opens', 'menus.c',
+     '    current_screen = SCREEN_CONFIRM;\n    confirm_type = 5;\n    return true;', '    confirm_type = 5;\n    return true;'),
+    ('menus: Y does not check mounted again (review M3)', 'menus.c',
+     'fwupdate_step(is_mounted, usb_msc_ide_busy(), waited)', 'fwupdate_step(false, usb_msc_ide_busy(), waited)'),
+    ('menus: Y ignores a running USB command (review L3)', 'menus.c',
+     'fwupdate_step(is_mounted, usb_msc_ide_busy(), waited)', 'fwupdate_step(is_mounted, false, waited)'),
+    ('menus: help row offers the old key', 'menus.c',
+     'Ctrl+F: Firmware Update', 'B: Firmware Update'),
+    ('usb: READ(10) not marked busy (review L3)', 'usb.c',
+     '    msc_busy_begin();\n    int32_t r = read10(', '    int32_t r = read10('),
+    ('usb: WRITE(10) not marked busy (review L3)', 'usb.c',
+     '    msc_busy_begin();\n    int32_t r = write10(', '    int32_t r = write10('),
+    ('usb: SAT pass-through not marked busy (review L3)', 'usb.c',
+     '        msc_busy_begin();\n        int32_t r = sat_scsi(', '        int32_t r = sat_scsi('),
+    ('usb: busy flag never cleared', 'usb.c',
+     '    msc_ide_busy = false;\n}', '}'),
 ]
+
+
+# run.sh builds and runs these in order, each ending with "N checks, M failed".
+PROGRAMS = ['test_read', 'test_fwupdate']
 
 
 def run_tests(srcdir, outdir):
     env = dict(os.environ, OUT=outdir)
-    p = subprocess.run(['sh', os.path.join(HERE, 'run.sh'), srcdir], env=env,
-                       capture_output=True, text=True)
-    return p
+    try:
+        return subprocess.run(['sh', os.path.join(HERE, 'run.sh'), srcdir], env=env,
+                              capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        return None
 
 
 def main():
     base = run_tests(SRC, tempfile.mkdtemp(prefix='ataboy-host-'))
-    last = base.stdout.strip().splitlines()[-1] if base.stdout.strip() else base.stderr[-500:]
+    if base is None:
+        print('the unmutated sources timed out'); return 2
+    last = ' / '.join(l for l in base.stdout.splitlines() if 'checks,' in l) or base.stderr[-500:]
     print(f'unmutated: rc={base.returncode}  {last}')
     if base.returncode != 0:
         print('the unmutated sources must pass first'); return 2
@@ -260,17 +301,31 @@ def main():
             print(f'NOT APPLIED  {name}'); continue
         open(path, 'wb').write(text.replace(old, new).encode('utf-8'))
         p = run_tests(src, os.path.join(tmp, 'out'))
-        out = p.stdout.strip().splitlines()
-        summary = out[-1] if out else ''
-        built = any(os.path.exists(os.path.join(tmp, 'out', 'test_read' + x)) for x in ('', '.exe'))
-        if 'checks,' not in summary and built and p.returncode != 0:
-            # Built, then crashed before its summary (a segfault, say). The
-            # tests caught it, just not gracefully: counts as killed.
+        if p is None:
+            # A test that never finishes did not pass: the mutant is caught.
             killed.append(name)
-            print(f'KILLED       {name}\n             crashed: {(p.stderr.strip().splitlines() or ["?"])[-1][:150]}')
+            print(f'KILLED       {name}\n             timed out after 900 s')
             shutil.rmtree(tmp, ignore_errors=True); continue
-        if 'checks,' not in summary:
-            bad_setup.append((name, 'did not build or run: ' + (p.stderr.strip().splitlines() or ['?'])[-1]))
+        out = p.stdout.strip().splitlines()
+        sums = [l for l in out if 'checks,' in l]
+        summary = ' / '.join(sums)
+        reported_failure = any(not l.endswith(' 0 failed') for l in sums)
+        if p.returncode != 0 and not reported_failure:
+            # run.sh stopped before every program reported. If the next one
+            # was built, it crashed before its summary (a segfault, say): the
+            # tests caught it, just not gracefully, so it counts as killed.
+            # If it was not built, the mutant broke the build: not run.
+            nxt = PROGRAMS[len(sums)] if len(sums) < len(PROGRAMS) else None
+            built = nxt and any(os.path.exists(os.path.join(tmp, 'out', nxt + x)) for x in ('', '.exe'))
+            if built:
+                killed.append(name)
+                print(f'KILLED       {name}\n             {nxt} crashed: {(p.stderr.strip().splitlines() or ["?"])[-1][:150]}')
+            else:
+                bad_setup.append((name, 'did not build: ' + (p.stderr.strip().splitlines() or ['?'])[-1]))
+                print(f'NO RESULT    {name}')
+            shutil.rmtree(tmp, ignore_errors=True); continue
+        if p.returncode == 0 and len(sums) != len(PROGRAMS):
+            bad_setup.append((name, f'{len(sums)} of {len(PROGRAMS)} test programs reported'))
             print(f'NO RESULT    {name}'); continue
         if p.returncode != 0:
             killed.append(name)

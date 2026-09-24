@@ -633,6 +633,44 @@ static void test_slave_with_master_after_reset(Mode m) {
     CHECK(g2.ok && matches_medium(g2, 200) && sim.violations == 0, "slave usable at the end, violations %d", sim.violations);
 }
 
+// Review finding L3: while an MSC callback is using the drive, usb.c says so
+// (usb_msc_ide_busy, which firmware update mode waits on), and it stops
+// saying so when the callback returns. Every command the drive gets from a
+// callback must come while the flag is set.
+static void test_msc_busy_flag() {
+    setup("MSC busy flag (firmware update waits on it)", LBA);
+    config.drive_write_protected = false;
+    sim.busy_probe = [] { return usb_msc_ide_busy(); };
+    CHECK(!usb_msc_ide_busy(), "busy before any command");
+    int c0 = sim.commands;
+    HostRead h = host_read10(100, 16);
+    CHECK(h.ok && !usb_msc_ide_busy(), "after READ(10): ok %d", h.ok);
+    std::vector<uint8_t> w(4096, 0x3C);
+    int32_t r = tud_msc_write10_cb(0, 500, 0, w.data(), 4096);
+    CHECK(r == 4096 && !usb_msc_ide_busy(), "after WRITE(10): r %d", r);
+    sim.bad[700] = {BAD_ERR, 0};
+    h = host_read10(700, 1);
+    CHECK(!h.ok && !usb_msc_ide_busy(), "after a failed READ(10)");
+    request_sense(18);                              // the host's auto-sense for that failure
+    sim.bad.clear();
+#if ATABOY_SAT
+    SatResult s = sat_cmd(pt12(4, 0x0E, 0, 2, 100, 0xE0, 0x20), 1024, true);
+    CHECK(s.r == 1024 && !usb_msc_ide_busy(), "after a SAT read: r %d", s.r);
+    s = sat_cmd(smart_status12(), 0, false);
+    CHECK(is_desc(s.sense) && !usb_msc_ide_busy(), "after a SAT non-data command");
+#endif
+    CHECK(sim.commands >= c0 + 3 && sim.cmds_while_not_busy == 0, "%d commands, %d of them with the flag clear",
+          sim.commands - c0, sim.cmds_while_not_busy);
+    sim.busy_probe = nullptr;
+    // Unmounted: the callbacks refuse without touching the drive.
+    is_mounted = false;
+    c0 = sim.commands;
+    h = host_read10(100, 8);
+    r = tud_msc_write10_cb(0, 500, 0, w.data(), 4096);
+    CHECK(!h.ok && r < 0 && sim.commands == c0 && !usb_msc_ide_busy(), "unmounted: commands %d", sim.commands - c0);
+    is_mounted = true;
+}
+
 #if ATABOY_SAT
 static const char *mode_name(Mode m) { return m == LBA ? "LBA" : "CHS"; }
 static std::string name2(const char *what, Mode m) { return std::string(what) + ", " + mode_name(m); }
@@ -1337,6 +1375,7 @@ int main() {
     test_slave_with_master_after_reset(LBA);
     test_slave_with_master_after_reset(CHS);
     test_host_offsets();
+    test_msc_busy_flag();
 #if ATABOY_SAT
     test_sat_smart_status(LBA);
     test_sat_smart_status(CHS);
