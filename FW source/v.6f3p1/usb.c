@@ -205,6 +205,13 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
 
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
                         void *buffer, uint16_t bufsize) {
+    // TinyUSB as shipped in pico-sdk 2.2.0 passes the HOST's requested
+    // transfer length here, not the size of `buffer` (CFG_TUD_MSC_EP_BUFSIZE).
+    // MODE SENSE(10) below memsets `bufsize` bytes, so a request longer than
+    // the buffer overwrote RAM past it - TinyUSB's own USB state, is_mounted,
+    // the current geometry. Newer TinyUSB clamps this; clamp here as well so
+    // the firmware is safe whichever TinyUSB it is built against.
+    if (bufsize > CFG_TUD_MSC_EP_BUFSIZE) bufsize = CFG_TUD_MSC_EP_BUFSIZE;
     uint8_t opcode = scsi_cmd[0];
     uint8_t *buf = (uint8_t *)buffer;
 
