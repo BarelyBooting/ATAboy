@@ -281,12 +281,81 @@ void ide_drain_sector(void) {
 }
 
 // ---------------------------------------------------------------------------
+//  Failure record and recovery for sector I/O
+// ---------------------------------------------------------------------------
+
+static ide_fail_t last_fail;
+
+void ide_last_failure(ide_fail_t *out) { *out = last_fail; }
+
+// Keep what the drive reported for a failed command. Must run before any
+// drain or reset, since both change the registers.
+static void record_failure(uint8_t kind, uint8_t cmd, uint8_t st,
+                           uint32_t lba, uint32_t done, uint32_t count) {
+    last_fail.kind    = kind;
+    last_fail.command = cmd;
+    last_fail.status  = st;
+    last_fail.error   = ide_read_reg(1);
+    for (int i = 0; i < 5; i++) last_fail.tf[i] = ide_read_reg(2 + i);
+    last_fail.drained = false;
+    last_fail.reset   = false;
+    last_fail.lba     = lba;
+    last_fail.done    = done;
+    last_fail.count   = count;
+}
+
+// Soft reset, for a drive that is stuck or did not end the command cleanly.
+static void soft_reset_restore(void) {
+    ide_write_control(0x04);
+    busy_wait_us_32(10);
+    ide_write_control(0x00);
+    ide_wait_until_ready(2000);
+    // SRST clears INITIALIZE DRIVE PARAMETERS, so restore CHS geometry
+    if (!config.use_lba_mode)
+        ide_set_geometry(config.heads, config.spt);
+    last_fail.reset = true;
+}
+
+// After a command ends with ERR the drive should be idle again: BSY=0,
+// DRQ=0, DRDY=1. True if it gets there within timeout_ms.
+static bool idle_after_error(uint32_t timeout_ms) {
+    uint32_t start = to_ms_since_boot(get_absolute_time());
+    while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
+        uint8_t st = ide_read_reg(7);
+        if (!(st & 0x80) && !(st & 0x08) && (st & 0x40)) return true;
+        busy_wait_us_32(10);
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 //  Sector I/O — LBA28, single-sector loop
 // ---------------------------------------------------------------------------
 
 int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
+    return ide_read_sectors_partial(lba, count, buf, 0);
+}
+
+// Reads count sectors into buf. On failure, *done (if not null) is the number
+// of sectors already in buf, which are good data from the drive; the failing
+// sector and anything after it are never written to buf.
+//
+// Error handling (issue #13): an ERR from the drive means it has finished the
+// command, so no reset is needed. If it offers data for the bad sector along
+// with ERR (older drives put the flawed data in the buffer), that data is
+// drained and thrown away. A soft reset is only used when the drive does not
+// end the command (timeout) or is not idle afterwards.
+int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
+                                 uint32_t *done) {
+    uint32_t s = 0;
+    uint8_t st = 0;
+    uint8_t cmd = 0;
+    if (done) *done = 0;
     if (count == 0) return -1;
-    if (!ide_wait_until_ready(5000)) return -1;
+    if (!ide_wait_until_ready(5000)) {
+        record_failure(IDE_FAIL_NOT_READY, 0, ide_read_reg(7), lba, 0, count);
+        return -1;
+    }
 
     bool use_lba48 = config.use_lba_mode && (config.lba_sectors > 0x0FFFFFFF);
 
@@ -321,16 +390,17 @@ int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
         ide_write_reg(6, dev_base | (head & 0x0F));
     }
 
-    ide_write_reg(7, use_lba48 ? 0x24 : 0x20);            // READ SECTORS EXT / READ SECTORS
+    cmd = use_lba48 ? 0x24 : 0x20;
+    ide_write_reg(7, cmd);                                 // READ SECTORS EXT / READ SECTORS
     wait_after_command();
 
     uint16_t *wbuf = (uint16_t *)buf;
 
-    for (uint32_t s = 0; s < count; s++) {
+    for (s = 0; s < count; s++) {
         // Poll for DRQ — INTRQ provides early-exit if enabled, otherwise pure polling
         for (uint32_t t = 0; t < 100000; t++) {
             if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
-            uint8_t st = ide_read_reg(7);
+            st = ide_read_reg(7);
             // While BSY is set the other status bits are not valid (ATA), so a
             // leftover ERR must not end a command the drive is still working on.
             if (st & 0x80) { busy_wait_us_32(10); continue; }
@@ -338,7 +408,7 @@ int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
             if (st & 0x08) goto drq_read;
             busy_wait_us_32(10);
         }
-        goto read_err;
+        goto read_timeout;
 
     drq_read:
         set_address(0);
@@ -351,23 +421,39 @@ int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
         bus_idle();
     }
 
+    if (done) *done = count;
     return (int32_t)(count * 512);
 
 read_err:
-    // Soft-reset to abort any stuck command (drive may be retrying internally)
-    ide_write_control(0x04);
-    busy_wait_us_32(10);
-    ide_write_control(0x00);
-    ide_wait_until_ready(2000);
-    // SRST clears INITIALIZE DRIVE PARAMETERS — restore CHS geometry
-    if (!config.use_lba_mode)
-        ide_set_geometry(config.heads, config.spt);
+    // The drive ended the command with ERR at sector s. Sectors 0..s-1 are
+    // already in buf and are good.
+    record_failure(IDE_FAIL_ERR, cmd, st, lba + s, s, count);
+    if (st & 0x08) {
+        // Data offered for the failed sector. Not good data: discard it.
+        ide_drain_sector();
+        last_fail.drained = true;
+    }
+    if (!idle_after_error(2000)) soft_reset_restore();
+    if (done) *done = s;
+    return -1;
+
+read_timeout:
+    // No DRQ in time: the drive may still be retrying, so abort with SRST.
+    record_failure(IDE_FAIL_TIMEOUT, cmd, st, lba + s, s, count);
+    soft_reset_restore();
+    if (done) *done = s;
     return -1;
 }
 
 int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
+    uint32_t s = 0;
+    uint8_t st = 0;
+    uint8_t fail_kind = IDE_FAIL_TIMEOUT;
     if (count == 0) return -1;
-    if (!ide_wait_until_ready(5000)) return -1;
+    if (!ide_wait_until_ready(5000)) {
+        record_failure(IDE_FAIL_NOT_READY, 0, ide_read_reg(7), lba, 0, count);
+        return -1;
+    }
 
     bool use_lba48 = config.use_lba_mode && (config.lba_sectors > 0x0FFFFFFF);
 
@@ -401,22 +487,23 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
         ide_write_reg(6, dev_base | (head & 0x0F));
     }
 
-    ide_write_reg(7, use_lba48 ? 0x34 : 0x30);            // WRITE SECTORS EXT / WRITE SECTORS
+    uint8_t cmd = use_lba48 ? 0x34 : 0x30;
+    ide_write_reg(7, cmd);                                 // WRITE SECTORS EXT / WRITE SECTORS
     wait_after_command();
 
     const uint16_t *wbuf = (const uint16_t *)buf;
 
     bool write_ok = true;
 
-    for (uint32_t s = 0; s < count; s++) {
+    for (s = 0; s < count; s++) {
         // Poll for DRQ — INTRQ not asserted for first sector of PIO write per ATA spec;
         // for s > 0 it provides early-exit if enabled, otherwise pure polling
         bool got_drq = false;
         for (uint32_t t = 0; t < 100000; t++) {
             if (s > 0 && config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);
-            uint8_t st = ide_read_reg(7);
+            st = ide_read_reg(7);
             if (st & 0x80) { busy_wait_us_32(10); continue; }   // BSY: other bits not valid
-            if (st & 0x01) { write_ok = false; break; }
+            if (st & 0x01) { write_ok = false; fail_kind = IDE_FAIL_ERR; break; }
             if (st & 0x08) { got_drq = true; break; }
             busy_wait_us_32(10);
         }
@@ -436,21 +523,17 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     if (write_ok) {
         for (uint32_t t = 0; t < 100000; t++) {
             if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);
-            uint8_t st = ide_read_reg(7);
+            st = ide_read_reg(7);
             if (st & 0x80) { busy_wait_us_32(10); continue; }   // BSY: other bits not valid
-            if (st & 0x01) { write_ok = false; break; }
+            if (st & 0x01) { write_ok = false; fail_kind = IDE_FAIL_ERR; break; }
             return (int32_t)(count * 512);
         }
     }
 
-    // Soft-reset to abort any stuck command (drive may be retrying internally)
-    ide_write_control(0x04);
-    busy_wait_us_32(10);
-    ide_write_control(0x00);
-    ide_wait_until_ready(2000);
-    // SRST clears INITIALIZE DRIVE PARAMETERS — restore CHS geometry
-    if (!config.use_lba_mode)
-        ide_set_geometry(config.heads, config.spt);
+    // Write errors still always reset, as before. Keep the registers first.
+    // For a write, 'done' is the number of sectors sent to the drive.
+    record_failure(fail_kind, cmd, st, lba + s, s, count);
+    soft_reset_restore();
     return -1;
 }
 

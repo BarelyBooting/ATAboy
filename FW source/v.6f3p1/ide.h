@@ -48,6 +48,35 @@ void    ide_drain_sector(void);
 int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf);
 int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf);
 
+// Same as ide_read_sectors, but on failure *done is set to the number of
+// sectors that were read into buf before the failing one. Those sectors are
+// good data from the drive. Nothing is written to buf for the failing sector
+// or any sector after it.
+int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
+                                 uint32_t *done);
+
+// What the drive reported for the last failed sector read or write, captured
+// before any recovery step (drain or soft reset) could change it.
+#define IDE_FAIL_NONE       0
+#define IDE_FAIL_NOT_READY  1   // drive not ready before the command was sent
+#define IDE_FAIL_ERR        2   // drive finished the command with ERR set
+#define IDE_FAIL_TIMEOUT    3   // no DRQ / no completion in time
+typedef struct {
+    uint8_t  kind;          // IDE_FAIL_*
+    uint8_t  command;       // ATA command that failed
+    uint8_t  status;        // status register when the failure was seen
+    uint8_t  error;         // error register (meaningful when status has ERR)
+    uint8_t  tf[5];         // registers 2..6: count, sector, cyl lo, cyl hi, dev/head
+    bool     drained;       // drive offered data for the failed sector; discarded
+    bool     reset;         // a soft reset was needed to get the drive back
+    uint32_t lba;           // first sector not transferred
+    uint32_t done;          // sectors transferred before the failure
+    uint32_t count;         // sectors requested
+} ide_fail_t;
+
+// Copy of the last failure record (kind == IDE_FAIL_NONE if none yet).
+void    ide_last_failure(ide_fail_t *out);
+
 // Read task file registers 1-7 into tf[1]..tf[7] (tf[0] unused).
 void    ide_read_taskfile(uint8_t tf[8]);
 
