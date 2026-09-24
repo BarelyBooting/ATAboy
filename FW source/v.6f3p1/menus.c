@@ -712,6 +712,22 @@ static void run_debug_errors(void) {
         if (err&0x02) strcat(eb,"TK0 "); if (err&0x01) strcat(eb,"AMNF ");
     }
     debug_print(0, FG_RED, "[Error Bits] %s", eb);
+
+    // Registers saved by the last failed sector read/write, before any drain
+    // or reset (the live ones above may since have been changed by a reset).
+    ide_fail_t f;
+    ide_last_failure(&f);
+    if (f.kind == IDE_FAIL_NONE) {
+        debug_print(2, FG_WHITE, "[Last Failed I/O] none since power-up");
+    } else {
+        static const char *kinds[] = {"?", "not ready", "ERR", "timeout"};
+        debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
+                    f.command, kinds[f.kind & 3], (unsigned long)f.lba,
+                    (unsigned long)f.done, (unsigned long)f.count);
+        debug_print(3, FG_WHITE, "ST:%02X ERR:%02X SC:%02X SN:%02X CL:%02X CH:%02X DH:%02X%s%s",
+                    f.status, f.error, f.tf[0], f.tf[1], f.tf[2], f.tf[3], f.tf[4],
+                    f.drained ? "  drained" : "", f.reset ? "  reset" : "");
+    }
 }
 
 static void run_seek_test(void) {
