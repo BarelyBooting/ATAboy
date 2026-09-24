@@ -46,15 +46,21 @@ int32_t sat_scsi(uint8_t lun, uint8_t const cdb[16], void *buffer, uint16_t host
         return -1;
     }
 
-    switch (ide_sat_pio_in(&tf, (uint8_t *)buffer)) {
+    uint8_t err = 0;
+    switch (ide_sat_pio_in(&tf, (uint8_t *)buffer, &err)) {
     case IDE_SAT_OK:
         return (int32_t)(tf.sectors * SAT_SECTOR_SIZE);
     case IDE_SAT_NOT_ISSUED:
         tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x04, 0x00);
         return -1;
     case IDE_SAT_ATA_ERROR:
-        if (tf.command == 0xEC) tud_msc_set_sense(lun, SCSI_SENSE_ABORTED_COMMAND, 0x00, 0x00);
-        else                    tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);
+        // Say what the drive said, so "the drive refused the command" is not
+        // reported as a media fault. IDNF is also what a drive returns for a
+        // sector past its end; the firmware's own range refusal is 5/21 instead.
+        if (err & 0x40)      tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);   // UNC: unrecovered read error
+        else if (err & 0x10) tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x14, 0x01);   // IDNF: record not found
+        else if (err & 0x04) tud_msc_set_sense(lun, SCSI_SENSE_ABORTED_COMMAND, 0x00, 0x00); // ABRT: command aborted
+        else                 tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);   // anything else
         return -1;
     default:    // IDE_SAT_TIMEOUT, IDE_SAT_BAD_END
         tud_msc_set_sense(lun, SCSI_SENSE_ABORTED_COMMAND, 0x00, 0x00);

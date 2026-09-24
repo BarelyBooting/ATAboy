@@ -62,13 +62,13 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba);
 // Result of ide_sat_pio_in(). Only IDE_SAT_OK means the buffer holds data.
 #define IDE_SAT_OK          0
 #define IDE_SAT_NOT_ISSUED  1   // drive busy or in an unexpected state; no command sent
-#define IDE_SAT_ATA_ERROR   2   // the drive set ERR
+#define IDE_SAT_ATA_ERROR   2   // the drive set ERR; *ata_error holds its Error register
 #define IDE_SAT_TIMEOUT     3   // BSY or DRQ never came; drive left as it was
 #define IDE_SAT_BAD_END     4   // all blocks read but the drive still offered data
 
 // Issue one PIO data-in command built by sat_policy_check() and read
 // tf->sectors * 512 bytes into buf. No soft reset on failure.
-int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf);
+int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, uint8_t *ata_error);
 #endif
 
 #endif

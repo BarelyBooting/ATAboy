@@ -509,7 +509,8 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba) {
 #define SAT_CMD_TIMEOUT_MS    10000   // data phase, from issue to the last block
 #define SAT_END_TIMEOUT_MS    1000    // after the last block, for BSY and DRQ to drop
 
-int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf) {
+int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, uint8_t *ata_error) {
+    *ata_error = 0;
     if (tf->sectors == 0 || tf->sectors > SAT_MAX_SECTORS) return IDE_SAT_NOT_ISSUED;
     if (!ide_wait_until_ready(SAT_READY_TIMEOUT_MS)) return IDE_SAT_NOT_ISSUED;
     if (ide_read_reg(7) & 0x08) return IDE_SAT_NOT_ISSUED;   // stale DRQ: not ours to discard
@@ -539,6 +540,7 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf) {
             uint8_t st = ide_read_reg(7);                       // also clears INTRQ
             if (!(st & 0x80)) {                                 // other bits only valid with BSY=0
                 if (st & 0x01) {
+                    *ata_error = ide_read_reg(1);               // Error register: read has no side effects
                     if (st & 0x08) ide_drain_sector();          // don't leave DRQ stranded
                     return IDE_SAT_ATA_ERROR;
                 }
@@ -567,7 +569,7 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf) {
     for (;;) {
         uint8_t st = ide_read_reg(7);
         if (!(st & 0x80)) {
-            if (st & 0x01) return IDE_SAT_ATA_ERROR;
+            if (st & 0x01) { *ata_error = ide_read_reg(1); return IDE_SAT_ATA_ERROR; }
             if (!(st & 0x08)) return IDE_SAT_OK;
         }
         if (to_ms_since_boot(get_absolute_time()) - end_start >= SAT_END_TIMEOUT_MS)
