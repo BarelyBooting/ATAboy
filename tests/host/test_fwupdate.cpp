@@ -240,7 +240,11 @@ static void test_unmount_forgets_identify() {
     is_mounted = true; media_changed_waiting = false; mock_id_words_forgotten = 0;
     menu_unmount();
     CHECK(!is_mounted && media_changed_waiting, "unmount state %d %d", is_mounted, media_changed_waiting);
+#if ATABOY_SAT
     CHECK(mock_id_words_forgotten == 1, "IDENTIFY words forgotten %d times", mock_id_words_forgotten);
+#else
+    CHECK(mock_id_words_forgotten == 0, "SAT=0 keeps no IDENTIFY words, forgotten %d times", mock_id_words_forgotten);
+#endif
 }
 
 int main() {

@@ -845,7 +845,9 @@ static bool fwupdate_key(int k) {
 static void menu_unmount(void) {
     is_mounted = false;
     media_changed_waiting = true;
-    ide_id_words_forget();
+#if ATABOY_SAT
+    ide_id_words_forget();          // only SAT builds keep the words
+#endif
 }
 
 static void fwupdate_confirmed(void) {
