@@ -45,7 +45,7 @@ add_executable(ATAboy
         config.c)
 
 pico_set_program_name(ATAboy "ATAboy")
-pico_set_program_version(ATAboy "0.6f3p1-palimpsest")
+pico_set_program_version(ATAboy "0.6f3p2-palimpsest")
 
 # Generate PIO header
 pico_generate_pio_header(ATAboy ${CMAKE_CURRENT_LIST_DIR}/ataboy.pio)

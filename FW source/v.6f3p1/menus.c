@@ -221,7 +221,7 @@ static void print_help(const char *text) {
 static void draw_bios_frame(void) {
     cdc_printf(BG_BLUE FG_WHITE CLR_SCR HIDE_CUR "\033[H");
     cdc_printf("\033[1;1H%80s", "");
-    cdc_printf("\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p1 (fork) - (C) 2026 obsoletetech.us");
+    cdc_printf("\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p2 (fork) - (C) 2026 obsoletetech.us");
 
     bool feat = (current_screen == SCREEN_FEATURES);
 
