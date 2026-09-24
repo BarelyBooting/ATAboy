@@ -26,6 +26,8 @@ static struct {
     bool     valid;
     uint8_t  dev_base;          // the device they came from
     uint16_t w82, w83, w84;
+    uint16_t serial[10];        // words 10..19, to tell this drive from another
+    uint16_t model[20];         // words 27..46
 } id_words;
 
 void ide_id_words_forget(void) { id_words.valid = false; }
@@ -320,10 +322,38 @@ bool ide_identify(uint16_t *buf) {
         id_words.w82 = buf[82];
         id_words.w83 = buf[83];
         id_words.w84 = buf[84];
+        for (int i = 0; i < 10; i++) id_words.serial[i] = buf[10 + i];
+        for (int i = 0; i < 20; i++) id_words.model[i]  = buf[27 + i];
     }
 #endif
     return ok;
 }
+
+#if ATABOY_SAT
+// Is the drive on the cable still the one the words were captured from? Asks
+// it for IDENTIFY again and compares serial, model and words 82..84. Called by
+// sat.c right before a command the words let through (SMART, READ NATIVE MAX,
+// READ SECTORS EXT): a drive swapped after detection, mounted without a new
+// one, would otherwise be judged by the old drive's words. Sends nothing when
+// no words were captured, so a drive set up without IDENTIFY (manual CHS, as
+// the CP3044 must be) never gets one from here. Any difference, or a failed
+// IDENTIFY, forgets the words. Runs on core 0 while mounted, like all SAT I/O.
+// Returns 1 same drive, 0 not (words forgotten) or no words held, -1 drive
+// not ready or still offering data from an earlier command: then nothing is
+// sent (identify_once would drain that data and issue IDENTIFY over it, which
+// the SAT path refuses to do) and the words are kept.
+int ide_id_words_verify(void) {
+    if (!id_words.valid || id_words.dev_base != dev_base) return 0;
+    if (!ide_wait_until_ready(1000) || (ide_read_reg(7) & 0x08)) return -1;
+    uint16_t buf[256];
+    bool same = identify_once(buf) && buf[82] == id_words.w82 &&
+                buf[83] == id_words.w83 && buf[84] == id_words.w84;
+    for (int i = 0; same && i < 10; i++) same = buf[10 + i] == id_words.serial[i];
+    for (int i = 0; same && i < 20; i++) same = buf[27 + i] == id_words.model[i];
+    if (!same) id_words.valid = false;
+    return same ? 1 : 0;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 //  Drain one sector of DRQ data (discard 256 words)

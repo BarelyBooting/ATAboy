@@ -164,6 +164,25 @@ int32_t sat_scsi(uint8_t lun, uint8_t const cdb[16], void *buffer, uint16_t host
         return -1;
     }
 
+    // The words above were captured at detection. Before a command they let
+    // through, make sure the drive on the cable is still that drive: a drive
+    // swapped after detection and mounted without a new one must not be
+    // judged by the old drive's words (re-review M-A). Same refusal as having
+    // no words at all.
+    bool gated = tf.command == 0xB0 || tf.command == 0xF8 ||
+                 tf.command == 0x27 || tf.command == 0x24;
+    if (gated) {
+        int same = ide_id_words_verify();
+        if (same < 0) {                 // busy or stale DRQ: as the SAT paths answer it
+            sense_plain(lun, SCSI_SENSE_NOT_READY, 0x04, 0x00);
+            return -1;
+        }
+        if (same == 0) {
+            sense_plain(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
+            return -1;
+        }
+    }
+
     ide_sat_regs_t regs;
     bool nondata = tf.protocol == SAT_PROTO_NON_DATA;
     int r = nondata ? ide_sat_nondata(&tf, &regs)

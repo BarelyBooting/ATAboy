@@ -104,7 +104,7 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     media_changed_waiting = false;
     last_key = last_asc = last_ascq = 0;           // no sense pending in TinyUSB
     sim.srst = 0; sim.init_params = 0; sim.violations = 0; sim.attempts.clear();
-    sim.data_reads = 0;                             // the IDENTIFY above is not the test's
+    sim.data_reads = 0; sim.id_data_reads = 0;      // the IDENTIFY above is not the test's
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -685,10 +685,10 @@ static void test_sat_smart_status(Mode m) {
         std::vector<uint8_t> forms[] = { smart_status12(0x20), smart_status12(0x2C),
                                          pt16(3, false, 0x2C, 0xDA, 0, 0xC24F00, 0x00, 0xB0) };
         for (auto &cdb : forms) {
-            int cmds = sim.commands;
+            int cmds = sim.non_id_commands();
             SatResult s = sat_cmd(cdb, 0, false);
             CHECK(s.called && !s.ok(), "exceeded %d: r %d", exceeded, s.r);
-            CHECK(sim.commands == cmds + 1, "commands %d", sim.commands - cmds);
+            CHECK(sim.non_id_commands() == cmds + 1, "commands %d", sim.non_id_commands() - cmds);
             CHECK(is_desc(s.sense) && s.sense.size() == 22, "descriptor, size %zu", s.sense.size());
             if (!is_desc(s.sense)) continue;
             CHECK(sense_is(s.sense, 0x01, 0x00, 0x1D), "sense %02x/%02x/%02x", s.sense[1], s.sense[2], s.sense[3]);
@@ -700,12 +700,12 @@ static void test_sat_smart_status(Mode m) {
         }
     }
     // CK_COND=0 is refused: the answer could not be returned.
-    int cmds = sim.commands;
+    int cmds = sim.non_id_commands();
     SatResult s = sat_cmd(smart_status12(0x0C), 0, false);
-    CHECK(!s.ok() && sense_is(s.sense, 0x05, 0x24, 0x00) && s.sense.size() == 18 && sim.commands == cmds,
-          "CK_COND=0: r %d commands %d", s.r, sim.commands - cmds);
-    CHECK(sim.data_reads == 0 && sim.srst == 0 && sim.violations == 0 && sim.hob_selects == 0,
-          "data reads %d srst %d violations %d hob %d", sim.data_reads, sim.srst, sim.violations, sim.hob_selects);
+    CHECK(!s.ok() && sense_is(s.sense, 0x05, 0x24, 0x00) && s.sense.size() == 18 && sim.non_id_commands() == cmds,
+          "CK_COND=0: r %d commands %d", s.r, sim.non_id_commands() - cmds);
+    CHECK(sim.non_id_data_reads() == 0 && sim.srst == 0 && sim.violations == 0 && sim.hob_selects == 0,
+          "data reads %d srst %d violations %d hob %d", sim.non_id_data_reads(), sim.srst, sim.violations, sim.hob_selects);
 }
 
 // READ NATIVE MAX ADDRESS on a drive with a Host Protected Area. The numbers
@@ -740,8 +740,8 @@ static void test_sat_native_max(Mode m) {
           is_desc(s.sense) ? desc_lba28(s.sense) : 0u);
     CHECK((sim.devctl & 0x80) == 0, "HOB left set in Device Control: %02x", sim.devctl);
     CHECK(sim.hob_selects == 2, "HOB selects %d (one per 0x27)", sim.hob_selects);
-    CHECK(sim.data_reads == 0 && sim.srst == 0 && sim.violations == 0, "data reads %d srst %d violations %d",
-          sim.data_reads, sim.srst, sim.violations);
+    CHECK(sim.non_id_data_reads() == 0 && sim.srst == 0 && sim.violations == 0, "data reads %d srst %d violations %d",
+          sim.non_id_data_reads(), sim.srst, sim.violations);
     CHECK(sim.cmd_count[0xF9] == 0 && sim.cmd_count[0x37] == 0, "SET MAX issued");
     // and a read afterwards still sees the current size, nothing changed
     HostRead h = host_read10(1000, 8);
@@ -762,7 +762,7 @@ static void test_sat_native_max_ext_abort() {
     sim.hpa_feature = false;
     s = sat_cmd(native_max12(), 0, false);
     CHECK(is_desc(s.sense) && sense_is(s.sense, 0x0B, 0x00, 0x00) && s.sense[11] == 0x04, "F8 unsupported");
-    CHECK(sim.srst == 0 && sim.data_reads == 0 && sim.violations == 0, "srst %d reads %d", sim.srst, sim.data_reads);
+    CHECK(sim.srst == 0 && sim.non_id_data_reads() == 0 && sim.violations == 0, "srst %d reads %d", sim.srst, sim.non_id_data_reads());
     HostRead h = host_read10(10, 8);
     CHECK(h.ok && matches_medium(h, 10), "usable afterwards");
 }
@@ -835,7 +835,7 @@ static void test_sat_nondata_timeout(Mode m) {
     if (m == CHS)
         CHECK(sim.geo_valid && sim.heads == 5 && sim.spt == 34 && sim.init_params > 0,
               "geometry %d %u x %u", sim.geo_valid, sim.heads, sim.spt);
-    CHECK(sim.data_reads == 0, "data reads %d", sim.data_reads);
+    CHECK(sim.non_id_data_reads() == 0, "data reads %d", sim.non_id_data_reads());
     sim.hang_cmd = 0;
     HostRead h = host_read10(1234, 8);
     CHECK(h.ok && matches_medium(h, 1234), "read after the abort");
@@ -864,7 +864,7 @@ static void test_sat_nondata_drq() {
     sim.nondata_drq = true;
     SatResult s = sat_cmd(smart_status12(), 0, false);
     CHECK(!s.ok() && sense_is(s.sense, 0x0B, 0x00, 0x00) && s.sense.size() == 18, "sense size %zu", s.sense.size());
-    CHECK(sim.data_reads == 0, "data register read %d times", sim.data_reads);
+    CHECK(sim.non_id_data_reads() == 0, "data register read %d times", sim.non_id_data_reads());
     CHECK(sim.srst >= 1, "must abort");
     sim.nondata_drq = false;
     HostRead h = host_read10(500, 8);
@@ -992,9 +992,9 @@ static void test_sat_sense_delivery() {
     CHECK(s.sense.size() == 18 && sense_is(s.sense, 0x05, 0x24, 0x00), "refusal: size %zu", s.sense.size());
     // With sense pending, TinyUSB does not call the callback at all.
     s = sat_cmd(smart_status12(), 0, false, 32, false);
-    int cmds = sim.commands;
+    int cmds = sim.non_id_commands();
     SatResult t = sat_cmd(smart_status12(), 0, false, 32, false);
-    CHECK(!t.called && sim.commands == cmds, "callback ran with sense pending");
+    CHECK(!t.called && sim.non_id_commands() == cmds, "callback ran with sense pending");
     request_sense(32);
 
     // The descriptor belongs to one command and one REQUEST SENSE. Below,
@@ -1058,14 +1058,14 @@ static std::vector<SatRow> gated_rows() {
 // gated must work throughout.
 static void check_gate(const char *when, unsigned allowed, bool ungated = true) {
     for (auto &r : gated_rows()) {
-        int cmds = sim.commands;
+        int cmds = sim.non_id_commands();
         SatResult s = sat_cmd(r.cdb, r.xfer, r.in);
         if (allowed & r.bit)
-            CHECK(sim.commands == cmds + 1, "%s: %s was not sent (r %d)", when, r.name, s.r);
+            CHECK(sim.non_id_commands() == cmds + 1, "%s: %s was not sent (r %d)", when, r.name, s.r);
         else
-            CHECK(!s.ok() && sim.commands == cmds && s.sense.size() == 18 && sense_is(s.sense, 0x05, 0x24, 0x00),
+            CHECK(!s.ok() && sim.non_id_commands() == cmds && s.sense.size() == 18 && sense_is(s.sense, 0x05, 0x24, 0x00),
                   "%s: %s must be refused before the drive: r %d commands %d sense %zu", when, r.name, s.r,
-                  sim.commands - cmds, s.sense.size());
+                  sim.non_id_commands() - cmds, s.sense.size());
     }
     if (!ungated) return;
     SatResult a = sat_cmd(pt12(4, 0x0E, 0, 1, 0, 0xA0, 0xEC), 512, true);
@@ -1082,6 +1082,80 @@ static void identify_with(uint16_t w82, uint16_t w83, uint16_t w84) {
     sim.id_w82 = w82; sim.id_w83 = w83; sim.id_w84 = w84;
     uint16_t id[256];
     CHECK(ide_identify(id), "IDENTIFY %04x %04x %04x", w82, w83, w84);
+}
+
+// Re-review M-A: a drive swapped on the cable after detection and mounted
+// without a new one (Mount only sets is_mounted) must not be judged by the
+// old drive's IDENTIFY words. Before a gated command the firmware asks the
+// drive for IDENTIFY again and compares serial, model and words 82..84.
+struct IdRow { const char *name; std::vector<uint8_t> cdb; uint32_t xfer; bool dir_in; uint8_t op; bool lba_only; };
+static std::vector<IdRow> id_check_rows() {
+    return { { "SMART RETURN STATUS", smart_status12(), 0, false, 0xB0, false },
+             { "READ NATIVE MAX", native_max12(), 0, false, 0xF8, false },
+             { "READ SECTORS EXT", pt16(4, true, 0x0E, 0, 1, 100, 0x40, 0x24), 512, true, 0x24, true } };
+}
+static void test_sat_identity_verified(Mode m) {
+    std::string n = name2("SAT gated rows verify the drive is the detected one", m);
+    setup(n.c_str(), m);
+    auto reset_drive = [&]() {
+        sim.id_model = "SIMULATED ATA DRIVE"; sim.id_serial = "SIM0000001";
+        sim.id_w82 = 0x4401; sim.id_w83 = 0x4400; sim.id_w84 = 0x4001; sim.identify_ok = true;
+        identify_with(0x4401, 0x4400, 0x4001);            // a detection of this drive
+    };
+    // want: 1 ran, 0 refused 5/24/00, 2 not ready 2/04/00
+    auto run = [&](const IdRow &g, const char *what, int want, int want_ids) {
+        int ids = sim.id_commands(), ops = sim.cmd_count[g.op];
+        SatResult r = sat_cmd(g.cdb, g.xfer, g.dir_in);
+        int got = r.ok() || (is_desc(r.sense) && sense_is(r.sense, 0x01, 0x00, 0x1D)) ? 1
+                : sense_is(r.sense, 0x05, 0x24, 0x00) ? 0 : sense_is(r.sense, 0x02, 0x04, 0x00) ? 2 : -1;
+        CHECK(got == want, "%s, %s: outcome %d, want %d", g.name, what, got, want);
+        CHECK(sim.id_commands() - ids == want_ids, "%s, %s: %d IDENTIFY sent, want %d", g.name, what, sim.id_commands() - ids, want_ids);
+        CHECK(sim.cmd_count[g.op] - ops == (want == 1 ? 1 : 0), "%s, %s: %d commands %02X reached the drive",
+              g.name, what, sim.cmd_count[g.op] - ops, g.op);
+    };
+    for (const IdRow &g : id_check_rows()) {
+        if (g.lba_only && m != LBA) continue;
+        reset_drive();
+        run(g, "same drive", 1, 1);
+        sim.id_serial = "OTHER00002";                     // same model, another unit
+        run(g, "other serial", 0, 1);
+        run(g, "after that (words forgotten)", 0, 0);
+        reset_drive();
+        sim.id_model = "OTHER ATA DRIVE";                 // same serial text, other model
+        run(g, "other model", 0, 1);
+        reset_drive();
+        sim.id_w82 = 0x4001;                              // same drive text, words changed
+        run(g, "other words 82..84", 0, 1);
+        reset_drive();
+        sim.id_model = "CONNER CFS1275A"; sim.id_serial = "CONNER0001";
+        sim.id_w82 = 0; sim.id_w83 = 0; sim.id_w84 = 0;
+        run(g, "CFS1275A-like drive", 0, 1);
+        reset_drive();
+        sim.identify_ok = false;                          // does not answer IDENTIFY
+        run(g, "drive aborts IDENTIFY", 0, 1);
+        reset_drive();
+        ide_id_words_forget();                            // manual CHS: no words
+        int cmds = sim.commands;
+        run(g, "no words held", 0, 0);
+        CHECK(sim.commands == cmds, "%s, no words: %d commands sent", g.name, sim.commands - cmds);
+        // Busy for longer than the check waits, then ready: the command must
+        // not go out unverified to whatever drive is there.
+        reset_drive();
+        sim.id_serial = "OTHER00002";
+        sim.phase = SimDrive::IDLE; sim.status = 0x80; sim.ready_at = mock_now_ns + 1500000000ull;
+        run(g, "busy 1.5 s during the check", 2, 0);
+        mock_now_ns += 2000000000ull;
+        run(g, "ready again, other serial", 0, 1);
+    }
+    // Rows the words do not gate never trigger the check (SAT data reads are
+    // LBA mode only, so this part runs in LBA mode).
+    reset_drive();
+    if (m == LBA) {
+        int ids = sim.id_commands();
+        SatResult rd = sat_cmd(pt12(4, 0x0E, 0, 1, 100, 0xE0, 0x20), 512, true);
+        CHECK(rd.ok() && sim.id_commands() == ids, "READ SECTORS: ok %d, %d IDENTIFY sent", rd.ok(), sim.id_commands() - ids);
+    }
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
 }
 
 static void test_sat_identify_gate() {
@@ -1129,15 +1203,15 @@ static void test_sat_identify_gate() {
     setup("SAT rows gated on the drive's IDENTIFY, CHS", CHS);
     for (auto &r : gated_rows()) {
         if (r.bit == G_READ_EXT) continue;          // refused in CHS mode anyway
-        int cmds = sim.commands;
+        int cmds = sim.non_id_commands();
         sat_cmd(r.cdb, r.xfer, r.in);
-        CHECK(sim.commands == cmds + 1, "CHS, full IDENTIFY: %s not sent", r.name);
+        CHECK(sim.non_id_commands() == cmds + 1, "CHS, full IDENTIFY: %s not sent", r.name);
     }
     identify_with(0x0001, 0x0000, 0x0000);
     for (auto &r : gated_rows()) {
-        int cmds = sim.commands;
+        int cmds = sim.non_id_commands();
         SatResult s = sat_cmd(r.cdb, r.xfer, r.in);
-        CHECK(sim.commands == cmds && sense_is(s.sense, 0x05, 0x24, 0x00), "CHS, pre-ATA-4: %s reached the drive", r.name);
+        CHECK(sim.non_id_commands() == cmds && sense_is(s.sense, 0x05, 0x24, 0x00), "CHS, pre-ATA-4: %s reached the drive", r.name);
     }
     CHECK(sim.violations == 0 && sim.srst == 0, "violations %d srst %d", sim.violations, sim.srst);
 }
@@ -1193,8 +1267,8 @@ static void test_sat_slow_bsy() {
         mock_now_ns += 700000000;
         s = sat_cmd(verify12(0x00, 4, 100), 0, false);
         CHECK(s.r == 0 && s.sense.empty(), "good verify after an ERR: r %d sense %zu", s.r, s.sense.size());
-        CHECK(sim.srst == 0 && sim.violations == 0 && sim.data_reads == 512, "srst %d violations %d data reads %d",
-              sim.srst, sim.violations, sim.data_reads);
+        CHECK(sim.srst == 0 && sim.violations == 0 && sim.non_id_data_reads() == 512, "srst %d violations %d data reads %d",
+              sim.srst, sim.violations, sim.non_id_data_reads());
     }
 }
 
@@ -1233,7 +1307,7 @@ static void test_sat_never_starts() {
     sim.bad.clear();
     HostRead h = host_read10(1000, 8);
     CHECK(h.ok && matches_medium(h, 1000), "usable after the aborts");
-    CHECK(sim.violations == 0 && sim.data_reads == 8 * 256, "violations %d data reads %d", sim.violations, sim.data_reads);
+    CHECK(sim.violations == 0 && sim.non_id_data_reads() == 8 * 256, "violations %d data reads %d", sim.violations, sim.non_id_data_reads());
 }
 
 // A drive so quick the command is over before the first poll: BSY is never
@@ -1394,6 +1468,8 @@ int main() {
     test_sat_sense_delivery();
     test_sat_refusals_touch_nothing();
     test_sat_identify_gate();
+    test_sat_identity_verified(LBA);
+    test_sat_identity_verified(CHS);
     test_sat_slow_bsy();
     test_sat_never_starts();
     test_sat_fast_command();

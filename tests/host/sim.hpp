@@ -94,6 +94,8 @@ struct SimDrive {
     // bits 15:14 of words 83 and 84. identify_ok = false: IDENTIFY aborts.
     uint16_t id_w82 = 0x4401, id_w83 = 0x4400, id_w84 = 0x4001;
     bool     identify_ok = true;
+    const char *id_model = "SIMULATED ATA DRIVE";  // words 27..46
+    const char *id_serial = "SIM0000001";           // words 10..19
 
     // registers
     uint8_t reg[8] = {0};
@@ -124,6 +126,13 @@ struct SimDrive {
     // bookkeeping for the tests
     int srst = 0, init_params = 0, violations = 0, commands = 0;
     int data_reads = 0;                     // data register reads, any phase
+    int id_data_reads = 0;                  // ...of which during IDENTIFY (0xEC)
+    // Commands and data reads other than IDENTIFY: the firmware re-IDENTIFYs
+    // the drive before a SAT command gated on IDENTIFY words (sat.c), and a
+    // test of the command itself counts only the command.
+    int non_id_commands() const { auto it = cmd_count.find(0xEC); return commands - (it == cmd_count.end() ? 0 : it->second); }
+    int non_id_data_reads() const { return data_reads - id_data_reads; }
+    int id_commands() const { auto it = cmd_count.find(0xEC); return it == cmd_count.end() ? 0 : it->second; }
     int hob_selects = 0;                    // Device Control writes with HOB set
     std::map<uint8_t, int> cmd_count;
     // Set by a test: called at every command; each command sent while it
@@ -219,7 +228,13 @@ struct SimDrive {
         xfer[0] = 0x0040;                                   // fixed disk
         xfer[1] = (uint16_t)(nsect / (native_heads * native_spt));
         xfer[3] = native_heads; xfer[6] = native_spt;
-        const char *model = "SIMULATED ATA DRIVE";
+        const char *model = id_model;
+        const char *ser = id_serial;
+        for (int i = 0; i < 10; i++) {
+            char a = ser[0] ? *ser++ : ' ';
+            char b = ser[0] ? *ser++ : ' ';
+            xfer[10 + i] = (uint16_t)(((uint8_t)a << 8) | (uint8_t)b);
+        }
         for (int i = 0; i < 20; i++) {
             char a = model[0] ? *model++ : ' ';
             char b = model[0] ? *model++ : ' ';
@@ -457,6 +472,7 @@ struct SimDrive {
     uint16_t read_data(uint64_t now) {
         tick(now);
         data_reads++;
+        if (cmd == 0xEC) id_data_reads++;
         if (phase == DRQ_IN || phase == ERR_DRQ) {
             uint16_t w = xfer[widx++];
             if (widx == 256) {

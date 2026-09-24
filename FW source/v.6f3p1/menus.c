@@ -834,10 +834,6 @@ static bool fwupdate_key(int k) {
     return true;
 }
 
-// Y at the prompt: reboot into the RP2350 ROM bootloader (USB drive and
-// picotool, the mode BOOTSEL gives), or come back with a message saying why
-// not. A USB command that started before the drive was unmounted may still
-// be running on core 0; wait for it, up to FWUPDATE_WAIT_MS, Esc cancels.
 // Unmount. Also forgets the drive's captured IDENTIFY words: with the drive
 // released, it can be swapped on the cable, and a later mount without a new
 // detection must not let the SAT policy judge the new drive by the old one's
@@ -850,6 +846,10 @@ static void menu_unmount(void) {
 #endif
 }
 
+// Y at the prompt: reboot into the RP2350 ROM bootloader (USB drive and
+// picotool, the mode BOOTSEL gives), or come back with a message saying why
+// not. A USB command that started before the drive was unmounted may still
+// be running on core 0; wait for it, up to FWUPDATE_WAIT_MS, Esc cancels.
 static void fwupdate_confirmed(void) {
     uint32_t t0 = to_ms_since_boot(get_absolute_time());
     bool told = false;

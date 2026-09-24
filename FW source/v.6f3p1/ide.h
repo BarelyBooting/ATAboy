@@ -136,6 +136,11 @@ void ide_id_words(ide_id_words_t *out);
 // the cable may be a different one, and it must not be judged by this one's
 // IDENTIFY. Until a detection captures new words, the gated SAT rows refuse.
 void ide_id_words_forget(void);
+// Re-IDENTIFY the drive and check it is the one the words came from (serial,
+// model, words 82..84): 1 yes; 0 no or IDENTIFY failed (words forgotten), or
+// no words held (nothing sent); -1 drive busy or offering stale data (nothing
+// sent, words kept).
+int ide_id_words_verify(void);
 #endif
 
 #endif
