@@ -3,7 +3,8 @@
     python tests/host/tui_compare.py <old src> <new src> [--expect screen:row,row ...]
 
 --expect names rows (1-based) of a screen where the new build is meant to
-show something different; differences there are listed but do not fail.
+show something different; differences there are counted but do not fail.
+A screen name of * means every screen (e.g. *:1 for a new version banner).
 
 Builds test_tui.cpp against each source tree, renders every captured screen
 with pyte (the emulator the console harness uses), and reports:
@@ -102,7 +103,7 @@ def main():
                         and not (ca.reverse or cb.reverse or ca.underscore or cb.underscore
                                  or ca.strikethrough or cb.strikethrough)):
                     invisible += 1      # a blank's foreground colour cannot be seen
-                elif y in expect.get(name, ()):
+                elif y in expect.get(name, ()) or y in expect.get('*', ()):
                     expected += 1
                 else:
                     diff.append((y, x))
