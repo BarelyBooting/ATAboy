@@ -92,16 +92,32 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba);
 #if ATABOY_SAT
 #include "sat_policy.h"
 
-// Result of ide_sat_pio_in(). Only IDE_SAT_OK means the buffer holds data.
+// Result of ide_sat_pio_in() / ide_sat_nondata(). Only IDE_SAT_OK means the
+// command completed without error (and, for PIO, that the buffer holds data).
 #define IDE_SAT_OK          0
 #define IDE_SAT_NOT_ISSUED  1   // drive busy or in an unexpected state; no command sent
-#define IDE_SAT_ATA_ERROR   2   // the drive set ERR; *ata_error holds its Error register
-#define IDE_SAT_TIMEOUT     3   // BSY or DRQ never came; drive left as it was
-#define IDE_SAT_BAD_END     4   // all blocks read but the drive still offered data
+#define IDE_SAT_ATA_ERROR   2   // the drive set ERR or DF; *regs holds what it reported
+#define IDE_SAT_TIMEOUT     3   // BSY or DRQ never came; the command was aborted (SRST)
+#define IDE_SAT_BAD_END     4   // the drive offered data it should not have; aborted (SRST)
+
+// The drive's output registers after a SAT command, read before anything else
+// could change them. Filled on IDE_SAT_ATA_ERROR, and on IDE_SAT_OK from
+// ide_sat_nondata(). The HOB bytes are read (hob == true) only for a 48-bit
+// command the drive did not abort: a drive that aborted it may predate 48-bit
+// ATA, and the HOB bit in Device Control means nothing to it.
+typedef struct {
+    uint8_t error, count, lba_low, lba_mid, lba_high, device, status;
+    uint8_t hob_count, hob_lba_low, hob_lba_mid, hob_lba_high;
+    bool    hob;
+} ide_sat_regs_t;
 
 // Issue one PIO data-in command built by sat_policy_check() and read
-// tf->sectors * 512 bytes into buf. No soft reset on failure.
-int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, uint8_t *ata_error);
+// tf->sectors * 512 bytes into buf. No soft reset on an ATA error.
+int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs);
+
+// Issue one non-data command built by sat_policy_check() and wait for it to
+// end. Never touches the data register. No soft reset on an ATA error.
+int ide_sat_nondata(const sat_taskfile_t *tf, ide_sat_regs_t *regs);
 #endif
 
 #endif

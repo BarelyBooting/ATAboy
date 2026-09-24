@@ -662,41 +662,50 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba) {
 }
 
 #if ATABOY_SAT
+#include <string.h>
+
 // ---------------------------------------------------------------------------
-//  SAT pass-through: one PIO data-in command, task file exactly as given
+//  SAT pass-through: one command, task file exactly as given
 // ---------------------------------------------------------------------------
 //
-// Used only by sat.c, for the commands sat_policy.c allows (IDENTIFY, READ
-// SECTORS, READ SECTORS EXT). Differs from ide_read_sectors() on purpose:
+// Used only by sat.c, for the commands sat_policy.c allows: PIO data-in
+// (IDENTIFY, READ SECTORS, READ SECTORS EXT, SMART READ DATA / THRESHOLDS /
+// LOG) and non-data (READ VERIFY, SMART RETURN STATUS, READ NATIVE MAX and
+// its EXT form). Differs from ide_read_sectors() on purpose:
 //  - it sends the ATA command byte the host chose (0x21 stays 0x21), and the
 //    48-bit registers only when the host asked for a 48-bit command;
 //  - on an error it does NOT soft-reset the drive or re-send INITIALIZE DRIVE
-//    PARAMETERS. It stops, leaves the drive's registers as they are, and
+//    PARAMETERS. It stops, reads the drive's registers for the caller, and
 //    reports the failure. The READ(10) path is unchanged.
 //  - it refuses to start if the drive is busy or holds data from some earlier
 //    command, instead of guessing what that state means.
 // Timeouts are wall-clock, not loop counts.
 
 #define SAT_READY_TIMEOUT_MS  5000    // same as ide_read_sectors()
-#define SAT_CMD_TIMEOUT_MS    10000   // data phase, from issue to the last block
+#define SAT_CMD_TIMEOUT_MS    10000   // PIO: from issue to the last block; non-data: to completion
 #define SAT_END_TIMEOUT_MS    1000    // after the last block, for BSY and DRQ to drop
 
 // Abort whatever the drive is still doing for a SAT command we gave up on.
 // Without this, a drive that finishes a slow read after our timeout raises
 // DRQ with that sector's data, and the next command on the bus (a READ(10)
 // from the host, say) can end up handed the stranded block as its own
-// result. A soft reset ends the command. There is no error state worth
-// keeping at this point: the command timed out or ended badly.
+// result. A soft reset ends the command, and srst_and_restore() selects the
+// drive again and, in CHS mode, puts the geometry back. There is no error
+// state worth keeping at this point: the command timed out or ended badly.
 static void sat_abort(void) {
     (void)srst_and_restore();   // on failure, CHS reads refuse until restored
 }
 
-int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, uint8_t *ata_error) {
-    *ata_error = 0;
-    if (tf->sectors == 0 || tf->sectors > SAT_MAX_SECTORS) return IDE_SAT_NOT_ISSUED;
-    if (!ide_wait_until_ready(SAT_READY_TIMEOUT_MS)) return IDE_SAT_NOT_ISSUED;
-    if (ide_read_reg(7) & 0x08) return IDE_SAT_NOT_ISSUED;   // stale DRQ: not ours to discard
+// Ready to take a new command: not busy, and not holding data from an
+// earlier one (that is not ours to discard; the READ(10) path's own guard
+// resets it). False means nothing was sent.
+static bool sat_can_issue(void) {
+    if (!ide_wait_until_ready(SAT_READY_TIMEOUT_MS)) return false;
+    if (ide_read_reg(7) & 0x08) return false;   // stale DRQ
+    return true;
+}
 
+static void sat_write_taskfile(const sat_taskfile_t *tf) {
     if (tf->ext) {
         // 48-bit: previous (HOB) value first, then current, per register
         ide_write_reg(1, tf->hob_feature);
@@ -712,7 +721,41 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, uint8_t *ata_error) {
     ide_write_reg(5, tf->lba_high);
     ide_write_reg(6, dev_base | (tf->device & 0x4F));
     ide_write_reg(7, tf->command);
-    busy_wait_us_32(1);             // give the drive time to assert BSY
+    busy_wait_us_32(1);             // give the drive time to assert BSY (400 ns)
+}
+
+// Read the output registers once the drive has ended the command (BSY=0).
+// Registers 1-6 only: reading them has no side effect, and the data register
+// is never touched. `st` is the status that ended the command.
+static void sat_read_outputs(const sat_taskfile_t *tf, uint8_t st, ide_sat_regs_t *r) {
+    r->status   = st;
+    r->error    = ide_read_reg(1);
+    r->count    = ide_read_reg(2);
+    r->lba_low  = ide_read_reg(3);
+    r->lba_mid  = ide_read_reg(4);
+    r->lba_high = ide_read_reg(5);
+    r->device   = ide_read_reg(6);
+    bool aborted = (st & 0x01) && (r->error & 0x04);
+    if (tf->ext && !aborted) {
+        // HOB=1 in Device Control reads back the previous (high) bytes of
+        // registers 2-5. nIEN stays 0, as everywhere else in this file.
+        ide_write_control(0x80);
+        r->hob_count    = ide_read_reg(2);
+        r->hob_lba_low  = ide_read_reg(3);
+        r->hob_lba_mid  = ide_read_reg(4);
+        r->hob_lba_high = ide_read_reg(5);
+        ide_write_control(0x00);
+        r->hob = true;
+    }
+}
+
+int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs) {
+    memset(regs, 0, sizeof(*regs));
+    if (tf->protocol != SAT_PROTO_PIO_IN) return IDE_SAT_NOT_ISSUED;
+    if (tf->sectors == 0 || tf->sectors > SAT_MAX_SECTORS) return IDE_SAT_NOT_ISSUED;
+    if (!sat_can_issue()) return IDE_SAT_NOT_ISSUED;
+
+    sat_write_taskfile(tf);
 
     uint16_t *wbuf = (uint16_t *)buf;
     uint32_t start = to_ms_since_boot(get_absolute_time());
@@ -722,7 +765,7 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, uint8_t *ata_error) {
             uint8_t st = ide_read_reg(7);                       // also clears INTRQ
             if (!(st & 0x80)) {                                 // other bits only valid with BSY=0
                 if (st & 0x21) {                                // ERR, or DF (device fault)
-                    *ata_error = ide_read_reg(1);               // Error register: read has no side effects
+                    sat_read_outputs(tf, st, regs);             // before the drain changes anything
                     if (st & 0x08) ide_drain_sector();          // don't leave DRQ stranded
                     return IDE_SAT_ATA_ERROR;
                 }
@@ -753,12 +796,42 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, uint8_t *ata_error) {
     for (;;) {
         uint8_t st = ide_read_reg(7);
         if (!(st & 0x80)) {
-            if (st & 0x21) { *ata_error = ide_read_reg(1); return IDE_SAT_ATA_ERROR; }
+            if (st & 0x21) { sat_read_outputs(tf, st, regs); return IDE_SAT_ATA_ERROR; }
             if (!(st & 0x08)) return IDE_SAT_OK;
         }
         if (to_ms_since_boot(get_absolute_time()) - end_start >= SAT_END_TIMEOUT_MS) {
             sat_abort();
             return (st & 0x80) ? IDE_SAT_TIMEOUT : IDE_SAT_BAD_END;
+        }
+        busy_wait_us_32(10);
+    }
+}
+
+// Non-data: issue, wait for BSY to drop, read the output registers. A drive
+// that answers a non-data command with DRQ is confused; its data is never
+// read (the data register is not touched on this path at all), and a soft
+// reset ends the command so nothing is left stranded for the next one.
+int ide_sat_nondata(const sat_taskfile_t *tf, ide_sat_regs_t *regs) {
+    memset(regs, 0, sizeof(*regs));
+    if (tf->protocol != SAT_PROTO_NON_DATA || tf->sectors != 0) return IDE_SAT_NOT_ISSUED;
+    if (!sat_can_issue()) return IDE_SAT_NOT_ISSUED;
+
+    sat_write_taskfile(tf);
+
+    uint32_t start = to_ms_since_boot(get_absolute_time());
+    for (;;) {
+        uint8_t st = ide_read_reg(7);                           // also clears INTRQ
+        if (!(st & 0x80)) {                                     // other bits only valid with BSY=0
+            sat_read_outputs(tf, st, regs);
+            if (st & 0x08) {                                    // DRQ on a non-data command
+                sat_abort();
+                return IDE_SAT_BAD_END;
+            }
+            return (st & 0x21) ? IDE_SAT_ATA_ERROR : IDE_SAT_OK;   // ERR or DF
+        }
+        if (to_ms_since_boot(get_absolute_time()) - start >= SAT_CMD_TIMEOUT_MS) {
+            sat_abort();
+            return IDE_SAT_TIMEOUT;
         }
         busy_wait_us_32(10);
     }

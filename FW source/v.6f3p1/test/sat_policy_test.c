@@ -5,15 +5,25 @@
 //
 // The expected verdicts do NOT come from sat_policy.c. expect_allow() below is
 // written a different way on purpose: it pulls out the few fields an allowed
-// command may vary (command, count, LBA, obsolete device bits), re-encodes the
-// only CDB those fields are allowed to produce, and compares bytes. Any byte
-// that differs from that canonical encoding is a refusal. The policy instead
-// checks field by field. Two shapes of the same rule, so a mistake in one is
-// unlikely to be repeated in the other.
+// command may vary (command, SMART subcommand, count, LBA, obsolete device
+// bits, CK_COND and the two data-phase bits of a non-data command),
+// re-encodes the only CDB those fields are allowed to produce, and compares
+// bytes. Any byte that differs from that canonical encoding is a refusal. The
+// policy instead checks field by field. Two shapes of the same rule, so a
+// mistake in one is unlikely to be repeated in the other.
 //
 // The allowed set is written out here by hand as well, not taken from the
-// policy's header: IDENTIFY (0xEC), READ SECTORS (0x20, 0x21) and READ
-// SECTORS EXT (0x24, 16-byte form only), PIO data-in, 1..8 sectors.
+// policy's header:
+//   PIO data-in, 1..8 sectors unless stated:
+//     IDENTIFY 0xEC (1), READ SECTORS 0x20 / 0x21 (LBA28), READ SECTORS EXT
+//     0x24 (16-byte form, EXTEND=1), SMART 0xB0 with FEATURES D0 or D1 (1
+//     sector, LBA low 0) or D5 (LBA low = any log address).
+//   Non-data, CBW length 0:
+//     READ VERIFY 0x40 (LBA28, count 0..255, 0 = 256, CK_COND 0 or 1),
+//     SMART RETURN STATUS 0xB0/DA, READ NATIVE MAX 0xF8, READ NATIVE MAX EXT
+//     0x27 (16-byte form, EXTEND=1); these three need CK_COND=1.
+//   SMART needs 4F/C2 in LBA mid/high. Reads and verifies need LBA mode;
+//   IDENTIFY, SMART and READ NATIVE MAX are allowed in CHS mode too.
 
 #include "sat_policy.h"
 #include <stdio.h>
@@ -36,81 +46,160 @@ static void fail(const char *what, const uint8_t *cdb, int len, bool dir_in, uin
 }
 
 // ---------------------------------------------------------------------------
-//  The expectation
+//  Encoders: register values in, CDB bytes out
 // ---------------------------------------------------------------------------
 
-static void enc12(uint8_t o[16], uint8_t cmd, uint8_t count, uint32_t lba28, uint8_t devtop) {
+typedef struct {
+    uint8_t proto, b2, feat, count, lo, mid, hi, hlo, hmid, hhi, dev, cmd;
+    bool ext;
+} fields_t;
+
+static void put12(uint8_t o[16], const fields_t *f) {
     memset(o, 0, 16);
-    o[0] = 0xA1; o[1] = 4 << 1; o[2] = 0x0E;
-    o[4] = count;
-    o[5] = (uint8_t)lba28; o[6] = (uint8_t)(lba28 >> 8); o[7] = (uint8_t)(lba28 >> 16);
-    o[8] = (uint8_t)(devtop | ((lba28 >> 24) & 0x0F));
-    o[9] = cmd;
+    o[0] = 0xA1; o[1] = (uint8_t)(f->proto << 1); o[2] = f->b2;
+    o[3] = f->feat; o[4] = f->count;
+    o[5] = f->lo; o[6] = f->mid; o[7] = f->hi;
+    o[8] = f->dev; o[9] = f->cmd;
+}
+
+static void put16(uint8_t o[16], const fields_t *f) {
+    memset(o, 0, 16);
+    o[0] = 0x85; o[1] = (uint8_t)((f->proto << 1) | (f->ext ? 1 : 0)); o[2] = f->b2;
+    o[4] = f->feat; o[6] = f->count;
+    o[7] = f->hlo; o[8] = f->lo; o[9] = f->hmid; o[10] = f->mid; o[11] = f->hhi; o[12] = f->hi;
+    o[13] = f->dev; o[14] = f->cmd;
+}
+
+// Stage 1 shapes: PIO data-in, FEATURES 0.
+static void enc12(uint8_t o[16], uint8_t cmd, uint8_t count, uint32_t lba28, uint8_t devtop) {
+    fields_t f = { 4, 0x0E, 0, count, (uint8_t)lba28, (uint8_t)(lba28 >> 8), (uint8_t)(lba28 >> 16),
+                   0, 0, 0, (uint8_t)(devtop | ((lba28 >> 24) & 0x0F)), cmd, false };
+    put12(o, &f);
 }
 
 static void enc16(uint8_t o[16], uint8_t cmd, bool ext, uint8_t count, uint64_t lba, uint8_t devtop) {
-    memset(o, 0, 16);
-    o[0] = 0x85; o[1] = (uint8_t)((4 << 1) | (ext ? 1 : 0)); o[2] = 0x0E;
-    o[6] = count;
-    o[8] = (uint8_t)lba; o[10] = (uint8_t)(lba >> 8); o[12] = (uint8_t)(lba >> 16);
-    if (ext) {
-        o[7] = (uint8_t)(lba >> 24); o[9] = (uint8_t)(lba >> 32); o[11] = (uint8_t)(lba >> 40);
-        o[13] = devtop;
-    } else {
-        o[13] = (uint8_t)(devtop | ((lba >> 24) & 0x0F));
-    }
-    o[14] = cmd;
+    fields_t f = { 4, 0x0E, 0, count, (uint8_t)lba, (uint8_t)(lba >> 8), (uint8_t)(lba >> 16),
+                   0, 0, 0, devtop, cmd, ext };
+    if (ext) { f.hlo = (uint8_t)(lba >> 24); f.hmid = (uint8_t)(lba >> 32); f.hhi = (uint8_t)(lba >> 40); }
+    else f.dev = (uint8_t)(devtop | ((lba >> 24) & 0x0F));
+    put16(o, &f);
 }
 
-// Would a correct policy allow this? Also reports the sector count it implies.
+// Non-data READ VERIFY.
+static void encv(uint8_t o[16], bool is16, uint8_t b2, uint8_t count, uint32_t lba28, uint8_t devtop) {
+    fields_t f = { 3, b2, 0, count, (uint8_t)lba28, (uint8_t)(lba28 >> 8), (uint8_t)(lba28 >> 16),
+                   0, 0, 0, (uint8_t)(devtop | ((lba28 >> 24) & 0x0F)), 0x40, false };
+    if (is16) put16(o, &f); else put12(o, &f);
+}
+
+// SMART, any subcommand.
+static void encs(uint8_t o[16], bool is16, uint8_t proto, uint8_t b2, uint8_t feat, uint8_t count,
+                 uint8_t lo, uint8_t dev) {
+    fields_t f = { proto, b2, feat, count, lo, 0x4F, 0xC2, 0, 0, 0, dev, 0xB0, false };
+    if (is16) put16(o, &f); else put12(o, &f);
+}
+
+// READ NATIVE MAX (0xF8, 28-bit) or READ NATIVE MAX EXT (0x27, 16-byte EXTEND=1).
+static void encn(uint8_t o[16], bool is16, bool ext, uint8_t cmd, uint8_t b2, uint8_t dev) {
+    fields_t f = { 3, b2, 0, 0, 0, 0, 0, 0, 0, 0, dev, cmd, ext };
+    if (is16) put16(o, &f); else put12(o, &f);
+}
+
+// ---------------------------------------------------------------------------
+//  The expectation
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    unsigned count;     // PIO data-in blocks (0 for non-data)
+    bool     nondata;
+    uint8_t  tdev;      // device bits the task file must carry
+} expect_t;
+
+// Would a correct policy allow this?
 static bool expect_allow(const uint8_t *c, int len, bool dir_in, uint32_t xfer,
-                         bool mounted, bool lba_mode, unsigned *count_out) {
-    uint8_t canon[16];
-    unsigned count = 0;
-    int n;
-    if (c[0] == 0xA1 && len == 12) {
-        uint8_t cmd = c[9], dev = c[8];
-        uint32_t lba = c[5] | ((uint32_t)c[6] << 8) | ((uint32_t)c[7] << 16) | ((uint32_t)(dev & 0x0F) << 24);
-        count = c[4];
-        if (cmd == 0xEC) {
-            count = 1;
-            enc12(canon, 0xEC, 1, 0, dev & 0xE0);                     // bits 7,6,5 free
-        } else if (cmd == 0x20 || cmd == 0x21) {
-            if (!lba_mode || count < 1 || count > MAXSEC) return false;
-            if ((uint64_t)lba + count > 0x10000000ull) return false;
-            enc12(canon, cmd, (uint8_t)count, lba, (uint8_t)((dev & 0xA0) | 0x40));
+                         bool mounted, bool lba_mode, expect_t *e_out) {
+    bool is16;
+    if (c[0] == 0xA1 && len == 12) is16 = false;
+    else if (c[0] == 0x85 && len == 16) is16 = true;
+    else return false;
+
+    uint8_t cmd  = is16 ? c[14] : c[9];
+    uint8_t dev  = is16 ? c[13] : c[8];
+    uint8_t feat = is16 ? c[4] : c[3];
+    uint8_t cnt  = is16 ? c[6] : c[4];
+    uint8_t lo   = is16 ? c[8] : c[5];
+    uint8_t mid  = is16 ? c[10] : c[6];
+    uint8_t hi   = is16 ? c[12] : c[7];
+    uint8_t b2   = c[2];
+
+    fields_t f;
+    memset(&f, 0, sizeof(f));
+    f.cmd = cmd;
+    expect_t e = { 0, false, 0 };
+    bool user_data = false;
+    // The non-data byte 2: CK_COND, T_DIR and BYTE_BLOCK may be anything.
+    uint8_t nd_b2_free = (uint8_t)(b2 & 0x2C);
+    uint8_t nd_b2_ck   = (uint8_t)(0x20 | (b2 & 0x0C));
+
+    if (cmd == 0xEC) {
+        e.count = 1;
+        f.count = 1;
+        f.dev = dev & 0xE0;                                         // bits 7,6,5 free
+    } else if (cmd == 0x20 || cmd == 0x21 || cmd == 0x40) {
+        uint32_t lba = lo | ((uint32_t)mid << 8) | ((uint32_t)hi << 16) | ((uint32_t)(dev & 0x0F) << 24);
+        unsigned n;
+        if (cmd == 0x40) { n = cnt ? cnt : 256; e.nondata = true; f.b2 = nd_b2_free; }
+        else { if (cnt < 1 || cnt > MAXSEC) return false; n = cnt; e.count = cnt; }
+        if ((uint64_t)lba + n > 0x10000000ull) return false;
+        f.count = cnt; f.lo = lo; f.mid = mid; f.hi = hi;
+        f.dev = (uint8_t)((dev & 0xA0) | 0x40 | (dev & 0x0F));
+        e.tdev = (uint8_t)(0x40 | (dev & 0x0F));
+        user_data = true;
+    } else if (cmd == 0x24) {
+        if (!is16) return false;
+        uint64_t lba = lo | ((uint64_t)mid << 8) | ((uint64_t)hi << 16) |
+                       ((uint64_t)c[7] << 24) | ((uint64_t)c[9] << 32) | ((uint64_t)c[11] << 40);
+        if (cnt < 1 || cnt > MAXSEC) return false;
+        if (lba + cnt > (1ull << 48)) return false;
+        e.count = cnt;
+        f.ext = true; f.count = cnt; f.lo = lo; f.mid = mid; f.hi = hi;
+        f.hlo = c[7]; f.hmid = c[9]; f.hhi = c[11];
+        f.dev = (uint8_t)((dev & 0xA0) | 0x40);
+        e.tdev = 0x40;
+        user_data = true;
+    } else if (cmd == 0xB0) {
+        f.feat = feat; f.mid = 0x4F; f.hi = 0xC2;
+        f.dev = dev & 0xE0;
+        if (feat == 0xD0 || feat == 0xD1) {
+            e.count = 1; f.count = 1;
+        } else if (feat == 0xD5) {
+            if (cnt < 1 || cnt > MAXSEC) return false;
+            e.count = cnt; f.count = cnt; f.lo = lo;
+        } else if (feat == 0xDA) {
+            e.nondata = true; f.b2 = nd_b2_ck;
         } else {
             return false;
         }
-        n = 12;
-    } else if (c[0] == 0x85 && len == 16) {
-        uint8_t cmd = c[14], dev = c[13];
-        count = c[6];
-        if (cmd == 0xEC) {
-            count = 1;
-            enc16(canon, 0xEC, false, 1, 0, dev & 0xE0);
-        } else if (cmd == 0x20 || cmd == 0x21) {
-            uint32_t lba = c[8] | ((uint32_t)c[10] << 8) | ((uint32_t)c[12] << 16) | ((uint32_t)(dev & 0x0F) << 24);
-            if (!lba_mode || count < 1 || count > MAXSEC) return false;
-            if ((uint64_t)lba + count > 0x10000000ull) return false;
-            enc16(canon, cmd, false, (uint8_t)count, lba, (uint8_t)((dev & 0xA0) | 0x40));
-        } else if (cmd == 0x24) {
-            uint64_t lba = c[8] | ((uint64_t)c[10] << 8) | ((uint64_t)c[12] << 16) |
-                           ((uint64_t)c[7] << 24) | ((uint64_t)c[9] << 32) | ((uint64_t)c[11] << 40);
-            if (!lba_mode || count < 1 || count > MAXSEC) return false;
-            if (lba + count > (1ull << 48)) return false;
-            enc16(canon, 0x24, true, (uint8_t)count, lba, (uint8_t)((dev & 0xA0) | 0x40));
-        } else {
-            return false;
-        }
-        n = 16;
+    } else if (cmd == 0xF8 || cmd == 0x27) {
+        if (cmd == 0x27) { if (!is16) return false; f.ext = true; }
+        e.nondata = true; f.b2 = nd_b2_ck;
+        f.dev = (uint8_t)((dev & 0xA0) | 0x40);
+        e.tdev = 0x40;
     } else {
         return false;
     }
-    if (memcmp(canon, c, (size_t)n) != 0) return false;
-    if (!dir_in || xfer != count * 512u) return false;
+    if (e.nondata) f.proto = 3;
+    else { f.proto = 4; f.b2 = 0x0E; }
+
+    uint8_t canon[16];
+    if (is16) put16(canon, &f); else put12(canon, &f);
+    if (memcmp(canon, c, is16 ? 16u : 12u) != 0) return false;
+
+    if (e.nondata) { if (xfer != 0) return false; }
+    else if (!dir_in || xfer != e.count * 512u) return false;
     if (!mounted) return false;
-    if (count_out) *count_out = count;
+    if (user_data && !lba_mode) return false;
+    if (e_out) *e_out = e;
     return true;
 }
 
@@ -127,8 +216,8 @@ static bool check(const uint8_t cdb_in[16], int len, bool dir_in, uint32_t xfer,
     memset(&tf, 0xAA, sizeof(tf));
     sat_verdict_t v = sat_policy_check(&in, &tf);
 
-    unsigned count = 0;
-    bool exp = expect_allow(cdb, len, dir_in, xfer, mounted, lba_mode, &count);
+    expect_t e;
+    bool exp = expect_allow(cdb, len, dir_in, xfer, mounted, lba_mode, &e);
     n_checks++;
 
     if (memcmp(cdb, cdb_in, 16) != 0) fail("policy modified the CDB", cdb_in, len, dir_in, xfer, mounted, lba_mode);
@@ -143,29 +232,41 @@ static bool check(const uint8_t cdb_in[16], int len, bool dir_in, uint32_t xfer,
         // The task file must be exactly what the CDB said, and only a read.
         bool is16 = cdb[0] == 0x85;
         uint8_t cmd = is16 ? cdb[14] : cdb[9];
-        uint8_t dev = is16 ? cdb[13] : cdb[8];
         bool ext = is16 && (cdb[1] & 1);
         sat_taskfile_t w;
         memset(&w, 0, sizeof(w));
         w.command = cmd;
-        w.count = (uint8_t)count;
-        w.sectors = (uint8_t)count;
+        w.feature = cmd == 0xB0 ? (is16 ? cdb[4] : cdb[3]) : 0;
+        w.count = cmd == 0xEC ? 1 : (is16 ? cdb[6] : cdb[4]);
+        w.sectors = (uint8_t)e.count;
         w.lba_low = is16 ? cdb[8] : cdb[5];
         w.lba_mid = is16 ? cdb[10] : cdb[6];
         w.lba_high = is16 ? cdb[12] : cdb[7];
         w.ext = ext;
         if (ext) { w.hob_lba_low = cdb[7]; w.hob_lba_mid = cdb[9]; w.hob_lba_high = cdb[11]; }
-        w.device = cmd == 0xEC ? 0x00 : (ext ? 0x40 : (uint8_t)(0x40 | (dev & 0x0F)));
-        if (tf.command != 0xEC && tf.command != 0x20 && tf.command != 0x21 && tf.command != 0x24)
+        w.device = e.tdev;
+        w.protocol = e.nondata ? 3 : 4;
+        w.ck_cond = e.nondata && (cdb[2] & 0x20);
+        bool read_set = tf.command == 0xEC || tf.command == 0x20 || tf.command == 0x21 ||
+                        tf.command == 0x24 || tf.command == 0x40 || tf.command == 0xF8 ||
+                        tf.command == 0x27 ||
+                        (tf.command == 0xB0 && (tf.feature == 0xD0 || tf.feature == 0xD1 ||
+                                                tf.feature == 0xD5 || tf.feature == 0xDA));
+        if (!read_set)
             fail("task file carries a command outside the read set", cdb, len, dir_in, xfer, mounted, lba_mode);
         if (tf.command != w.command || tf.count != w.count || tf.sectors != w.sectors ||
             tf.lba_low != w.lba_low || tf.lba_mid != w.lba_mid || tf.lba_high != w.lba_high ||
             tf.hob_lba_low != w.hob_lba_low || tf.hob_lba_mid != w.hob_lba_mid ||
-            tf.hob_lba_high != w.hob_lba_high || tf.hob_count != 0 || tf.feature != 0 ||
-            tf.hob_feature != 0 || tf.ext != w.ext || tf.device != w.device)
+            tf.hob_lba_high != w.hob_lba_high || tf.hob_count != 0 || tf.feature != w.feature ||
+            tf.hob_feature != 0 || tf.ext != w.ext || tf.device != w.device ||
+            tf.protocol != w.protocol || tf.ck_cond != w.ck_cond)
             fail("task file does not match the CDB", cdb, len, dir_in, xfer, mounted, lba_mode);
-        if (tf.sectors < 1 || tf.sectors > MAXSEC || (uint32_t)tf.sectors * 512u != xfer)
+        if (e.nondata) {
+            if (tf.sectors != 0 || xfer != 0)
+                fail("non-data task file has a data phase", cdb, len, dir_in, xfer, mounted, lba_mode);
+        } else if (tf.sectors < 1 || tf.sectors > MAXSEC || (uint32_t)tf.sectors * 512u != xfer) {
             fail("task file transfer does not match the CBW", cdb, len, dir_in, xfer, mounted, lba_mode);
+        }
     } else {
         n_refuse++;
         static const sat_taskfile_t zero;
@@ -185,18 +286,22 @@ static bool check(const uint8_t cdb_in[16], int len, bool dir_in, uint32_t xfer,
     return v.allow;
 }
 
-// Seeds: one canonical CDB for every allowed row, at a few LBAs.
-typedef struct { uint8_t cdb[16]; int len; unsigned count; } seed_t;
-static seed_t seeds[200];
+// Seeds: one canonical CDB for every allowed row, at a few LBAs and in the
+// byte-2 and device-byte variants real tools send.
+typedef struct { uint8_t cdb[16]; int len; bool dir_in; uint32_t xfer; } seed_t;
+static seed_t seeds[600];
 static int n_seeds;
 
-static void add_seed12(uint8_t cmd, uint8_t count, uint32_t lba, uint8_t devtop) {
+static seed_t *new_seed(int len, bool dir_in, uint32_t xfer) {
     seed_t *s = &seeds[n_seeds++];
-    enc12(s->cdb, cmd, count, lba, devtop); s->len = 12; s->count = count;
+    s->len = len; s->dir_in = dir_in; s->xfer = xfer;
+    return s;
+}
+static void add_seed12(uint8_t cmd, uint8_t count, uint32_t lba, uint8_t devtop) {
+    enc12(new_seed(12, true, count * 512u)->cdb, cmd, count, lba, devtop);
 }
 static void add_seed16(uint8_t cmd, bool ext, uint8_t count, uint64_t lba, uint8_t devtop) {
-    seed_t *s = &seeds[n_seeds++];
-    enc16(s->cdb, cmd, ext, count, lba, devtop); s->len = 16; s->count = count;
+    enc16(new_seed(16, true, count * 512u)->cdb, cmd, ext, count, lba, devtop);
 }
 
 static void build_seeds(void) {
@@ -222,6 +327,50 @@ static void build_seeds(void) {
         add_seed16(0x24, true, 1, l48[i], 0x40);
         add_seed16(0x24, true, MAXSEC, l48[i], 0xE0);
     }
+
+    // READ VERIFY (non-data). hdparm sends byte 2 = 0x20 (CK_COND only),
+    // smartctl 0x2C (T_DIR and BYTE_BLOCK as well).
+    static const uint32_t v28[] = { 0, 1, 0x1234, 0x0950FA0F, 0x0FFFFF00 };
+    static const uint8_t vcnt[] = { 1, 8, 255, 0 };
+    static const uint8_t vb2[] = { 0x00, 0x20, 0x2C, 0x0C, 0x08, 0x04, 0x28, 0x24 };
+    for (unsigned i = 0; i < sizeof(v28) / sizeof(v28[0]); i++)
+        for (unsigned k = 0; k < sizeof(vcnt) / sizeof(vcnt[0]); k++)
+            for (unsigned b = 0; b < sizeof(vb2) / sizeof(vb2[0]); b++) {
+                if (b > 1 && k != 0 && i != 2) continue;          // every byte-2 form, at a few places
+                encv(new_seed(12, false, 0)->cdb, false, vb2[b], vcnt[k], v28[i], 0xE0);
+                encv(new_seed(16, false, 0)->cdb, true, vb2[b], vcnt[k], v28[i], 0x40);
+            }
+
+    // SMART. smartread.ps1: A1 08 0E D0 01 00 4F C2 A0 B0 00 00 (and D1).
+    static const uint8_t sdev[] = { 0x00, 0xA0, 0xE0, 0x40 };
+    for (unsigned d = 0; d < sizeof(sdev) / sizeof(sdev[0]); d++)
+        for (int form = 0; form < 2; form++) {
+            bool is16 = form == 1;
+            int len = is16 ? 16 : 12;
+            encs(new_seed(len, true, 512)->cdb, is16, 4, 0x0E, 0xD0, 1, 0, sdev[d]);
+            encs(new_seed(len, true, 512)->cdb, is16, 4, 0x0E, 0xD1, 1, 0, sdev[d]);
+            encs(new_seed(len, false, 0)->cdb, is16, 3, 0x20, 0xDA, 0, 0, sdev[d]);
+            encs(new_seed(len, false, 0)->cdb, is16, 3, 0x2C, 0xDA, 0, 0, sdev[d]);
+        }
+    static const uint8_t logs[] = { 0x00, 0x01, 0x06, 0x80, 0xE0, 0xFF };
+    for (unsigned g = 0; g < sizeof(logs) / sizeof(logs[0]); g++)
+        for (uint8_t n = 1; n <= MAXSEC; n++) {
+            if (n != 1 && n != MAXSEC && g != 1) continue;
+            encs(new_seed(12, true, n * 512u)->cdb, false, 4, 0x0E, 0xD5, n, logs[g], 0xA0);
+            encs(new_seed(16, true, n * 512u)->cdb, true, 4, 0x0E, 0xD5, n, logs[g], 0x00);
+        }
+    encs(new_seed(12, false, 0)->cdb, false, 3, 0x28, 0xDA, 0, 0, 0xA0);
+    encs(new_seed(12, false, 0)->cdb, false, 3, 0x24, 0xDA, 0, 0, 0xA0);
+
+    // READ NATIVE MAX ADDRESS (0xF8) and READ NATIVE MAX ADDRESS EXT (0x27).
+    static const uint8_t nb2[] = { 0x20, 0x2C, 0x28, 0x24 };
+    static const uint8_t ndev[] = { 0x40, 0xE0, 0x60, 0xC0 };
+    for (unsigned b = 0; b < sizeof(nb2) / sizeof(nb2[0]); b++)
+        for (unsigned d = 0; d < sizeof(ndev) / sizeof(ndev[0]); d++) {
+            encn(new_seed(12, false, 0)->cdb, false, false, 0xF8, nb2[b], ndev[d]);
+            encn(new_seed(16, false, 0)->cdb, true, false, 0xF8, nb2[b], ndev[d]);
+            encn(new_seed(16, false, 0)->cdb, true, true, 0x27, nb2[b], ndev[d]);
+        }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,36 +381,45 @@ int main(void) {
     // Every seed must itself be allowed, or the sweeps around it prove nothing.
     section = "0 seeds";
     for (int i = 0; i < n_seeds; i++)
-        if (!check(seeds[i].cdb, seeds[i].len, true, seeds[i].count * 512u, true, true))
-            fail("seed is not allowed", seeds[i].cdb, seeds[i].len, true, seeds[i].count * 512u, true, true);
+        if (!check(seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, true, true))
+            fail("seed is not allowed", seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, true, true);
     printf("[0] %d seeds, all allowed\n", n_seeds);
 
-    // 1. The domain: {A1, 85 EXTEND=0, 85 EXTEND=1} x {IDENTIFY-shaped,
-    //    READ-shaped} x every ATA command byte x every PROTOCOL x both T_DIR
-    //    x counts 0..9 and 255. The CBW agrees with the CDB (a consistent host).
+    // 1. The domain: {A1, 85 EXTEND=0, 85 EXTEND=1} x {IDENTIFY-, READ-,
+    //    SMART-D0-, SMART-D5-, SMART-DA- and NATIVE-MAX-shaped} x every ATA
+    //    command byte x every PROTOCOL x eight byte-2 values x counts 0..9 and
+    //    255. The CBW agrees with byte 2 (a consistent host).
     section = "1 domain";
     long a0 = n_allow, c0 = n_checks;
     static const unsigned counts[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255 };
+    static const uint8_t b2s[] = { 0x0E, 0x06, 0x00, 0x20, 0x2C, 0x0C, 0x2E, 0x24 };
     for (int form = 0; form < 3; form++)
-        for (int shape = 0; shape < 2; shape++)
+        for (int shape = 0; shape < 6; shape++)
             for (unsigned cmd = 0; cmd < 256; cmd++)
                 for (unsigned proto = 0; proto < 16; proto++)
-                    for (int tdir = 0; tdir < 2; tdir++)
+                    for (unsigned bi = 0; bi < sizeof(b2s); bi++)
                         for (unsigned ci = 0; ci < sizeof(counts) / sizeof(counts[0]); ci++) {
                             uint8_t c[16];
                             uint8_t cnt = (uint8_t)counts[ci];
-                            if (form == 0) {
-                                if (shape == 0) enc12(c, (uint8_t)cmd, cnt, 0, 0x00);
-                                else            enc12(c, (uint8_t)cmd, cnt, 0x0234567, 0xE0);
-                                c[1] = (uint8_t)(proto << 1);
-                            } else {
-                                bool ext = form == 2;
-                                if (shape == 0) enc16(c, (uint8_t)cmd, ext, cnt, 0, 0x00);
-                                else            enc16(c, (uint8_t)cmd, ext, cnt, ext ? 0x0123456789Aull : 0x0234567, 0xE0);
-                                c[1] = (uint8_t)((proto << 1) | (ext ? 1 : 0));
+                            bool is16 = form != 0, ext = form == 2;
+                            fields_t f;
+                            memset(&f, 0, sizeof(f));
+                            f.cmd = (uint8_t)cmd; f.count = cnt; f.ext = ext;
+                            switch (shape) {
+                            case 0: break;                                              // all zero
+                            case 1: f.lo = 0x67; f.mid = 0x45; f.hi = 0x23; f.dev = 0xE0;
+                                    if (ext) { f.hlo = 0x89; f.hmid = 0x01; } else f.dev |= 0x02;
+                                    break;
+                            case 2: f.feat = 0xD0; f.mid = 0x4F; f.hi = 0xC2; f.dev = 0xA0; break;
+                            case 3: f.feat = 0xD5; f.lo = 0x80; f.mid = 0x4F; f.hi = 0xC2; f.dev = 0xA0; break;
+                            case 4: f.feat = 0xDA; f.mid = 0x4F; f.hi = 0xC2; f.dev = 0xA0; break;
+                            case 5: f.dev = 0x40; break;
                             }
-                            c[2] = tdir ? 0x0E : 0x06;
-                            check(c, form == 0 ? 12 : 16, tdir != 0, cnt * 512u, true, true);
+                            if (is16) put16(c, &f); else put12(c, &f);
+                            c[1] = (uint8_t)((proto << 1) | (ext ? 1 : 0));
+                            c[2] = b2s[bi];
+                            bool tlen = (c[2] & 0x03) != 0, tdir = (c[2] & 0x08) != 0;
+                            check(c, is16 ? 16 : 12, tlen && tdir, tlen ? cnt * 512u : 0, true, true);
                         }
     printf("[1] domain sweep: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
 
@@ -274,7 +432,7 @@ int main(void) {
                 uint8_t c[16];
                 memcpy(c, seeds[i].cdb, 16);
                 c[pos] = (uint8_t)val;
-                check(c, seeds[i].len, true, seeds[i].count * 512u, true, true);
+                check(c, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, true, true);
             }
     printf("[2] single-byte changes: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
 
@@ -295,7 +453,7 @@ int main(void) {
     a0 = n_allow; c0 = n_checks;
     for (int i = 0; i < n_seeds; i++)
         for (int len = 0; len < 256; len++)
-            check(seeds[i].cdb, len, true, seeds[i].count * 512u, true, true);
+            check(seeds[i].cdb, len, seeds[i].dir_in, seeds[i].xfer, true, true);
     printf("[4] CB length 0..255: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
 
     // 5. State: mounted x LBA mode, for every seed and for its single-byte changes.
@@ -304,15 +462,29 @@ int main(void) {
     for (int i = 0; i < n_seeds; i++)
         for (int m = 0; m < 2; m++)
             for (int l = 0; l < 2; l++) {
-                check(seeds[i].cdb, seeds[i].len, true, seeds[i].count * 512u, m != 0, l != 0);
+                check(seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, m != 0, l != 0);
                 for (int pos = 0; pos < 16; pos++) {
                     uint8_t c[16];
                     memcpy(c, seeds[i].cdb, 16);
                     c[pos] ^= 0x01;
-                    check(c, seeds[i].len, true, seeds[i].count * 512u, m != 0, l != 0);
+                    check(c, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, m != 0, l != 0);
                 }
             }
     printf("[5] mounted x LBA mode: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
+
+    // 5b. The CHS-mode rule stated directly, not through expect_allow(): with
+    //     the drive set up in CHS mode, a seed is allowed exactly when it names
+    //     no user sector (IDENTIFY, SMART, READ NATIVE MAX).
+    section = "5b chs rule";
+    a0 = n_allow; c0 = n_checks;
+    for (int i = 0; i < n_seeds; i++) {
+        uint8_t cmd = seeds[i].len == 16 ? seeds[i].cdb[14] : seeds[i].cdb[9];
+        bool want = cmd == 0xEC || cmd == 0xB0 || cmd == 0xF8 || cmd == 0x27;
+        if (check(seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, true, false) != want) {
+            n_fail++; printf("  FAIL CHS rule, command %02X\n", cmd);
+        }
+    }
+    printf("[5b] CHS mode, direct: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
 
     // 6. Every SCSI opcode in byte 0, with an otherwise valid body.
     section = "6 opcode";
@@ -322,8 +494,8 @@ int main(void) {
             uint8_t c[16];
             memcpy(c, seeds[i].cdb, 16);
             c[0] = (uint8_t)op;
-            check(c, 12, true, seeds[i].count * 512u, true, true);
-            check(c, 16, true, seeds[i].count * 512u, true, true);
+            check(c, 12, seeds[i].dir_in, seeds[i].xfer, true, true);
+            check(c, 16, seeds[i].dir_in, seeds[i].xfer, true, true);
         }
     printf("[6] SCSI opcode byte: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
 
@@ -352,6 +524,21 @@ int main(void) {
             }
         }
     }
+    // READ VERIFY: count 0 means 256 sectors, and the end check must know it.
+    static const unsigned vn[] = { 1, 2, 8, 128, 255, 256 };
+    for (unsigned k = 0; k < sizeof(vn) / sizeof(vn[0]); k++) {
+        uint8_t c[16];
+        unsigned n = vn[k];
+        for (int d = -2; d <= 2; d++) {
+            uint64_t lba = 0x10000000ull - n + (uint64_t)(int64_t)d;
+            bool want = lba + n <= 0x10000000ull;
+            if (lba >= 0x10000000ull) continue;
+            encv(c, false, 0x20, (uint8_t)(n & 0xFF), (uint32_t)lba, 0x40);
+            if (check(c, 12, false, 0, true, true) != want) { n_fail++; printf("  FAIL verify bound, 12-byte, n=%u d=%d\n", n, d); }
+            encv(c, true, 0x00, (uint8_t)(n & 0xFF), (uint32_t)lba, 0xE0);
+            if (check(c, 16, false, 0, true, true) != want) { n_fail++; printf("  FAIL verify bound, 16-byte, n=%u d=%d\n", n, d); }
+        }
+    }
     printf("[7] LBA boundaries: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
 
     // 8. Named refusals: each must be refused. Most are already inside the
@@ -359,41 +546,95 @@ int main(void) {
     section = "8 named";
     c0 = n_checks;
     int named_bad = 0;
-    struct { const char *name; uint8_t c[16]; int len; uint32_t xfer; } named[] = {
-        { "SRST template (SAT protocol 1)",       { 0xA1, 0x02 }, 12, 0 },
-        { "Return Response Info (protocol 15)",   { 0xA1, 0x1E, 0x20 }, 12, 0 },
-        { "READ DMA 0xC8",                        { 0xA1, 0x0C, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0xC8 }, 12, 512 },
-        { "READ DMA 0xC8 as PIO",                 { 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0xC8 }, 12, 512 },
-        { "READ DMA EXT 0x25",                    { 0x85, 0x0D, 0x0E, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xE0, 0x25 }, 16, 512 },
-        { "READ DMA EXT 0x25 as PIO",             { 0x85, 0x09, 0x0E, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xE0, 0x25 }, 16, 512 },
-        { "READ SECTORS EXT 0x24 in 12-byte CDB", { 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0x24 }, 12, 512 },
-        { "READ SECTORS EXT with EXTEND=0",       { 0x85, 0x08, 0x0E, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xE0, 0x24 }, 16, 512 },
-        { "READ SECTORS with EXTEND=1",           { 0x85, 0x09, 0x0E, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xE0, 0x20 }, 16, 512 },
-        { "READ SECTORS count 0 (ATA 256)",       { 0xA1, 0x08, 0x0E, 0, 0, 0, 0, 0, 0xE0, 0x20 }, 12, 0 },
-        { "READ SECTORS count 9",                 { 0xA1, 0x08, 0x0E, 0, 9, 0, 0, 0, 0xE0, 0x20 }, 12, 9 * 512 },
-        { "READ SECTORS count 128 (imagelba default chunk)", { 0xA1, 0x08, 0x0E, 0, 128, 0, 0, 0, 0xE0, 0x20 }, 12, 128 * 512 },
-        { "READ SECTORS in CHS form (LBA bit 0)", { 0xA1, 0x08, 0x0E, 0, 1, 1, 0, 0, 0xA0, 0x20 }, 12, 512 },
-        { "READ SECTORS to device 1 (DEV bit)",   { 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0xF0, 0x20 }, 12, 512 },
-        { "READ SECTORS, CK_COND=1",              { 0xA1, 0x08, 0x2E, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, 512 },
-        { "READ SECTORS, T_DIR=0",                { 0xA1, 0x08, 0x06, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, 512 },
-        { "READ SECTORS, BYTE_BLOCK=0",           { 0xA1, 0x08, 0x0A, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, 512 },
-        { "READ SECTORS, MULTIPLE_COUNT=1",       { 0xA1, 0x28, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, 512 },
-        { "READ SECTORS, PIO data-out protocol",  { 0xA1, 0x0A, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, 512 },
-        { "READ VERIFY 0x40 (not in stage 1)",    { 0xA1, 0x06, 0x00, 0, 1, 0, 0, 0, 0xE0, 0x40 }, 12, 0 },
-        { "SMART READ DATA (not in stage 1)",     { 0xA1, 0x08, 0x0E, 0xD0, 1, 0, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, 512 },
-        { "SMART READ LOG (not in stage 1)",      { 0x85, 0x08, 0x0E, 0, 0xD5, 0, 1, 0, 0, 0, 0x4F, 0, 0xC2, 0xA0, 0xB0 }, 16, 512 },
-        { "WRITE SECTORS 0x30",                   { 0xA1, 0x0A, 0x06, 0, 1, 0, 0, 0, 0xE0, 0x30 }, 12, 512 },
-        { "WRITE SECTORS 0x30 dressed as data-in",{ 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0x30 }, 12, 512 },
-        { "WRITE SECTORS EXT 0x34",               { 0x85, 0x0B, 0x06, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xE0, 0x34 }, 16, 512 },
-        { "WRITE DMA 0xCA",                       { 0xA1, 0x0C, 0x06, 0, 1, 0, 0, 0, 0xE0, 0xCA }, 12, 512 },
-        { "SECURITY ERASE UNIT 0xF4",             { 0xA1, 0x0A, 0x06, 0, 1, 0, 0, 0, 0xA0, 0xF4 }, 12, 512 },
-        { "SET MAX ADDRESS 0xF9",                 { 0xA1, 0x06, 0x00, 0, 0, 0, 0, 0, 0xE0, 0xF9 }, 12, 0 },
-        { "DOWNLOAD MICROCODE 0x92",              { 0xA1, 0x0A, 0x06, 0x07, 1, 0, 0, 0, 0xA0, 0x92 }, 12, 512 },
-        { "IDENTIFY with CB length 16",           { 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0, 0xEC }, 16, 512 },
-        { "IDENTIFY, 85 form with CB length 12",  { 0x85, 0x08, 0x0E, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xEC }, 12, 512 },
+    struct { const char *name; uint8_t c[16]; int len; bool dir_in; uint32_t xfer; bool lba_mode; } named[] = {
+        { "SRST template (SAT protocol 1)",       { 0xA1, 0x02 }, 12, false, 0, true },
+        { "Return Response Info (protocol 15)",   { 0xA1, 0x1E, 0x20 }, 12, false, 0, true },
+        { "READ DMA 0xC8",                        { 0xA1, 0x0C, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0xC8 }, 12, true, 512, true },
+        { "READ DMA 0xC8 as PIO",                 { 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0xC8 }, 12, true, 512, true },
+        { "READ DMA EXT 0x25",                    { 0x85, 0x0D, 0x0E, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xE0, 0x25 }, 16, true, 512, true },
+        { "READ DMA EXT 0x25 as PIO",             { 0x85, 0x09, 0x0E, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xE0, 0x25 }, 16, true, 512, true },
+        { "READ SECTORS EXT 0x24 in 12-byte CDB", { 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0x24 }, 12, true, 512, true },
+        { "READ SECTORS EXT with EXTEND=0",       { 0x85, 0x08, 0x0E, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xE0, 0x24 }, 16, true, 512, true },
+        { "READ SECTORS with EXTEND=1",           { 0x85, 0x09, 0x0E, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xE0, 0x20 }, 16, true, 512, true },
+        { "READ SECTORS count 0 (ATA 256)",       { 0xA1, 0x08, 0x0E, 0, 0, 0, 0, 0, 0xE0, 0x20 }, 12, true, 0, true },
+        { "READ SECTORS count 9",                 { 0xA1, 0x08, 0x0E, 0, 9, 0, 0, 0, 0xE0, 0x20 }, 12, true, 9 * 512, true },
+        { "READ SECTORS count 128 (imagelba default chunk)", { 0xA1, 0x08, 0x0E, 0, 128, 0, 0, 0, 0xE0, 0x20 }, 12, true, 128 * 512, true },
+        { "READ SECTORS in CHS form (LBA bit 0)", { 0xA1, 0x08, 0x0E, 0, 1, 1, 0, 0, 0xA0, 0x20 }, 12, true, 512, true },
+        { "READ SECTORS to device 1 (DEV bit)",   { 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0xF0, 0x20 }, 12, true, 512, true },
+        { "READ SECTORS, CK_COND=1",              { 0xA1, 0x08, 0x2E, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, true, 512, true },
+        { "READ SECTORS, T_DIR=0",                { 0xA1, 0x08, 0x06, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, true, 512, true },
+        { "READ SECTORS, BYTE_BLOCK=0",           { 0xA1, 0x08, 0x0A, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, true, 512, true },
+        { "READ SECTORS, MULTIPLE_COUNT=1",       { 0xA1, 0x28, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, true, 512, true },
+        { "READ SECTORS, PIO data-out protocol",  { 0xA1, 0x0A, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, true, 512, true },
+        { "READ SECTORS as non-data",             { 0xA1, 0x06, 0x20, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, false, 0, true },
+        { "READ SECTORS in CHS mode",             { 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0x20 }, 12, true, 512, false },
+        { "READ VERIFY in CHS mode",              { 0xA1, 0x06, 0x20, 0, 1, 0, 0, 0, 0xE0, 0x40 }, 12, false, 0, false },
+        { "READ VERIFY in CHS form (LBA bit 0)",  { 0xA1, 0x06, 0x20, 0, 1, 1, 0, 0, 0xA0, 0x40 }, 12, false, 0, true },
+        { "READ VERIFY as PIO data-in",           { 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0x40 }, 12, true, 512, true },
+        { "READ VERIFY with a data-in CBW",       { 0xA1, 0x06, 0x20, 0, 1, 0, 0, 0, 0xE0, 0x40 }, 12, true, 512, true },
+        { "READ VERIFY with a data-out CBW",      { 0xA1, 0x06, 0x20, 0, 1, 0, 0, 0, 0xE0, 0x40 }, 12, false, 512, true },
+        { "READ VERIFY, T_LENGTH=2",              { 0xA1, 0x06, 0x22, 0, 1, 0, 0, 0, 0xE0, 0x40 }, 12, false, 0, true },
+        { "READ VERIFY, OFF_LINE=1",              { 0xA1, 0x06, 0x60, 0, 1, 0, 0, 0, 0xE0, 0x40 }, 12, false, 0, true },
+        { "READ VERIFY, T_TYPE=1",                { 0xA1, 0x06, 0x30, 0, 1, 0, 0, 0, 0xE0, 0x40 }, 12, false, 0, true },
+        { "READ VERIFY with EXTEND=1",            { 0x85, 0x07, 0x20, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xE0, 0x40 }, 16, false, 0, true },
+        { "READ VERIFY EXT 0x42",                 { 0x85, 0x07, 0x20, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0x40, 0x42 }, 16, false, 0, true },
+        { "READ VERIFY past 2^28 (count 0)",      { 0xA1, 0x06, 0x20, 0, 0, 0x01, 0xFF, 0xFF, 0xEF, 0x40 }, 12, false, 0, true },
+        { "SMART RETURN STATUS as PIO (interlock-test.ps1 shape)", { 0xA1, 0x08, 0x0E, 0xDA, 1, 0, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, true, 512, true },
+        { "SMART RETURN STATUS, CK_COND=0",       { 0xA1, 0x06, 0x0C, 0xDA, 0, 0, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, false, 0, true },
+        { "SMART RETURN STATUS, count 1",         { 0xA1, 0x06, 0x20, 0xDA, 1, 0, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, false, 0, true },
+        { "SMART READ DATA without 4F/C2",        { 0xA1, 0x08, 0x0E, 0xD0, 1, 0, 0, 0, 0xA0, 0xB0 }, 12, true, 512, true },
+        { "SMART READ DATA as non-data",          { 0xA1, 0x06, 0x20, 0xD0, 1, 0, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, false, 0, true },
+        { "SMART READ DATA, count 2",             { 0xA1, 0x08, 0x0E, 0xD0, 2, 0, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, true, 1024, true },
+        { "SMART READ DATA with EXTEND=1",        { 0x85, 0x09, 0x0E, 0, 0xD0, 0, 1, 0, 0, 0, 0x4F, 0, 0xC2, 0xA0, 0xB0 }, 16, true, 512, true },
+        { "SMART READ LOG, 9 sectors",            { 0xA1, 0x08, 0x0E, 0xD5, 9, 1, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, true, 9 * 512, true },
+        { "SMART READ LOG, 0 sectors",            { 0xA1, 0x08, 0x0E, 0xD5, 0, 1, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, true, 0, true },
+        { "SMART ENABLE OPERATIONS D8",           { 0xA1, 0x06, 0x20, 0xD8, 0, 0, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, false, 0, true },
+        { "SMART DISABLE OPERATIONS D9",          { 0xA1, 0x06, 0x20, 0xD9, 0, 0, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, false, 0, true },
+        { "SMART ATTRIBUTE AUTOSAVE D2",          { 0xA1, 0x06, 0x20, 0xD2, 0xF1, 0, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, false, 0, true },
+        { "SMART SAVE ATTRIBUTE VALUES D3",       { 0xA1, 0x06, 0x20, 0xD3, 0, 0, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, false, 0, true },
+        { "SMART EXECUTE OFF-LINE D4",            { 0xA1, 0x06, 0x20, 0xD4, 0, 0x01, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, false, 0, true },
+        { "SMART WRITE LOG D6",                   { 0xA1, 0x0A, 0x06, 0xD6, 1, 0x80, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, false, 512, true },
+        { "SMART WRITE LOG D6 dressed as data-in",{ 0xA1, 0x08, 0x0E, 0xD6, 1, 0x80, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, true, 512, true },
+        { "SMART ENABLE/DISABLE AUTO OFF-LINE DB",{ 0xA1, 0x06, 0x20, 0xDB, 0xF8, 0, 0x4F, 0xC2, 0xA0, 0xB0 }, 12, false, 0, true },
+        { "READ NATIVE MAX, CK_COND=0",           { 0xA1, 0x06, 0x00, 0, 0, 0, 0, 0, 0x40, 0xF8 }, 12, false, 0, true },
+        { "READ NATIVE MAX, LBA bit 0",           { 0xA1, 0x06, 0x20, 0, 0, 0, 0, 0, 0xA0, 0xF8 }, 12, false, 0, true },
+        { "READ NATIVE MAX, count 1",             { 0xA1, 0x06, 0x20, 0, 1, 0, 0, 0, 0x40, 0xF8 }, 12, false, 0, true },
+        { "READ NATIVE MAX with EXTEND=1",        { 0x85, 0x07, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0xF8 }, 16, false, 0, true },
+        { "READ NATIVE MAX EXT in 12-byte CDB",   { 0xA1, 0x06, 0x20, 0, 0, 0, 0, 0, 0x40, 0x27 }, 12, false, 0, true },
+        { "READ NATIVE MAX EXT with EXTEND=0",    { 0x85, 0x06, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x27 }, 16, false, 0, true },
+        { "READ NATIVE MAX EXT, CK_COND=0",       { 0x85, 0x07, 0x0C, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x27 }, 16, false, 0, true },
+        { "READ NATIVE MAX EXT, HOB LBA set",     { 0x85, 0x07, 0x20, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0x40, 0x27 }, 16, false, 0, true },
+        { "SET MAX ADDRESS 0xF9",                 { 0xA1, 0x06, 0x00, 0, 0, 0, 0, 0, 0xE0, 0xF9 }, 12, false, 0, true },
+        { "SET MAX ADDRESS 0xF9 with CK_COND",    { 0xA1, 0x06, 0x20, 0, 0, 0, 0, 0, 0x40, 0xF9 }, 12, false, 0, true },
+        { "SET MAX ADDRESS EXT 0x37",             { 0x85, 0x07, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x37 }, 16, false, 0, true },
+        { "DCO RESTORE 0xB1/C0",                  { 0xA1, 0x06, 0x20, 0xC0, 0, 0, 0, 0, 0xA0, 0xB1 }, 12, false, 0, true },
+        { "DCO FREEZE LOCK 0xB1/C1",              { 0xA1, 0x06, 0x20, 0xC1, 0, 0, 0, 0, 0xA0, 0xB1 }, 12, false, 0, true },
+        { "DCO IDENTIFY 0xB1/C2",                 { 0xA1, 0x08, 0x0E, 0xC2, 1, 0, 0, 0, 0xA0, 0xB1 }, 12, true, 512, true },
+        { "DCO SET 0xB1/C3",                      { 0xA1, 0x0A, 0x06, 0xC3, 1, 0, 0, 0, 0xA0, 0xB1 }, 12, false, 512, true },
+        { "DCO IDENTIFY dressed as SMART shape",  { 0xA1, 0x08, 0x0E, 0xC2, 1, 0, 0x4F, 0xC2, 0xA0, 0xB1 }, 12, true, 512, true },
+        { "SECURITY SET PASSWORD 0xF1",           { 0xA1, 0x0A, 0x06, 0, 1, 0, 0, 0, 0xA0, 0xF1 }, 12, false, 512, true },
+        { "SECURITY UNLOCK 0xF2",                 { 0xA1, 0x0A, 0x06, 0, 1, 0, 0, 0, 0xA0, 0xF2 }, 12, false, 512, true },
+        { "SECURITY ERASE PREPARE 0xF3",          { 0xA1, 0x06, 0x20, 0, 0, 0, 0, 0, 0xA0, 0xF3 }, 12, false, 0, true },
+        { "SECURITY ERASE UNIT 0xF4",             { 0xA1, 0x0A, 0x06, 0, 1, 0, 0, 0, 0xA0, 0xF4 }, 12, true, 512, true },
+        { "SECURITY FREEZE LOCK 0xF5",            { 0xA1, 0x06, 0x20, 0, 0, 0, 0, 0, 0xA0, 0xF5 }, 12, false, 0, true },
+        { "SECURITY DISABLE PASSWORD 0xF6",       { 0xA1, 0x0A, 0x06, 0, 1, 0, 0, 0, 0xA0, 0xF6 }, 12, false, 512, true },
+        { "WRITE SECTORS 0x30",                   { 0xA1, 0x0A, 0x06, 0, 1, 0, 0, 0, 0xE0, 0x30 }, 12, true, 512, true },
+        { "WRITE SECTORS 0x30 dressed as data-in",{ 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0xE0, 0x30 }, 12, true, 512, true },
+        { "WRITE SECTORS 0x30 as non-data",       { 0xA1, 0x06, 0x20, 0, 1, 0, 0, 0, 0xE0, 0x30 }, 12, false, 0, true },
+        { "WRITE SECTORS EXT 0x34",               { 0x85, 0x0B, 0x06, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xE0, 0x34 }, 16, true, 512, true },
+        { "WRITE VERIFY 0x3C",                    { 0xA1, 0x0A, 0x06, 0, 1, 0, 0, 0, 0xE0, 0x3C }, 12, false, 512, true },
+        { "WRITE DMA 0xCA",                       { 0xA1, 0x0C, 0x06, 0, 1, 0, 0, 0, 0xE0, 0xCA }, 12, true, 512, true },
+        { "FORMAT TRACK 0x50",                    { 0xA1, 0x0A, 0x06, 0, 1, 0, 0, 0, 0xE0, 0x50 }, 12, false, 512, true },
+        { "INITIALIZE DEVICE PARAMETERS 0x91",    { 0xA1, 0x06, 0x20, 0, 17, 0, 0, 0, 0xA9, 0x91 }, 12, false, 0, true },
+        { "RECALIBRATE 0x10",                     { 0xA1, 0x06, 0x20, 0, 0, 0, 0, 0, 0xA0, 0x10 }, 12, false, 0, true },
+        { "SET FEATURES 0xEF",                    { 0xA1, 0x06, 0x20, 0x82, 0, 0, 0, 0, 0xA0, 0xEF }, 12, false, 0, true },
+        { "DOWNLOAD MICROCODE 0x92",              { 0xA1, 0x0A, 0x06, 0x07, 1, 0, 0, 0, 0xA0, 0x92 }, 12, true, 512, true },
+        { "IDENTIFY with CB length 16",           { 0xA1, 0x08, 0x0E, 0, 1, 0, 0, 0, 0, 0xEC }, 16, true, 512, true },
+        { "IDENTIFY, 85 form with CB length 12",  { 0x85, 0x08, 0x0E, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xEC }, 12, true, 512, true },
+        { "IDENTIFY as non-data with CK_COND",    { 0xA1, 0x06, 0x20, 0, 1, 0, 0, 0, 0, 0xEC }, 12, false, 0, true },
     };
     for (unsigned i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
-        bool a = check(named[i].c, named[i].len, true, named[i].xfer, true, true);
+        bool a = check(named[i].c, named[i].len, named[i].dir_in, named[i].xfer, true, named[i].lba_mode);
         if (a) { named_bad++; printf("  FAIL named refusal allowed: %s\n", named[i].name); n_fail++; }
     }
     printf("[8] named refusals: %u cases, %d allowed\n", (unsigned)(sizeof(named) / sizeof(named[0])), named_bad);
@@ -471,6 +712,27 @@ int main(void) {
         sat_taskfile_t tf;
         n_checks++;
         if (sat_policy_check(&in, &tf).allow) { n_fail++; printf("  FAIL data-out CBW allowed\n"); }
+        // Non-data rows through a data-out CBW. On the data-out path TinyUSB
+        // passes the real CBW length (1..4096) as bufsize, and a mimic image
+        // must match it in its low 16 bits, so its length is never 0: every
+        // non-data row is refused, whatever the mimic says.
+        {
+            uint8_t v[16];
+            encs(v, false, 3, 0x20, 0xDA, 0, 0, 0xA0);
+            for (uint32_t real = 1; real <= 4096; real++) {
+                uint8_t mimic[31] = { 0x55, 0x53, 0x42, 0x43, 0, 0, 0, 0,
+                                      (uint8_t)real, (uint8_t)(real >> 8), 0, 0, 0x00, 0x00, 12 };
+                memcpy(mimic + 15, v, 16);
+                for (int hi = 0; hi < 2; hi++) {
+                    mimic[10] = (uint8_t)hi;           // try 0x0001xxxx as well
+                    sat_cbw_t mo;
+                    if (!sat_cbw_parse(mimic, 0, v, (uint16_t)real, &mo)) continue;
+                    sat_input_t mi = { v, mo.cb_len, mo.dir_in, mo.xfer_len, true, true };
+                    n_checks++;
+                    if (sat_policy_check(&mi, &tf).allow) { n_fail++; printf("  FAIL non-data row allowed through a data-out mimic, len %u\n", real); }
+                }
+            }
+        }
         // NULL arguments
         n_checks++;
         if (sat_cbw_parse(NULL, 0, cdb, 512, &o) || sat_cbw_parse(img, 0, NULL, 512, &o) ||

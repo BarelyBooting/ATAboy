@@ -73,6 +73,9 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition,
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                           void *buffer, uint32_t bufsize) {
     (void)lun;
+#if ATABOY_SAT
+    sat_sense_forget();     // this command may set sense of its own
+#endif
     if (!is_mounted) return -1;
 
     // TinyUSB derives the block size from the host's CBW (length / count)
@@ -164,6 +167,9 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                            uint8_t *buffer, uint32_t bufsize) {
     (void)lun;
+#if ATABOY_SAT
+    sat_sense_forget();     // this command may set sense of its own
+#endif
     if (!is_mounted || config.drive_write_protected) return -1;
 
     // TinyUSB derives the block size from the host's CBW (length / count)

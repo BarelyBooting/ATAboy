@@ -89,23 +89,23 @@ $mutants = @(
     @{ Name = 'accept T_DIR=0 (to device)'
        Find = 'if (b2 != SAT_BYTE2_PIO_IN)'
        Repl = 'if ((b2 | 0x08) != SAT_BYTE2_PIO_IN)' }
-    @{ Name = 'accept PROTOCOL 5 (PIO data-out)'
-       Find = '(((b1 >> 1) & 0x0F) != SAT_PROTO_PIO_IN)'
-       Repl = '(((b1 >> 1) & 0x0F) != SAT_PROTO_PIO_IN && ((b1 >> 1) & 0x0F) != 5)' }
+    @{ Name = 'accept PROTOCOL 5 (PIO data-out) as data-in'
+       Find = '    if (proto == SAT_PROTO_PIO_IN) {'
+       Repl = "    if (proto == 5) proto = SAT_PROTO_PIO_IN;`n    if (proto == SAT_PROTO_PIO_IN) {" }
     @{ Name = 'accept a data-out CBW'
        Find = 'if (!in->dir_in) return'
        Repl = 'if (0) return' }
     @{ Name = 'ignore the CBW transfer length'
        Find = 'if (in->xfer_len != (uint32_t)count * SAT_SECTOR_SIZE) return'
        Repl = 'if (0) return' }
-    @{ Name = 'accept CK_COND=1'
+    @{ Name = 'accept CK_COND=1 on PIO data-in'
        Find = 'if (b2 != SAT_BYTE2_PIO_IN)'
        Repl = 'if ((b2 & ~0x20) != SAT_BYTE2_PIO_IN)' }
     @{ Name = 'accept MULTIPLE_COUNT != 0'
        Find = 'if ((b1 >> 5) != 0) return'
        Repl = 'if (0) return' }
-    @{ Name = 'ignore FEATURES'
-       Find = 'if (feat != 0 || hfeat != 0) return'
+    @{ Name = 'ignore FEATURES on IDENTIFY, reads and verify'
+       Find = 'if (feat != 0) return'
        Repl = 'if (0) return' }
     @{ Name = 'ignore CONTROL'
        Find = 'if (ctrl != 0) return'
@@ -117,21 +117,21 @@ $mutants = @(
        Find = 'if (!is16 || !ext) return'
        Repl = 'if (is16 && !ext) return' }
     @{ Name = 'allow READ SECTORS with EXTEND=1'
-       Find = "    case ATA_READ_SECTORS_NR:`n        if (ext) return"
-       Repl = "    case ATA_READ_SECTORS_NR:`n        if (0) return" }
+       Find = "    case ATA_READ_SECTORS_NR:`n        want_proto = SAT_PROTO_PIO_IN;`n        user_data = true;`n        if (ext) return"
+       Repl = "    case ATA_READ_SECTORS_NR:`n        want_proto = SAT_PROTO_PIO_IN;`n        user_data = true;`n        if (0) return" }
     @{ Name = 'drop the 28-bit LBA end check'
        Find = '(1ull << 28)'
        Repl = '(1ull << 32)' }
     @{ Name = 'drop the 48-bit LBA end check'
        Find = '(1ull << 48)'
        Repl = '(1ull << 56)' }
-    @{ Name = 'ignore non-zero HOB bytes on a 28-bit read'
-       Find = 'if (hcount | lba3 | lba4 | lba5) return'
+    @{ Name = 'ignore non-zero HOB LBA bytes on 28-bit rows'
+       Find = 'if (lba3 | lba4 | lba5) return'
        Repl = 'if (0) return' }
-    @{ Name = 'accept CHS addressing (LBA bit clear)'
+    @{ Name = 'accept CHS addressing (LBA bit clear) on reads and verify'
        Find = 'if (!(dev & 0x40)) return'
        Repl = 'if (0) return' }
-    @{ Name = 'accept IDENTIFY with a non-zero LBA'
+    @{ Name = 'accept IDENTIFY and READ NATIVE MAX with a non-zero LBA'
        Find = 'if (lba0 | lba1 | lba2 | lba3 | lba4 | lba5) return'
        Repl = 'if (0) return' }
     @{ Name = 'ignore the reserved byte 10 of the 12-byte form'
@@ -143,8 +143,8 @@ $mutants = @(
     @{ Name = 'refuse nothing when unmounted (skip the state check)'
        Find = 'if (!in->mounted) return'
        Repl = 'if (0) return' }
-    @{ Name = 'allow reads in CHS mode'
-       Find = 'if (cmd != ATA_IDENTIFY && !in->lba_mode) return'
+    @{ Name = 'allow reads and verify in CHS mode'
+       Find = 'if (user_data && !in->lba_mode) return'
        Repl = 'if (0) return' }
     @{ Name = 'CBW parse: skip the CB byte comparison'
        Find = 'if (memcmp(img + 15, cdb, 16) != 0) return false;'
@@ -156,8 +156,127 @@ $mutants = @(
        Find = 'if (img[0] != 0x55 || img[1] != 0x53 || img[2] != 0x42 || img[3] != 0x43) return false;'
        Repl = '' }
     @{ Name = 'leave the device byte in the task file on refusal'
-       Find = "    uint8_t tdev = 0;`n    switch (cmd) {"
-       Repl = "    uint8_t tdev = 0;`n    tf->device = dev;`n    switch (cmd) {" }
+       Find = "    bool user_data = false;     // carries a user-data address: LBA mode only`n    switch (cmd) {"
+       Repl = "    bool user_data = false;     // carries a user-data address: LBA mode only`n    tf->device = dev;`n    switch (cmd) {" }
+
+    # ---- stage 2: non-data protocol, READ VERIFY, SMART, READ NATIVE MAX ----
+    @{ Name = 'ignore HOB FEATURES and HOB COUNT'
+       Find = 'if (hfeat != 0 || hcount != 0) return'
+       Repl = 'if (0) return' }
+    @{ Name = 'row protocol not enforced (any row as PIO-in or non-data)'
+       Find = 'if (proto != want_proto) return'
+       Repl = 'if (0) return' }
+    @{ Name = 'non-data: accept T_LENGTH != 0'
+       Find = '(uint8_t)~(SAT_BYTE2_CK_COND | SAT_BYTE2_NO_DATA_PHASE)'
+       Repl = '(uint8_t)~(SAT_BYTE2_CK_COND | SAT_BYTE2_NO_DATA_PHASE | 0x03)' }
+    @{ Name = 'non-data: accept OFF_LINE != 0'
+       Find = '(uint8_t)~(SAT_BYTE2_CK_COND | SAT_BYTE2_NO_DATA_PHASE)'
+       Repl = '(uint8_t)~(SAT_BYTE2_CK_COND | SAT_BYTE2_NO_DATA_PHASE | 0xC0)' }
+    @{ Name = 'non-data: accept T_TYPE=1'
+       Find = '(uint8_t)~(SAT_BYTE2_CK_COND | SAT_BYTE2_NO_DATA_PHASE)'
+       Repl = '(uint8_t)~(SAT_BYTE2_CK_COND | SAT_BYTE2_NO_DATA_PHASE | 0x10)' }
+    @{ Name = 'non-data: refuse T_DIR / BYTE_BLOCK set (smartctl form)'
+       Find = 'SAT_BYTE2_NO_DATA_PHASE  0x0C'
+       Repl = 'SAT_BYTE2_NO_DATA_PHASE  0x00' }
+    @{ Name = 'non-data: accept a CBW with a data phase'
+       Find = 'if (in->xfer_len != 0) return'
+       Repl = 'if (0) return' }
+    @{ Name = 'register rows accept CK_COND=0'
+       Find = 'if (need_ck && !ck) return'
+       Repl = 'if (0) return' }
+    @{ Name = 'READ VERIFY: count 0 taken as 0 sectors in the end check'
+       Find = 'uint32_t n = count ? count : 256u;'
+       Repl = 'uint32_t n = count;' }
+    @{ Name = 'READ VERIFY: accept EXTEND=1'
+       Find = "        want_proto = SAT_PROTO_NON_DATA;`n        user_data = true;`n        if (ext) return"
+       Repl = "        want_proto = SAT_PROTO_NON_DATA;`n        user_data = true;`n        if (0) return" }
+    @{ Name = 'READ VERIFY: accept CHS addressing (LBA bit clear)'
+       Find = 'if (!(dev & 0x40)) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);   // verify'
+       Repl = 'if (0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);   // verify' }
+    @{ Name = 'READ VERIFY: allowed in CHS mount mode'
+       Find = "        want_proto = SAT_PROTO_NON_DATA;`n        user_data = true;"
+       Repl = "        want_proto = SAT_PROTO_NON_DATA;`n        user_data = false;" }
+    @{ Name = 'IDENTIFY, SMART and READ NATIVE MAX refused in CHS mode'
+       Find = 'if (user_data && !in->lba_mode) return'
+       Repl = 'if (!in->lba_mode) return' }
+    @{ Name = 'allow DEVICE CONFIGURATION 0xB1 (as SMART)'
+       Find = "    case ATA_SMART:`n"
+       Repl = "    case ATA_SMART:`n    case 0xB1:`n" }
+    @{ Name = 'allow SMART ENABLE OPERATIONS D8'
+       Find = "        case SMART_RETURN_STATUS:`n"
+       Repl = "        case SMART_RETURN_STATUS:`n        case 0xD8:`n" }
+    @{ Name = 'allow SMART EXECUTE OFF-LINE D4'
+       Find = "        case SMART_RETURN_STATUS:`n"
+       Repl = "        case SMART_RETURN_STATUS:`n        case 0xD4:`n" }
+    @{ Name = 'allow SMART WRITE LOG D6 (as READ LOG)'
+       Find = "        case SMART_READ_LOG:`n"
+       Repl = "        case SMART_READ_LOG:`n        case 0xD6:`n" }
+    @{ Name = 'SMART: ignore the 4F/C2 signature'
+       Find = 'if (lba1 != SMART_LBA_MID || lba2 != SMART_LBA_HIGH) return'
+       Repl = 'if (0) return' }
+    @{ Name = 'SMART: allow EXTEND=1'
+       Find = "        if (ext) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);`n        if (lba3 | lba4 | lba5) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);`n        if (lba1 != SMART_LBA_MID"
+       Repl = "        if (lba3 | lba4 | lba5) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);`n        if (lba1 != SMART_LBA_MID" }
+    @{ Name = 'SMART: ignore the device low nibble'
+       Find = 'if (dev & 0x0F) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);   // smart'
+       Repl = 'if (0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);   // smart' }
+    @{ Name = 'SMART READ DATA/THRESHOLDS: allow count != 1'
+       Find = "            want_proto = SAT_PROTO_PIO_IN;`n            if (count != 1) return"
+       Repl = "            want_proto = SAT_PROTO_PIO_IN;`n            if (0) return" }
+    @{ Name = 'SMART READ DATA/THRESHOLDS: allow a non-zero LBA low'
+       Find = "            if (count != 1) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);`n            if (lba0 != 0) return"
+       Repl = "            if (count != 1) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);`n            if (0) return" }
+    @{ Name = 'SMART READ LOG: no sector cap'
+       Find = 'if (count == 0 || count > SAT_MAX_SECTORS) return'
+       Repl = 'if (count == 0) return' }
+    @{ Name = 'SMART READ LOG: allow 0 sectors'
+       Find = 'if (count == 0 || count > SAT_MAX_SECTORS) return'
+       Repl = 'if (count > SAT_MAX_SECTORS) return' }
+    @{ Name = 'SMART RETURN STATUS: allow a non-zero count'
+       Find = "            need_ck = true;`n            if (count != 0) return"
+       Repl = "            need_ck = true;`n            if (0) return" }
+    @{ Name = 'SMART RETURN STATUS: accept CK_COND=0'
+       Find = "            want_proto = SAT_PROTO_NON_DATA;`n            need_ck = true;"
+       Repl = "            want_proto = SAT_PROTO_NON_DATA;" }
+    @{ Name = 'allow SET MAX ADDRESS 0xF9 (as READ NATIVE MAX)'
+       Find = "    case ATA_READ_NATIVE_MAX:`n"
+       Repl = "    case ATA_READ_NATIVE_MAX:`n    case 0xF9:`n" }
+    @{ Name = 'allow SET MAX ADDRESS EXT 0x37 (as READ NATIVE MAX EXT)'
+       Find = "    case ATA_READ_NATIVE_MAX_EXT:`n"
+       Repl = "    case ATA_READ_NATIVE_MAX_EXT:`n    case 0x37:`n" }
+    @{ Name = 'READ NATIVE MAX: accept CK_COND=0'
+       Find = "        want_proto = SAT_PROTO_NON_DATA;`n        need_ck = true;`n        if (ext) return"
+       Repl = "        want_proto = SAT_PROTO_NON_DATA;`n        if (ext) return" }
+    @{ Name = 'READ NATIVE MAX: accept EXTEND=1'
+       Find = "        need_ck = true;`n        if (ext) return refuse"
+       Repl = "        need_ck = true;`n        if (0) return refuse" }
+    @{ Name = 'READ NATIVE MAX: accept LBA bit clear'
+       Find = 'if ((dev & 0x4F) != 0x40) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);  // native max: '
+       Repl = 'if ((dev & 0x0F) != 0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);  // native max: ' }
+    @{ Name = 'READ NATIVE MAX (both): accept FEATURES or count'
+       Find = 'if (feat != 0 || count != 0) return'
+       Repl = 'if (0) return' }
+    @{ Name = 'READ NATIVE MAX (both): accept a non-zero LBA or HOB LBA'
+       Find = "        if (feat != 0 || count != 0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);`n        if (lba0 | lba1 | lba2 | lba3 | lba4 | lba5) return"
+       Repl = "        if (feat != 0 || count != 0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);`n        if (0) return" }
+    @{ Name = 'READ NATIVE MAX EXT: accept the 12-byte form or EXTEND=0'
+       Find = 'if (!is16 || !ext) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);  // native max ext'
+       Repl = 'if (0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);  // native max ext' }
+    @{ Name = 'READ NATIVE MAX EXT: accept LBA bit clear'
+       Find = 'if ((dev & 0x4F) != 0x40) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);  // native max ext'
+       Repl = 'if ((dev & 0x0F) != 0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);  // native max ext' }
+    @{ Name = 'task file: non-data command given a data phase'
+       Find = '    tf->sectors = sectors;'
+       Repl = '    tf->sectors = count;' }
+    @{ Name = 'task file: CK_COND not passed on'
+       Find = '    tf->ck_cond = ck;'
+       Repl = '    tf->ck_cond = false;' }
+    @{ Name = 'task file: SMART subcommand not passed on'
+       Find = '    tf->feature = feat;'
+       Repl = '    tf->feature = 0;' }
+    @{ Name = 'task file: every command marked PIO data-in'
+       Find = '    tf->protocol = want_proto;'
+       Repl = '    tf->protocol = SAT_PROTO_PIO_IN;' }
 )
 
 $orig = [IO.File]::ReadAllText($policy).Replace("`r`n", "`n")
