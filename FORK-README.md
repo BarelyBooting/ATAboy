@@ -18,7 +18,17 @@ The fork's firmware lives in [`FW source/v.6f3p1/`](FW%20source/v.6f3p1/) on the
 
 5. **`pico_sdk_import.cmake` is included**, so the source builds as-is. Upstream v.6f3 references it but doesn't ship it.
 
-The fork's build calls itself `0.6f3p1-palimpsest` and shows `v0.6f3p1 (fork)` in the setup screen, so it can't be mistaken for a stock v0.6f3.
+Added in 0.6f3p3 (built and host-tested, not yet run on hardware):
+
+6. **[Issue #13](https://github.com/redruM0381/ATAboy/issues/13): one bad sector no longer fails a whole multi-sector read.** The host gets every good sector before the bad one, then an error, and can read the rest one at a time. A failed sector is never filled in, and any flawed data the drive offers with the error is thrown away. The firmware no longer soft-resets the drive after an ordinary read error; it still resets on a timeout. The drive's error registers are saved before any reset, and Debug Mode's "E" shows them.
+
+7. **Status polls wait for BSY to clear before looking at ERR or DRQ**, and wait 400 ns after each command before the first status read, as ATA requires. Before, an ERR bit seen while the drive was still busy could end a command early.
+
+8. **[Issue #9](https://github.com/redruM0381/ATAboy/issues/9): the whole 80x24 screen is painted blue**, instead of relying on the terminal to erase in the current colour (GNU screen doesn't, by default). **Ctrl+L redraws the screen.**
+
+9. **Host tests** in `tests/host/`: the real `ide.c` and `usb.c` run against a simulated drive (`run.sh`, `mutate.py`), and `tui_compare.py` checks the screen output against an older build.
+
+The fork's build calls itself `0.6f3p3-palimpsest` and shows `v0.6f3p3 (fork)` in the setup screen (0.6f3p1 before items 6 to 9), so it can't be mistaken for a stock v0.6f3.
 
 ## Builds
 
