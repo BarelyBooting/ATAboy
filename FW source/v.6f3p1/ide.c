@@ -32,8 +32,12 @@ static struct {
 
 void ide_id_words_forget(void) { id_words.valid = false; }
 
+// Words held, and taken from the device selected now. The one test of it,
+// shared by the policy's view (ide_id_words) and the identity check.
+static bool id_words_held(void) { return id_words.valid && id_words.dev_base == dev_base; }
+
 void ide_id_words(ide_id_words_t *out) {
-    out->valid = id_words.valid && id_words.dev_base == dev_base;
+    out->valid = id_words_held();
     out->w82 = id_words.w82;
     out->w83 = id_words.w83;
     out->w84 = id_words.w84;
@@ -343,7 +347,7 @@ bool ide_identify(uint16_t *buf) {
 // sent (identify_once would drain that data and issue IDENTIFY over it, which
 // the SAT path refuses to do) and the words are kept.
 int ide_id_words_verify(void) {
-    if (!id_words.valid || id_words.dev_base != dev_base) return 0;
+    if (!id_words_held()) return 0;
     if (!ide_wait_until_ready(1000) || (ide_read_reg(7) & 0x08)) return -1;
     uint16_t buf[256];
     bool same = identify_once(buf) && buf[82] == id_words.w82 &&

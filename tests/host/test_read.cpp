@@ -886,6 +886,11 @@ static void test_sat_stale_drq(Mode m) {
     CHECK(sense_is(a.sense, 0x02, 0x04, 0x00) && sense_is(b.sense, 0x02, 0x04, 0x00) && sense_is(c.sense, 0x02, 0x04, 0x00),
           "not ready: %zu %zu %zu", a.sense.size(), b.sense.size(), c.sense.size());
     CHECK(sim.commands == cmds, "%d commands issued over stale DRQ", sim.commands - cmds);
+    // A row the IDENTIFY words do not gate (so no identity check runs first):
+    // the SAT path's own stale DRQ check must refuse it.
+    SatResult e = sat_cmd(pt12(4, 0x0E, 0, 1, 0, 0x00, 0xEC), 512, true);
+    CHECK(sense_is(e.sense, 0x02, 0x04, 0x00), "IDENTIFY over stale DRQ: not ready expected");
+    CHECK(sim.commands == cmds, "%d commands issued over stale DRQ (IDENTIFY row)", sim.commands - cmds);
     CHECK(sim.data_reads == 0 && sim.srst == 0, "data reads %d srst %d", sim.data_reads, sim.srst);
     HostRead h = host_read10(300, 4);       // the READ(10) guard clears it
     CHECK(!h.ok && !contains_flawed(h), "READ(10) guard");
@@ -1419,7 +1424,46 @@ static void test_no_sat() {
 }
 #endif
 
+#if ATABOY_SAT
+// The shipping build refuses SMART READ DATA (D0) and RETURN STATUS (DA):
+// on ATA-3 drives both save attribute values to the drive (sat_policy.h).
+// Nothing may reach the drive for them, not even the identity check's
+// IDENTIFY; the SMART rows without that wording, and READ NATIVE MAX, work.
+// Built by run.sh without ATABOY_SAT_SMART_SAVES; everything else in this
+// file runs in the build with it set.
+static void test_sat_smart_saves_off(Mode m) {
+    std::string n = name2("shipping build: SMART READ DATA and RETURN STATUS refused", m);
+    setup(n.c_str(), m);
+    identify_with(0x4401, 0x4400, 0x4001);              // the drive claims everything
+    struct { const char *name; std::vector<uint8_t> cdb; uint32_t xfer; bool dir_in; } off[] = {
+        { "SMART READ DATA, 12", pt12(4, 0x0E, 0xD0, 1, 0xC24F00, 0xA0, 0xB0), 512, true },
+        { "SMART READ DATA, 16", pt16(4, false, 0x0E, 0xD0, 1, 0xC24F00, 0xA0, 0xB0), 512, true },
+        { "SMART RETURN STATUS, 12", smart_status12(), 0, false },
+        { "SMART RETURN STATUS, 12 (smartctl form)", smart_status12(0x2C), 0, false },
+        { "SMART RETURN STATUS, 16", pt16(3, false, 0x20, 0xDA, 0, 0xC24F00, 0xA0, 0xB0), 0, false },
+    };
+    for (auto &o : off) {
+        int cmds = sim.commands;
+        SatResult r = sat_cmd(o.cdb, o.xfer, o.dir_in);
+        CHECK(!r.ok() && sense_is(r.sense, 0x05, 0x24, 0x00), "%s: expected 5/24/00", o.name);
+        CHECK(sim.commands == cmds, "%s: %d commands reached the drive", o.name, sim.commands - cmds);
+    }
+    int b0 = sim.cmd_count[0xB0];
+    SatResult t = sat_cmd(pt12(4, 0x0E, 0xD1, 1, 0xC24F00, 0xA0, 0xB0), 512, true);
+    CHECK(t.ok() && sim.cmd_count[0xB0] == b0 + 1, "SMART READ THRESHOLDS still works: ok %d", t.ok());
+    SatResult nm = sat_cmd(native_max12(), 0, false);
+    CHECK(is_desc(nm.sense) && sense_is(nm.sense, 0x01, 0x00, 0x1D), "READ NATIVE MAX still works");
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+}
+#endif
+
 int main() {
+#if ATABOY_SAT && !ATABOY_SAT_SMART_SAVES
+    test_sat_smart_saves_off(LBA);
+    test_sat_smart_saves_off(CHS);
+    std::printf("%d checks, %d failed\n", checks, failures);
+    return failures > 255 ? 255 : failures;
+#endif
     test_clean_reads(LBA);
     test_clean_reads(CHS);
     test_bad_at_each_position(LBA, BAD_ERR, "bad at each position, ERR, LBA");

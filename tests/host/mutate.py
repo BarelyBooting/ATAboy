@@ -172,13 +172,17 @@ MUTANTS = [
     ('IDENTIFY words kept across a new probe', 'ide.c',
      '    id_words.valid = false;     // a new detection', '    // a new detection'),
     ('IDENTIFY words not tied to the device they came from', 'ide.c',
-     'out->valid = id_words.valid && id_words.dev_base == dev_base;', 'out->valid = id_words.valid;'),
+     'return id_words.valid && id_words.dev_base == dev_base; }', 'return id_words.valid; }'),
     ('word 83 kept as word 82', 'ide.c',
      'id_words.w82 = buf[82];', 'id_words.w82 = buf[83];'),
     ('word 83 kept as word 84', 'ide.c',
      'id_words.w84 = buf[84];', 'id_words.w84 = buf[83];'),
-    ('SAT: policy told an IDENTIFY was captured when none was', 'sat.c',
-     '    in.id_captured = id.valid;', '    in.id_captured = true;'),
+    # Not run, EQUIVALENT since ff9a3ed: 'policy told an IDENTIFY was captured
+    # when none was' (sat.c in.id_captured = true). Every row that looks at
+    # the words also goes through ide_id_words_verify(), which refuses when no
+    # words are held, so the host sees the same refusal either way; the policy
+    # is the first of two layers. The policy's own handling of "not captured"
+    # is proven by the exhaustive policy test (run-sat-policy-tests.ps1).
     ('SAT: word 84 not passed to the policy', 'sat.c',
      '    in.id_w84 = id.w84;', '    in.id_w84 = 0x4001;'),
     # --- M1: a SAT command counts as ended only once it has visibly started ---

@@ -212,12 +212,14 @@ static bool expect_allow_caps(const uint8_t *c, int len, bool dir_in, uint32_t x
     } else if (cmd == 0xB0) {
         f.feat = feat; f.mid = 0x4F; f.hi = 0xC2;
         f.dev = dev & 0xE0;
-        if (feat == 0xD0 || feat == 0xD1) {
+        // D0 and DA save attribute values to the drive (ATA-3): refused unless
+        // built with ATABOY_SAT_SMART_SAVES=1 (sat_policy.h).
+        if ((feat == 0xD0 && ATABOY_SAT_SMART_SAVES) || feat == 0xD1) {
             e.count = 1; f.count = 1;
         } else if (feat == 0xD5) {
             if (cnt < 1 || cnt > MAXSEC) return false;
             e.count = cnt; f.count = cnt; f.lo = lo;
-        } else if (feat == 0xDA) {
+        } else if (feat == 0xDA && ATABOY_SAT_SMART_SAVES) {
             e.nondata = true; f.b2 = nd_b2_ck;
         } else {
             return false;
@@ -402,10 +404,12 @@ static void build_seeds(void) {
         for (int form = 0; form < 2; form++) {
             bool is16 = form == 1;
             int len = is16 ? 16 : 12;
-            encs(new_seed(len, true, 512)->cdb, is16, 4, 0x0E, 0xD0, 1, 0, sdev[d]);
             encs(new_seed(len, true, 512)->cdb, is16, 4, 0x0E, 0xD1, 1, 0, sdev[d]);
-            encs(new_seed(len, false, 0)->cdb, is16, 3, 0x20, 0xDA, 0, 0, sdev[d]);
-            encs(new_seed(len, false, 0)->cdb, is16, 3, 0x2C, 0xDA, 0, 0, sdev[d]);
+            if (ATABOY_SAT_SMART_SAVES) {   // D0 and DA: see sat_policy.h
+                encs(new_seed(len, true, 512)->cdb, is16, 4, 0x0E, 0xD0, 1, 0, sdev[d]);
+                encs(new_seed(len, false, 0)->cdb, is16, 3, 0x20, 0xDA, 0, 0, sdev[d]);
+                encs(new_seed(len, false, 0)->cdb, is16, 3, 0x2C, 0xDA, 0, 0, sdev[d]);
+            }
         }
     static const uint8_t logs[] = { 0x00, 0x01, 0x06, 0x80, 0xE0, 0xFF };
     for (unsigned g = 0; g < sizeof(logs) / sizeof(logs[0]); g++)
@@ -414,8 +418,10 @@ static void build_seeds(void) {
             encs(new_seed(12, true, n * 512u)->cdb, false, 4, 0x0E, 0xD5, n, logs[g], 0xA0);
             encs(new_seed(16, true, n * 512u)->cdb, true, 4, 0x0E, 0xD5, n, logs[g], 0x00);
         }
-    encs(new_seed(12, false, 0)->cdb, false, 3, 0x28, 0xDA, 0, 0, 0xA0);
-    encs(new_seed(12, false, 0)->cdb, false, 3, 0x24, 0xDA, 0, 0, 0xA0);
+    if (ATABOY_SAT_SMART_SAVES) {
+        encs(new_seed(12, false, 0)->cdb, false, 3, 0x28, 0xDA, 0, 0, 0xA0);
+        encs(new_seed(12, false, 0)->cdb, false, 3, 0x24, 0xDA, 0, 0, 0xA0);
+    }
 
     // READ NATIVE MAX ADDRESS (0xF8) and READ NATIVE MAX ADDRESS EXT (0x27).
     static const uint8_t nb2[] = { 0x20, 0x2C, 0x28, 0x24 };

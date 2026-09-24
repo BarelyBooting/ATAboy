@@ -195,6 +195,8 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
         switch (feat) {
         case SMART_READ_DATA:
         case SMART_READ_THRESHOLDS:
+            if (feat == SMART_READ_DATA && !ATABOY_SAT_SMART_SAVES)   // smart d0 saves to the drive
+                return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
             want_proto = SAT_PROTO_PIO_IN;
             if (count != 1) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
             if (lba0 != 0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
@@ -208,6 +210,8 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
             sectors = count;
             break;
         case SMART_RETURN_STATUS:
+            if (!ATABOY_SAT_SMART_SAVES)                                // smart da saves to the drive
+                return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
             want_proto = SAT_PROTO_NON_DATA;
             need_ck = true;
             if (count != 0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);

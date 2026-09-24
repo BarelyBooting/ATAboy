@@ -97,6 +97,19 @@
 #ifndef SAT_POLICY_H
 #define SAT_POLICY_H
 
+// SMART READ DATA (B0h/D0h) and SMART RETURN STATUS (B0h/DAh) write to the
+// drive on the drives this bridge exists for. ATA-3 (X3T13/2008D rev 7b,
+// 7.31.5 and 7.31.6) says the drive "saves any updated attribute values to
+// non-volatile memory" before it answers either one; ATA-5 dropped that
+// wording, but a drive built to ATA-3 still does it (Conner's CFS1275A manual
+// says so too). The words 82..84 gate cannot tell such a drive from a newer
+// one. So both are refused unless the firmware is built with
+// ATABOY_SAT_SMART_SAVES=1, which a build used on archaeology specimens must
+// never be. READ THRESHOLDS and READ LOG have no such wording and stay.
+#ifndef ATABOY_SAT_SMART_SAVES
+#define ATABOY_SAT_SMART_SAVES 0
+#endif
+
 #include <stdint.h>
 #include <stdbool.h>
 

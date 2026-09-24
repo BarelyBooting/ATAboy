@@ -84,6 +84,13 @@ if(ATABOY_SAT)
     target_sources(ATAboy PRIVATE sat.c sat_policy.c)
     target_compile_definitions(ATAboy PRIVATE ATABOY_SAT=1)
 endif()
+# SMART READ DATA and SMART RETURN STATUS save attribute values to the drive
+# on ATA-3 drives (sat_policy.h), so they are refused unless this is ON.
+# Never ON in a build used on archaeology specimens.
+option(ATABOY_SAT_SMART_SAVES "Also allow SMART READ DATA and RETURN STATUS through SAT" OFF)
+if(ATABOY_SAT AND ATABOY_SAT_SMART_SAVES)
+    target_compile_definitions(ATAboy PRIVATE ATABOY_SAT_SMART_SAVES=1)
+endif()
 
 pico_add_extra_outputs(ATAboy)
 

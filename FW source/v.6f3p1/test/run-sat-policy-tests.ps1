@@ -44,9 +44,9 @@ Write-Host ("test    : {0}" -f (Get-FileHash $test -Algorithm SHA256).Hash.ToLow
 
 # Mutants are built without -Werror: a mutation often leaves a variable
 # unused or a comparison always false, which is the point of it.
-function Invoke-Build([string]$srcDir, [string]$out, [switch]$Mutant) {
+function Invoke-Build([string]$srcDir, [string]$out, [switch]$Mutant, [string[]]$Extra = @()) {
     $flags = if ($Mutant) { $cflags | Where-Object { $_ -ne '-Werror' } } else { $cflags }
-    $ccArgs = $flags + @('-I', $srcDir, (Join-Path $srcDir 'sat_policy.c'), $test, '-o', $out)
+    $ccArgs = $flags + $Extra + @('-I', $srcDir, (Join-Path $srcDir 'sat_policy.c'), $test, '-o', $out)
     $log = & $ccPath @ccArgs 2>&1
     return @{ Ok = ($LASTEXITCODE -eq 0); Log = ($log | Out-String) }
 }
@@ -69,11 +69,37 @@ if ($realExit -ne 0) {
     exit 1
 }
 
+# ---- 1b. the real policy, built with SMART D0/DA opted in -------------------
+# The shipping build refuses SMART READ DATA and RETURN STATUS (sat_policy.h,
+# ATABOY_SAT_SMART_SAVES). The opt-in build must still be exactly right, so it
+# runs the same exhaustive test. Mutants below use the shipping build.
+$optDir = Join-Path $work 'real-smart-saves'
+New-Item -ItemType Directory -Path $optDir | Out-Null
+Copy-Item $policy, $header $optDir
+$b = Invoke-Build $optDir (Join-Path $optDir "t$exe") -Extra @('-DATABOY_SAT_SMART_SAVES=1')
+if (-not $b.Ok) {
+    Write-Host "COULD NOT RUN: the test did not build with ATABOY_SAT_SMART_SAVES=1." -ForegroundColor Red
+    Write-Host $b.Log
+    exit 2
+}
+Write-Host "`n--- real policy, ATABOY_SAT_SMART_SAVES=1 ---" -ForegroundColor Yellow
+& (Join-Path $optDir "t$exe")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "`nRESULT: the real policy FAILS its test with SMART D0/DA opted in." -ForegroundColor Red
+    exit 1
+}
+
 # ---- 2. mutants ----------------------------------------------------------------
 # Each is one textual change to sat_policy.c. `Find` must occur in the file
 # (every occurrence is replaced), or the mutant is reported as not applied,
 # which counts as a failure of this script, never as a kill.
 $mutants = @(
+    @{ Name = 'SMART READ DATA allowed in the shipping build'
+       Find = 'if (feat == SMART_READ_DATA && !ATABOY_SAT_SMART_SAVES)'
+       Repl = 'if (0)' }
+    @{ Name = 'SMART RETURN STATUS allowed in the shipping build'
+       Find = 'if (!ATABOY_SAT_SMART_SAVES)                                // smart da'
+       Repl = 'if (0)                                // smart da' }
     @{ Name = 'allow write opcode 0x30 (WRITE SECTORS)'
        Find = '    case ATA_READ_SECTORS_NR:'
        Repl = "    case ATA_READ_SECTORS_NR:`n    case 0x30:" }
@@ -369,6 +395,15 @@ foreach ($m in $mutants) {
     }
     $out = & (Join-Path $dir "t$exe") 2>&1 | Out-String
     $code = $LASTEXITCODE
+    # A mutant in code the shipping build never reaches (the SMART D0/DA rows)
+    # is only visible with them opted in: run that build too. Killed by either.
+    if ($code -eq 0) {
+        $b2 = Invoke-Build $dir (Join-Path $dir "t2$exe") -Mutant -Extra @('-DATABOY_SAT_SMART_SAVES=1')
+        if ($b2.Ok) {
+            $out = & (Join-Path $dir "t2$exe") 2>&1 | Out-String
+            $code = $LASTEXITCODE
+        }
+    }
     $summary = ([regex]::Match($out, '(\d+) failures')).Groups[1].Value
     if ($code -ne 0) {
         $killed++
