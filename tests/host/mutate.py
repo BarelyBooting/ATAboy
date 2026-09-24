@@ -198,6 +198,9 @@ MUTANTS = [
      '    w->irq_usable = !gpio_get(IDE_INTRQ);', '    w->irq_usable = true;'),
     ('SAT: BSY seen does not count as started', 'ide.c',
      '    if ((st & 0x80) || irq) w->started = true;', '    if (irq) w->started = true;'),
+    ('SAT: no 1 us settle after the command (status read inside ATA\'s 400 ns)', 'ide.c',
+     '    ide_write_reg(7, tf->command);\n    busy_wait_us_32(1);             // give the drive time to assert BSY (400 ns)\n',
+     '    ide_write_reg(7, tf->command);\n'),
     ('SAT PIO: DRQ does not count as started', 'ide.c',
      '                if (st & 0x08) w.started = true;                // DRQ is this command\'s (sat_can_issue)\n', ''),
     # --- M2: DF (device fault) is an error on every SAT path ---
