@@ -88,7 +88,13 @@ MUTANTS = [
     # Found on hardware 2026-09-23 (slave-only ST380011A): the reset waited on
     # an absent master, whose status floats to 0xFF, and gave up unselected.
     ('slave waits on the absent master after SRST (the bug as found)', 'ide.c',
-     '    if (dev_base == 0xA0) {\n        uint32_t start', '    if (1) {\n        uint32_t start'),
+     'while (((st = ide_read_reg(7)) & 0x80) && st != 0xFF) {', 'while ((st = ide_read_reg(7)) & 0x80) {'),
+    ('slave selected while the master is still busy after SRST (review L2)', 'ide.c',
+     'while (((st = ide_read_reg(7)) & 0x80) && st != 0xFF) {', 'while (0 && st) {'),
+    ('master: no wait on device 0 after SRST (review: srst master wait skipped)', 'ide.c',
+     '        while (ide_read_reg(7) & 0x80) {\n            if (to_ms_since_boot', '        while (0) {\n            if (to_ms_since_boot'),
+    ('master handled like a slave after SRST (gives up waiting, selects anyway)', 'ide.c',
+     '    if (dev_base == 0xA0) {\n        while (ide_read_reg(7) & 0x80) {', '    if (0) {\n        while (ide_read_reg(7) & 0x80) {'),
     ('device not selected again after SRST', 'ide.c',
      '    ide_write_reg(6, dev_base);\n    busy_wait_us_32(1);                     // 400 ns', '    busy_wait_us_32(1);                     // 400 ns'),
     ('geometry not marked lost by SRST', 'ide.c',

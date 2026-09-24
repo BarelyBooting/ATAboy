@@ -590,6 +590,49 @@ static bool sense_is(const std::vector<uint8_t> &s, uint8_t key, uint8_t asc, ui
     return false;
 }
 
+// Review finding L2: a slave in use with a master on the cable (auto-mount
+// uses the saved device without probing; the probe passes over a master
+// busy for more than 10 s). After a soft reset the master stays busy for
+// 3 s. The slave must not be selected before the master is done, or the
+// select is lost and the slave is left unselected. Through the READ(10)
+// path and through a SAT abort.
+static void test_slave_with_master_after_reset(Mode m) {
+    setup(m == LBA ? "slave with a master present, soft reset, LBA" : "slave with a master present, soft reset, CHS", m);
+    sim.slave = true; sim.master_present = true;
+    ide_select_device(0xB0);
+    if (m == CHS) ide_set_geometry(config.heads, config.spt);
+    else { ide_write_reg(6, 0xB0); busy_wait_us_32(1); }
+    uint16_t id[256];
+    CHECK(ide_identify(id), "slave IDENTIFY");
+    sim.violations = 0;
+    HostRead g0 = host_read10(100, 8);
+    CHECK(g0.ok && matches_medium(g0, 100), "baseline slave read");
+    sim.bad[5003] = {BAD_HANG, 0};
+    uint8_t buf[8 * 512]; uint32_t done = 0;
+    int32_t r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(r < 0 && done == 3 && f.reset && !f.reset_failed, "r %d done %u reset %d failed %d", r, done, f.reset, f.reset_failed);
+    CHECK(mock_now_ns >= sim.master_ready_at, "the reset finished before the master did");
+    CHECK(((sim.reg[6] >> 4) & 1) == 1, "slave not selected after the reset (DH %02X)", sim.reg[6]);
+    CHECK(sim.violations == 0, "violations %d (a register write while the master was busy)", sim.violations);
+    sim.bad.clear();
+    HostRead g = host_read10(100, 8);
+    CHECK(g.ok && matches_medium(g, 100), "slave usable after the reset");
+#if ATABOY_SAT
+    sim.hang_cmd = 0xB0;                            // a SAT command the drive never finishes
+    int srst0 = sim.srst;
+    SatResult s = sat_cmd(smart_status12(), 0, false);
+    CHECK(!s.ok() && sim.srst > srst0 && sense_is(s.sense, 0x0B, 0x00, 0x00), "SAT abort: r %d", s.r);
+    CHECK(((sim.reg[6] >> 4) & 1) == 1 && sim.violations == 0, "after the SAT abort: DH %02X violations %d",
+          sim.reg[6], sim.violations);
+    sim.hang_cmd = 0;
+    s = sat_cmd(smart_status12(), 0, false);
+    CHECK(is_desc(s.sense) && sense_is(s.sense, 0x01, 0x00, 0x1D), "SAT after the abort");
+#endif
+    HostRead g2 = host_read10(200, 8);
+    CHECK(g2.ok && matches_medium(g2, 200) && sim.violations == 0, "slave usable at the end, violations %d", sim.violations);
+}
+
 #if ATABOY_SAT
 static const char *mode_name(Mode m) { return m == LBA ? "LBA" : "CHS"; }
 static std::string name2(const char *what, Mode m) { return std::string(what) + ", " + mode_name(m); }
@@ -1291,6 +1334,8 @@ int main() {
     test_geometry_rejected_chs();
     test_slave_after_reset(LBA);
     test_slave_after_reset(CHS);
+    test_slave_with_master_after_reset(LBA);
+    test_slave_with_master_after_reset(CHS);
     test_host_offsets();
 #if ATABOY_SAT
     test_sat_smart_status(LBA);

@@ -52,6 +52,15 @@ struct SimDrive {
     // This drive answers as device 1 (slave). Only the selected device (DEV
     // bit of register 6) drives status or acts on a command; SRST selects 0.
     bool     slave = false;
+    // With slave set: a master is on the cable too. It is modelled only as
+    // far as a soft reset goes. After SRST is released it stays busy for
+    // master_t_reset (ATA: device 0 also waits for device 1), and while it
+    // is selected and busy a register write is lost and counted as a
+    // violation (the host must not write the command block while the
+    // selected device is busy). Otherwise it reads DRDY and takes nothing.
+    bool     master_present = false;
+    uint64_t master_t_reset = 3000000000ull;
+    uint64_t master_ready_at = 0;
     int      reset_writes = 0;              // task-file writes while in SRST
     bool     reject_idp = false;            // ABRT INITIALIZE DEVICE PARAMETERS
 
@@ -252,10 +261,14 @@ struct SimDrive {
     }
 
     bool selected() const { return ((reg[6] >> 4) & 1) == (slave ? 1 : 0); }
+    bool master_busy(uint64_t now) const { return (devctl & 0x04) || now < master_ready_at; }
 
     // alt: Alternate Status (control block), which does not release INTRQ.
     uint8_t read_status(uint64_t now, bool alt = false) {
-        if (!selected()) return 0xFF;              // no such device: the ATAboy bus floats high (ide.c probe filter)
+        if (!selected()) {
+            if (slave && master_present) return master_busy(now) ? 0x80 : 0x50;
+            return 0xFF;                           // no such device: the ATAboy bus floats high (ide.c probe filter)
+        }
         if (!alt) intrq = false;                   // reading Status releases INTRQ
         if (phase == IN_RESET && !(devctl & 0x04) && now < srst_released_at + 2000000)
             return status_before_srst & ~0x80;     // stale during the 2 ms window
@@ -285,11 +298,14 @@ struct SimDrive {
 
     void write_reg(int r, uint8_t v, uint64_t now) {
         tick(now);
+        if (slave && master_present && !selected() && master_busy(now)) { violations++; return; }   // lost
         if (phase == IN_RESET) {
             // Once SRST is released the drives are still busy finishing the
             // reset. Selecting a device then is latched (Linux does it on a
             // slave-only cable); any other write is a protocol violation.
-            if (r == 6 && !(devctl & 0x04)) { reg[6] = v; return; }
+            // For a master it is one too: device 0 is the drive the host
+            // waits on, so the host has not waited for it.
+            if (r == 6 && !(devctl & 0x04)) { if (!slave) { violations++; reset_writes++; } reg[6] = v; return; }
             violations++; reset_writes++; return;
         }
         if (r == 7) {
@@ -428,6 +444,7 @@ struct SimDrive {
         } else if (devctl & 0x04) {
             ready_at = now + t_reset;
             srst_released_at = now;
+            master_ready_at = now + master_t_reset;
         }
         devctl = v;
     }

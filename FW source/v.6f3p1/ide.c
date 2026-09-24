@@ -375,20 +375,35 @@ static bool srst_and_restore(void) {
     chs_geometry_lost = true;               // SRST drops INITIALIZE DEVICE PARAMETERS
     busy_wait_us_32(2000);                  // ATA: 2 ms before status is valid
     // SRST leaves device 0 selected, and device 0 holds BSY until device 1
-    // has finished too, so a master is waited on right here. A slave is only
-    // ever in use when detection found no usable master (the probe takes the
-    // master first), and an absent device 0 reads 0xFF on this bus, which
-    // looks like BSY for the whole timeout. So a slave skips that wait.
+    // has finished too, so the host waits on device 0 before it selects
+    // anything. That goes for a slave as well: a slave can be in use with a
+    // master on the cable (auto-mount takes the saved dev_base without
+    // probing, and the probe passes over a master that stays busy for more
+    // than 10 s), and selecting it while the master is still busy is a
+    // register write the master may drop, leaving the slave unselected.
+    // The exception: an absent device 0 reads 0xFF on this bus (it floats
+    // high), which looks like BSY for the whole timeout, so a slave stops
+    // waiting on 0xFF. (Review finding L2 corrected an earlier comment here
+    // that said a slave is only used when there is no usable master.)
     // Either way our device is selected again before anything else, even on
-    // a timeout: left pointing at an absent master, every later command
-    // would poll the floating bus and fail until the next detect.
+    // a timeout: left pointing at device 0, every later command would go to
+    // the wrong drive or poll a floating bus until the next detect.
     // (A master that times out needs no reselect: device 0 is ours, and
-    // writing registers to a drive still in reset would break the protocol.)
+    // writing registers to a drive still in reset would break the protocol.
+    // A slave whose master never comes out of reset is selected anyway;
+    // there is nothing better to do for it.)
+    uint32_t start = to_ms_since_boot(get_absolute_time());
     if (dev_base == 0xA0) {
-        uint32_t start = to_ms_since_boot(get_absolute_time());
         while (ide_read_reg(7) & 0x80) {
             if (to_ms_since_boot(get_absolute_time()) - start >= IDE_SRST_TIMEOUT_MS)
                 return false;
+            busy_wait_us_32(10);
+        }
+    } else {
+        uint8_t st;
+        while (((st = ide_read_reg(7)) & 0x80) && st != 0xFF) {
+            if (to_ms_since_boot(get_absolute_time()) - start >= IDE_SRST_TIMEOUT_MS)
+                break;                      // master stuck in reset: select the slave anyway
             busy_wait_us_32(10);
         }
     }
