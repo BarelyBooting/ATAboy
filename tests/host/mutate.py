@@ -55,7 +55,7 @@ MUTANTS = [
      '        ide_drain_sector();\n        last_fail.drained = true;',
      '        last_fail.drained = true;'),
     ('CHS geometry not restored after a reset', 'ide.c',
-     '    if (config.use_lba_mode) return recovery_end(true);\n    return recovery_end(ide_set_geometry(config.heads, config.spt));',
+     '    rec.stage = REC_GEO;\n    if (recovery_ms(IDE_GEOMETRY_TIMEOUT_MS) < IDE_GEOMETRY_TIMEOUT_MS) return 0;\n    return recovery_end(ide_set_geometry(config.heads, config.spt));',
      '    return recovery_end(true);'),
     ('read data into the caller buffer when draining', 'ide.c',
      '        ide_drain_sector();\n        last_fail.drained = true;',
@@ -104,20 +104,15 @@ MUTANTS = [
     ('CHS transfers never refuse on a lost geometry', 'ide.c',
      '    if (config.use_lba_mode || !chs_geometry_lost) return true;', '    return true;'),
     ('geometry restore ignores ABRT', 'ide.c',
-     'bool ok = ide_wait_until_ready(recovery_ms(1000)) && !(ide_read_reg(7) & 0x01);', 'bool ok = ide_wait_until_ready(recovery_ms(1000));'),
+     'bool ok = ide_wait_until_ready(recovery_ms(IDE_GEOMETRY_TIMEOUT_MS)) && !(ide_read_reg(7) & 0x01);',
+     'bool ok = ide_wait_until_ready(recovery_ms(IDE_GEOMETRY_TIMEOUT_MS));'),
     ('reset recorded as fine when it failed', 'ide.c',
      '    last_fail.reset_failed = !ok;', '    last_fail.reset_failed = false;'),
     ('no geometry check before a write', 'ide.c',
-     '    if (!chs_geometry_ok()) {\n        record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);\n        return -1;\n    }\n\n'
-     '    bool use_lba48 = config.use_lba_mode && (config.lba_sectors > 0x0FFFFFFF);\n\n    if (config.use_lba_mode) {\n        if (use_lba48) {\n'
-     '            ide_write_reg(2, 0);                               // sector count high\n'
-     '            ide_write_reg(3, (lba >> 24) & 0xFF);              // LBA 24-31\n'
-     '            ide_write_reg(4, 0);                               // LBA 32-39\n',
-     '    if (0) {\n        record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);\n        return -1;\n    }\n\n'
-     '    bool use_lba48 = config.use_lba_mode && (config.lba_sectors > 0x0FFFFFFF);\n\n    if (config.use_lba_mode) {\n        if (use_lba48) {\n'
-     '            ide_write_reg(2, 0);                               // sector count high\n'
-     '            ide_write_reg(3, (lba >> 24) & 0xFF);              // LBA 24-31\n'
-     '            ide_write_reg(4, 0);                               // LBA 32-39\n'),
+     '    if (!chs_geometry_ok()) {\n        record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);\n        return -1;\n    }\n'
+     '    if (!time_to_send(lba, count)) return -1;              // as for a read',
+     '    if (0) {\n        record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);\n        return -1;\n    }\n'
+     '    if (!time_to_send(lba, count)) return -1;              // as for a read'),
     # --- usb.c: host-controlled offsets (review finding F2) ---
     ('READ(10) accepts a non-zero offset', 'usb.c',
      '    if (offset != 0 || (bufsize % 512) != 0) {\n        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);\n        return -1;\n    }\n\n    uint64_t max = total_sectors();\n    if (max == 0) return -1;\n\n    uint32_t remaining = bufsize;\n    uint8_t *ptr = (uint8_t *)buffer;',
@@ -347,10 +342,10 @@ MUTANTS = [
      '        ide_write_reg(6, dev_base);\n        busy_wait_us_32(1);                 // 400 ns before status is valid',
      '        if (rec.stage != REC_HW) ide_write_reg(6, dev_base);\n        busy_wait_us_32(1);                 // 400 ns before status is valid'),
     ('SAT abort not recorded (review L-2)', 'ide.c',
-     '    record_failure(kind, tf->command, st, lba, 0, tf->sectors);\n    soft_reset_restore();', '    soft_reset_restore();'),
+     '    record_failure(kind, tf->command, st, sat_tf_lba(tf), 0, tf->sectors);\n    soft_reset_restore();', '    soft_reset_restore();'),
     ('SAT abort does not reset the drive', 'ide.c',
-     '    record_failure(kind, tf->command, st, lba, 0, tf->sectors);\n    soft_reset_restore();',
-     '    record_failure(kind, tf->command, st, lba, 0, tf->sectors);'),
+     '    record_failure(kind, tf->command, st, sat_tf_lba(tf), 0, tf->sectors);\n    soft_reset_restore();',
+     '    record_failure(kind, tf->command, st, sat_tf_lba(tf), 0, tf->sectors);'),
     # --- 0.6f3p7: IDENTIFY believes ERR only once the command has started (review L-3) ---
     ('IDENTIFY: stale ERR taken as its answer', 'ide.c',
      '        if (w.started && (st & 0x01)) { if (st & 0x08) ide_drain_sector(); return 0; }',
@@ -407,13 +402,84 @@ MUTANTS = [
     ('M-1: a pending recovery not carried on first (commands sent over it)', 'ide.c',
      '    if (rec.stage == REC_NONE) return true;\n    return recovery_run() > 0;', '    return true;'),
     ('M-1: SAT sends with a recovery pending', 'ide.c',
-     '    if (!recovery_gate() || work_ms(1) == 0) return false;', '    if (work_ms(1) == 0) return false;'),
+     '    if (!recovery_gate() || !sat_time_to_send(tf)) return false;', '    if (!sat_time_to_send(tf)) return false;'),
     ('M-1: a command sent with no time left to reset after it', 'ide.c',
-     '    if (work_ms(1) > 0) return true;', '    return true;'),
+     '    if (work_ms(need) >= need) return true;', '    return true;'),
     ('M-1: no time recorded over the failure that caused it (issue #13 call)', 'ide.c',
-     '    if (!host.recorded) record_failure(IDE_FAIL_NO_TIME', '    record_failure(IDE_FAIL_NO_TIME'),
+     '    if (!host.recorded) record_failure(IDE_FAIL_NO_TIME, 0, ide_read_reg(7), lba, 0, count);',
+     '    record_failure(IDE_FAIL_NO_TIME, 0, ide_read_reg(7), lba, 0, count);'),
     ('M-1: a re-detect leaves the recovery pending', 'ide.c',
      '    recovery_forget();          // the probe\'s own reset supersedes any recovery still waiting\n', ''),
+    # --- review of 0.6f3p7 (MEDIUM): never send a command without a fair window ---
+    ('MW: a command sent with any work time at all (the b073832 rule, E2 to E5)', 'ide.c',
+     '    if (work_ms(need) >= need) return true;', '    if (work_ms(1) > 0) return true;'),
+    ('MW: the window is n sectors, not n + 1', 'ide.c',
+     '    uint32_t need = IDE_SECTOR_ALLOW_MS * (count + 1);', '    uint32_t need = IDE_SECTOR_ALLOW_MS * count;'),
+    ('MW: 1 s a sector (the 0.6f3p6 polls without the status reads)', 'ide.c',
+     '#define IDE_SECTOR_ALLOW_MS 1100', '#define IDE_SECTOR_ALLOW_MS 1000'),
+    ('MW: read not checked again after the ready wait', 'ide.c',
+     '    // Still a fair window after waiting for the drive to be ready?\n    if (!time_to_send(lba, count)) return -1;\n', ''),
+    ('MW: write not checked again after the ready wait and 0x91', 'ide.c',
+     '    if (!time_to_send(lba, count)) return -1;              // as for a read\n', ''),
+    ('MW: the call again at a failed sector not given the time it took (E3)', 'ide.c',
+     '        need += host.fail_ms - IDE_SECTOR_ALLOW_MS;     // issue #13: the failed sector again', '        ;'),
+    ('MW: a failed sector time held against later host commands', 'ide.c',
+     '    host.recorded = false;\n    host.failed = false;', '    host.recorded = false;'),
+    ('MW: time of an ERR sector not kept', 'ide.c',
+     '    note_failed_sector(lba + s, ms_now() - sector_start);\n    record_failure(IDE_FAIL_ERR,', '    record_failure(IDE_FAIL_ERR,'),
+    ('X15: NO_TIME never recorded', 'ide.c',
+     '    if (!host.recorded) record_failure(IDE_FAIL_NO_TIME, 0, ide_read_reg(7), lba, 0, count);\n', ''),
+    ('X8: SAT sent with any work time (not its whole 10 s)', 'ide.c',
+     '    if (work_ms(SAT_CMD_TIMEOUT_MS) >= SAT_CMD_TIMEOUT_MS) return true;', '    if (work_ms(1) > 0) return true;'),
+    ('MW: SAT not checked again after the ready wait', 'ide.c',
+     '    if (ide_read_reg(7) & 0x08) return false;   // stale DRQ\n    return sat_time_to_send(tf);',
+     '    if (ide_read_reg(7) & 0x08) return false;   // stale DRQ\n    return true;'),
+    ('MW: SAT refusal for time not recorded', 'ide.c',
+     '    if (!host.recorded) record_failure(IDE_FAIL_NO_TIME, tf->command,', '    if (0) record_failure(IDE_FAIL_NO_TIME, tf->command,'),
+    ('X4: identity check starts without time for a full IDENTIFY', 'ide.c',
+     '    if (work_ms(IDE_IDCHECK_MS) < IDE_IDCHECK_MS) {', '    if (0) {'),
+    # --- review of 0.6f3p7: LOW items and surviving mutants ---
+    ('X1: ide_reset_drive does not end a pending recovery', 'ide.c',
+     '    recovery_forget();          // this reset supersedes any recovery still waiting\n', ''),
+    ('LOW: 0x91 sent with whatever is left (the LOW as found)', 'ide.c',
+     '    if (recovery_ms(IDE_GEOMETRY_TIMEOUT_MS) < IDE_GEOMETRY_TIMEOUT_MS) return 0;\n', ''),
+    ('LOW: an unmounted callback enters a host command (the LOW as found)', 'usb.c',
+     '    if (!is_mounted) return;\n    if (!rw', '    if (!rw'),
+    ('LOW: IORDY setting put on the pin while it is held', 'ide.c',
+     '    if (!iordy_held) ide_set_iordy(config.iordy_enabled);\n}', '    ide_set_iordy(config.iordy_enabled);\n}'),
+    ('LOW: a host command does not put the IORDY setting on the pin', 'ide.c',
+     '    host.on = true;\n    ide_iordy_follow_config();', '    host.on = true;'),
+    ('LOW: Features sets the IORDY pin itself (the LOW as found)', 'menus.c',
+     '    if (!is_mounted && !usb_msc_ide_busy()) ide_iordy_follow_config();', '    ide_set_iordy(config.iordy_enabled);'),
+    ('LOW: Features asks ide.c for the pin while mounted', 'menus.c',
+     '    if (!is_mounted && !usb_msc_ide_busy()) ide_iordy_follow_config();', '    ide_iordy_follow_config();'),
+    ('X10: write10_complete_cb does nothing', 'usb.c',
+     'void tud_msc_write10_complete_cb(uint8_t lun) { (void)lun; rw_cmd.open = false; }',
+     'void tud_msc_write10_complete_cb(uint8_t lun) { (void)lun; }'),
+    ('X11: scsi_complete_cb does nothing', 'usb.c',
+     '    (void)lun; (void)scsi_cmd;\n    rw_cmd.open = false;', '    (void)lun; (void)scsi_cmd;'),
+    # Not run, EQUIVALENT (review of 0.6f3p7, the reviewer's X2, X14, X17, X18,
+    # X19). Each cuts, or keeps open, something the rules above already make
+    # unreachable; none changes what any caller can see.
+    #  X2  'negative return leaves the command open' (usb.c host_cmd_leave).
+    #      After a negative return TinyUSB fails the command and sends its CSW,
+    #      and the complete callback then closes it anyway. Only a bulk-only
+    #      reset between the two could tell, and then the next READ(10) at
+    #      exactly that LBA inherits what is left of the budget, which is
+    #      already what an abandoned command does by design (usb.c).
+    #  X14 'SAT end wait uses SAT_END_TIMEOUT_MS uncut'. The end wait starts
+    #      after the last block, which is read before the command's limit,
+    #      the end of the work time; the recovery reserve (5 s) is then left,
+    #      more than the 1 s wait.
+    #  X17 'identify_run ready wait not cut'. Inside a host command only the
+    #      identity check calls it, and only with 12 s of work time left.
+    #  X18 'set_geometry wait not cut'. Inside a host command 0x91 goes out
+    #      only from recovery_run with its whole 1 s left (the LOW above), or
+    #      from chs_geometry_ok, which a read or write reaches with at least
+    #      the 5 s reserve left.
+    #  X19 'idle_after_error not cut'. ERR is only seen before the command's
+    #      limit, the end of the work time, so the 5 s reserve is left, more
+    #      than the 2 s wait. A check in test_read's main holds the reserve.
     # --- review 0.6f3p7 LOW items and surviving mutants R1 to R7 ---
     ('L-2: reset flags not kept for the whole host command', 'ide.c',
      '    last_fail.hw_reset = host.hw_resets > 0;', '    last_fail.hw_reset = false;'),

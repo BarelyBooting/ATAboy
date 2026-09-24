@@ -53,13 +53,16 @@ bool usb_msc_ide_busy(void) { busy_reads++; return mock_now_ns < busy_until_ns; 
 // counts it again if the USB side still had the bus at that moment (review
 // L-5: core 1 must not drive the bus while a USB command runs on core 0).
 static int bus_uses = 0, bus_uses_while_busy = 0;
+static int mock_iordy_pin_writes = 0, mock_iordy_follows = 0;
 static void bus_use() { bus_uses++; if (mock_now_ns < busy_until_ns) bus_uses_while_busy++; }
 void ide_select_device(uint8_t) {}
 uint8_t ide_probe_devices(void) { bus_use(); return 0; }
 void ide_reset_drive(void) { bus_use(); }
 bool ide_wait_until_ready(uint32_t) { bus_use(); return true; }
 uint8_t ide_read_reg(uint8_t) { bus_use(); return 0x50; }
-void ide_set_iordy(bool) {}
+void ide_set_iordy(bool) { mock_iordy_pin_writes++; }
+// ide.c decides when the Features setting reaches the pin (review of 0.6f3p7, LOW).
+void ide_iordy_follow_config(void) { mock_iordy_follows++; }
 bool ide_identify(uint16_t *) { bus_use(); return false; }
 bool ide_set_geometry(uint8_t, uint8_t) { bus_use(); return true; }
 void ide_read_taskfile(uint8_t tf[8]) { bus_use(); for (int i = 0; i < 8; i++) tf[i] = 0; tf[7] = 0x50; }
@@ -390,6 +393,32 @@ static void test_banner() {
 #endif
 }
 
+// ---- Features, IORDY: the menu never sets the pin itself -------------------
+// Review of 0.6f3p7 (LOW): switching IORDY on used to set the pin at once,
+// undoing ide.c's hold while a drive comes back from a hardware reset. The
+// menu now leaves the pin to ide.c: it asks for it at once only when nothing
+// is mounted and no USB command is running (core 0 puts the setting on the
+// pin at the next USB command otherwise). ide.c's side, the hold itself, is
+// tested in test_read (test_iordy_setting_deferred).
+static void test_iordy_toggle() {
+    const struct { bool mounted, busy, now; } cases[] = {
+        { false, false, true }, { true, false, false }, { false, true, false }, { true, true, false } };
+    for (auto &c : cases) {
+        is_mounted = c.mounted;
+        busy_until_ns = c.busy ? mock_now_ns + 1000000000ull : 0;
+        bool was = config.iordy_enabled;
+        int w0 = mock_iordy_pin_writes, f0 = mock_iordy_follows;
+        features_toggle_iordy();
+        CHECK(config.iordy_enabled == !was, "mounted %d busy %d: setting not switched", c.mounted, c.busy);
+        CHECK(mock_iordy_pin_writes == w0, "mounted %d busy %d: the menu set the pin itself", c.mounted, c.busy);
+        CHECK(mock_iordy_follows - f0 == (c.now ? 1 : 0), "mounted %d busy %d: asked ide.c %d times, want %d",
+              c.mounted, c.busy, mock_iordy_follows - f0, c.now ? 1 : 0);
+    }
+    is_mounted = false;
+    busy_until_ns = 0;
+    config.iordy_enabled = false;
+}
+
 int main() {
     test_decisions();
     test_key_in_menus();
@@ -400,6 +429,7 @@ int main() {
     test_bus_wait();
     test_debug_errors_row();
     test_banner();
+    test_iordy_toggle();
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;
 }

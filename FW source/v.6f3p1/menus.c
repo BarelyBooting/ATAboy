@@ -824,6 +824,19 @@ static bool bus_free_wait(bool on_debug) {
     return false;
 }
 
+// Features, IORDY: Enter switches the setting. Review of 0.6f3p7 (LOW): this
+// used to put it on the pin at once, which undid ide.c holding IORDY ignored
+// while a drive is still coming back from a hardware reset (a drive in its
+// power-on diagnostics holds IORDY low, and a register read that believes it
+// would never end). ide.c now decides when it reaches the pin
+// (ide_iordy_follow_config): at once if nothing is mounted and no USB command
+// is running, else at the next USB command, on core 0; in both cases not
+// before the drive is back if IORDY is held.
+static void features_toggle_iordy(void) {
+    config.iordy_enabled = !config.iordy_enabled;
+    if (!is_mounted && !usb_msc_ide_busy()) ide_iordy_follow_config();
+}
+
 // Debug screen keys other than Esc. Every one of them reads or drives the
 // bus, so each waits for a running USB command first (bus_free_wait).
 static void debug_key(int k) {
@@ -1252,7 +1265,7 @@ void core1_entry(void) {
             else if (k == KEY_ENTER) {
                 if (config.feat_selected == 0) config.drive_write_protected = !config.drive_write_protected;
                 else if (config.feat_selected == 1) config.auto_mount = !config.auto_mount;
-                else if (config.feat_selected == 2) { config.iordy_enabled = !config.iordy_enabled; ide_set_iordy(config.iordy_enabled); }
+                else if (config.feat_selected == 2) features_toggle_iordy();
                 else if (config.feat_selected == 3) config.intrq_enabled = !config.intrq_enabled;
                 else if (config.feat_selected == 4) current_screen = SCREEN_DEBUG;
             }

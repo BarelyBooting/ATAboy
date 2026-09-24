@@ -40,6 +40,10 @@ uint8_t ide_read_reg(uint8_t reg);
 uint8_t ide_read_alt_status(void);
 void    ide_write_control(uint8_t val);
 void    ide_set_iordy(bool enabled);
+// Put config.iordy_enabled on the pin now, unless IORDY is held ignored until
+// the drive is back from a hardware reset (then it is put on the pin then).
+// Core 1 calls it only while nothing is mounted and no USB command runs.
+void    ide_iordy_follow_config(void);
 
 bool    ide_identify(uint16_t *buf);
 bool    ide_set_geometry(uint8_t heads, uint8_t spt);

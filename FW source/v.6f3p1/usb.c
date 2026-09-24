@@ -95,7 +95,14 @@ static struct {
     uint32_t next_lba;      // where its next callback starts
 } rw_cmd;
 
+// Nothing is timed while no drive is mounted (review of 0.6f3p7, LOW): the
+// callback then refuses without touching the bus, and core 1 may be using
+// the bus meanwhile (Auto Detect, auto-mount) with waits that ide.c would
+// cut to this command's time while it is entered. Called after
+// msc_busy_begin(), so this read of is_mounted is the one the busy flag's
+// protocol pairs with (above).
 static void host_cmd_enter(bool rw, bool write, uint32_t lba) {
+    if (!is_mounted) return;
     if (!rw || !rw_cmd.open || rw_cmd.write != write || lba != rw_cmd.next_lba)
         ide_host_cmd_begin();
     rw_cmd.open = rw;

@@ -165,6 +165,20 @@ static void iordy_release(void) {
     ide_set_iordy(config.iordy_enabled);
 }
 
+// Put config.iordy_enabled on the pin, unless IORDY is held ignored after a
+// hardware reset: then it waits for the drive to show ready, and
+// iordy_release() puts the setting on the pin as it is at that moment.
+// Review of 0.6f3p7 (LOW): the Features menu used to set the pin itself, so
+// switching IORDY on while a hardware reset's recovery was still waiting for
+// the drive undid iordy_hold(), and the next register read could hang core 0
+// on a drive holding IORDY low in its power-on diagnostics. Called by the
+// menu on core 1 only while nothing is mounted and no USB command is running
+// (menus.c), and by core 0 at every host command (ide_host_cmd_enter), so
+// only the core that owns the bus ever sets the pin.
+void ide_iordy_follow_config(void) {
+    if (!iordy_held) ide_set_iordy(config.iordy_enabled);
+}
+
 // ATA: the host must wait at least 400 ns after writing the command register
 // before reading status. Until then the drive may not have raised BSY yet, so
 // status can still show the end of the previous command, including its ERR.
@@ -257,12 +271,18 @@ static bool ms_passed(uint32_t start, uint32_t limit_ms) { return ms_now() - sta
 // The host command in progress (ide.h, ide_host_cmd_*). Written and read only
 // on core 0, inside MSC callbacks: `on` is false everywhere else, so core 1's
 // waits (detection, the debug keys, auto-mount) are never cut short by it.
+// usb.c only enters a host command while a drive is mounted, so a callback
+// that refuses because nothing is mounted leaves `on` alone while core 1 may
+// be detecting a drive.
 static struct {
     bool     on;            // core 0 is inside a callback of this command
     uint32_t start;         // when the command's first callback began (ms)
     uint8_t  resets;        // soft resets started during the command
     uint8_t  hw_resets;     // hardware resets during the command
     bool     recorded;      // the command has written a failure record
+    bool     failed;        // a sector read failed in this command (issue #13):
+    uint32_t fail_lba;      //   this sector,
+    uint32_t fail_ms;       //   after the drive had worked on it this long
 } host;
 
 void ide_host_cmd_begin(void) {
@@ -270,8 +290,14 @@ void ide_host_cmd_begin(void) {
     host.resets = 0;
     host.hw_resets = 0;
     host.recorded = false;
+    host.failed = false;
 }
-void ide_host_cmd_enter(void) { host.on = true; }
+// The IORDY setting from the Features menu is put on the pin here, on core 0,
+// while a drive is mounted (ide_iordy_follow_config).
+void ide_host_cmd_enter(void) {
+    host.on = true;
+    ide_iordy_follow_config();
+}
 void ide_host_cmd_leave(void) { host.on = false; }
 
 // What is left of the host command's time; no limit outside one.
@@ -473,6 +499,12 @@ bool ide_wait_until_ready(uint32_t timeout_ms) {
     }
 }
 
+// INITIALIZE DEVICE PARAMETERS: how long the drive is given to take it, as in
+// 0.6f3p6. Inside a host command it is only sent with all of this left
+// (recovery_run; a read or write reaches chs_geometry_ok() with at least the
+// recovery reserve left), so the cut below does not bite there.
+#define IDE_GEOMETRY_TIMEOUT_MS 1000
+
 bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
     ide_write_reg(2, spt);
@@ -481,7 +513,7 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     // Only a clean completion counts. With ABRT the drive keeps its own
     // default translation, which is not the geometry we address it with.
     // Inside a host command the wait is cut to what is left of its time.
-    bool ok = ide_wait_until_ready(recovery_ms(1000)) && !(ide_read_reg(7) & 0x01);
+    bool ok = ide_wait_until_ready(recovery_ms(IDE_GEOMETRY_TIMEOUT_MS)) && !(ide_read_reg(7) & 0x01);
     chs_geometry_lost = !ok;
     return ok;
 }
@@ -597,7 +629,11 @@ static void soft_reset_restore(void);
 
 int ide_id_words_verify(void) {
     if (!id_words_held()) return 0;
-    if (!recovery_gate() || work_ms(IDE_IDCHECK_MS) < IDE_IDCHECK_MS) return -1;
+    if (!recovery_gate()) return -1;
+    if (work_ms(IDE_IDCHECK_MS) < IDE_IDCHECK_MS) {         // nothing sent, recorded as for a SAT command
+        if (!host.recorded) record_failure(IDE_FAIL_NO_TIME, 0xEC, ide_read_reg(7), 0, 0, 1);
+        return -1;
+    }
     if (!ide_wait_until_ready(1000) || (ide_read_reg(7) & 0x08)) return -1;
     uint16_t buf[256];
     int got = identify_run(buf);
@@ -703,6 +739,7 @@ static void record_failure(uint8_t kind, uint8_t cmd, uint8_t st,
 #define REC_SRST   1        // SRST sent; waiting for the drive (31 s)
 #define REC_HW     2        // RESET- pulsed; waiting for the drive (31 s)
 #define REC_RECAL  3        // RECALIBRATE sent after RESET-; waiting for it (10 s)
+#define REC_GEO    4        // back; CHS mode: INITIALIZE DEVICE PARAMETERS still to send
 static struct {
     uint8_t     stage;
     bool        selected;   // our device selected again since the reset
@@ -808,7 +845,9 @@ static void hw_reset_start(void) {
 // has stayed idle IDE_RECAL_GRACE_MS, which is how a drive that finished it
 // before the first poll, with no INTRQ wired, looks. ERR (a drive that does
 // not know the command) ends it too: the drive is idle, which is all 0x91
-// needs.
+// needs. It can go out with little of the host command's time left; its 10 s
+// count from here and carry over to the next host command (recal_wait), so
+// it always gets them, and is never reset for want of time.
 static void recal_start(void) {
     sat_watch_arm(&rec.recal);              // the ready wait's status read released INTRQ
     ide_write_reg(7, 0x10);
@@ -866,6 +905,13 @@ static int recovery_run(void) {
     // Back from the reset. CHS mode: the translation the host's sector
     // numbers assume, or CHS reads and writes refuse (chs_geometry_ok).
     if (config.use_lba_mode) return recovery_end(true);
+    // Review of 0.6f3p7 (LOW): 0x91 used to go out with whatever was left,
+    // none at all if the drive came back as the host command's time ran out;
+    // it then "failed" and the record said the reset had failed, when nothing
+    // had. It is sent only with its whole second left; otherwise the
+    // recovery stays pending and the next host command sends it first.
+    rec.stage = REC_GEO;
+    if (recovery_ms(IDE_GEOMETRY_TIMEOUT_MS) < IDE_GEOMETRY_TIMEOUT_MS) return 0;
     return recovery_end(ide_set_geometry(config.heads, config.spt));
 }
 
@@ -903,15 +949,87 @@ static bool chs_geometry_ok(void) {
     return ide_set_geometry(config.heads, config.spt);
 }
 
-// Inside a host command: is there time to send a command and still reset the
-// drive if it hangs (more than the recovery reserve left)? If not, nothing is
-// sent. That is recorded, unless this host command has recorded a failure of
-// its own already: the issue #13 call again at the failing sector must not
-// hide the failure that made it.
+// ---------------------------------------------------------------------------
+//  The least time a READ or WRITE SECTORS is sent with
+// ---------------------------------------------------------------------------
+// Review of 0.6f3p7 (MEDIUM): a command used to be sent whenever any work
+// time at all was left. The chunks of one READ(10) or WRITE(10) share the
+// host command's time, so a later chunk, or the issue #13 call again at a
+// failing sector, could go out with a few milliseconds. The drive, healthy
+// and working, could not finish in that, and was soft-reset for it. Measured
+// in the host tests on b073832: a 128-sector READ(10) (what imagelba sends)
+// from a drive reading 120 ms a sector was reset on every try and never read,
+// where 0.6f3p6 read it with no reset; a 16-sector READ(10) with one sector
+// that took 14.8 s to read well reset the drive over the healthy second
+// chunk, on every retry; a sector that ended in ERR after 9 s was read again
+// with 6 s and the drive reset, which ERR never needs (issue #13).
+//
+// So a READ or WRITE SECTORS of n sectors is sent inside a host command only
+// if its work time (what is left less the recovery reserve) is at least
+// IDE_SECTOR_ALLOW_MS * (n + 1). Otherwise NOTHING is sent: the host command
+// fails, the failure is recorded as IDE_FAIL_NO_TIME, the drive is not
+// touched, and the host may retry, best with a smaller command. A reset then
+// only ever follows a command that was given a fair window and did not end
+// in it.
+//
+// Why that much. 0.6f3p6, whose resets were proven on the project's drives,
+// waited up to 100000 polls, 10 us apart plus a status read, for each DRQ
+// of a read or write and for the BSY at the end of a write: at least 1 s
+// each, a little more with the reads (not measured on the board; 1.1 s is
+// taken). A command of n sectors has n such waits (read) or n + 1 (write),
+// so n + 1 of them covers both. Every chunk the USB path sends is at most 8
+// sectors (CFG_TUD_MSC_EP_BUFSIZE, 4 KiB), so its work time is at least
+// 9.9 s: any command that then times out has had a sector take longer than
+// 0.6f3p6 allowed, and 0.6f3p6 would have reset the drive too. No reset here
+// is one that 0.6f3p6 would not have made. The first chunk of a host command
+// has the full 15 s, unless a recovery carried over from an earlier host
+// command used some of them first.
+//
+// The issue #13 call again at a sector that just failed: the drive will most
+// likely take as long over it again as it took the first time, so that time
+// replaces the one-sector allowance for it when it is longer (send_need_ms).
+// A sector that ended in ERR after 9 s is not read again with 6 s left; the
+// host gets the good sectors before it, and a clean failure.
+//
+// What this costs (the throughput floor). A READ(10) of 128 sectors is 16
+// chunks of 8. The last one is sent only if the first 120 sectors took no
+// more than 15 s less 9.9 s, 5.1 s: about 42 ms a sector on average, 12 KB/s.
+// A drive slower than that (only one retrying on many sectors; a healthy
+// 1990s drive reads a sector in a few milliseconds at most) fails such a
+// command cleanly every time, with no reset. The host should then send
+// smaller commands: a READ(10) of 8 sectors or fewer is one chunk and always
+// has the whole 15 s. The same holds for a slow sector early in a command:
+// one that takes more than about 5 s to read well makes the chunks after it
+// refuse, and the command fails cleanly; the same sector read in a command
+// of 8 sectors or fewer succeeds. A host test holds the floor to these
+// numbers (test_min_window_floor).
+#define IDE_SECTOR_ALLOW_MS 1100
+
+static uint32_t send_need_ms(uint32_t lba, uint32_t count) {
+    uint32_t need = IDE_SECTOR_ALLOW_MS * (count + 1);
+    if (host.failed && lba == host.fail_lba && host.fail_ms > IDE_SECTOR_ALLOW_MS)
+        need += host.fail_ms - IDE_SECTOR_ALLOW_MS;     // issue #13: the failed sector again
+    return need;
+}
+
+// Inside a host command: is there a fair window for this command, and the
+// recovery reserve after it? If not, nothing is sent. That is recorded,
+// unless this host command has recorded a failure of its own already: the
+// issue #13 call again at the failing sector must not hide the failure that
+// made it. Outside a host command there is no limit (work_ms).
 static bool time_to_send(uint32_t lba, uint32_t count) {
-    if (work_ms(1) > 0) return true;
+    uint32_t need = send_need_ms(lba, count);
+    if (work_ms(need) >= need) return true;
     if (!host.recorded) record_failure(IDE_FAIL_NO_TIME, 0, ide_read_reg(7), lba, 0, count);
     return false;
+}
+
+// A sector read failed after the drive had worked on it for ms: kept for the
+// issue #13 call again at it, in this host command only.
+static void note_failed_sector(uint32_t lba, uint32_t ms) {
+    host.failed = true;
+    host.fail_lba = lba;
+    host.fail_ms = ms;
 }
 
 // After a command ends with ERR the drive should be idle again: BSY=0,
@@ -948,8 +1066,9 @@ int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
 //
 // Time (review M-1): inside a host command every wait is cut to the command's
 // budget (work_ms, recovery_ms), and nothing is sent while a recovery from an
-// earlier command is still pending (recovery_gate) or when there is no longer
-// time to send a command and still reset the drive (time_to_send).
+// earlier command is still pending (recovery_gate) or when the command would
+// not have a fair window with the recovery reserve after it (time_to_send;
+// checked before and after waiting for the drive to be ready).
 int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
                                  uint32_t *done) {
     uint32_t s = 0;
@@ -980,6 +1099,8 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
         record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);
         return -1;
     }
+    // Still a fair window after waiting for the drive to be ready?
+    if (!time_to_send(lba, count)) return -1;
 
     bool use_lba48 = config.use_lba_mode && (config.lba_sectors > 0x0FFFFFFF);
 
@@ -1019,6 +1140,7 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
     wait_after_command();
     uint32_t start = ms_now();                             // the whole command: IDE_CMD_TIMEOUT_MS,
     uint32_t limit = work_ms(IDE_CMD_TIMEOUT_MS);          // or what the host command has left
+    uint32_t sector_start = start;                         // when the drive began on sector s
 
     uint16_t *wbuf = (uint16_t *)buf;
 
@@ -1045,6 +1167,7 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
 
         sio_hw->gpio_set = (1 << IDE_CS0);
         bus_idle();
+        sector_start = ms_now();
     }
 
     if (done) *done = count;
@@ -1053,6 +1176,7 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
 read_err:
     // The drive ended the command with ERR at sector s. Sectors 0..s-1 are
     // already in buf and are good.
+    note_failed_sector(lba + s, ms_now() - sector_start);
     record_failure(IDE_FAIL_ERR, cmd, st, lba + s, s, count);
     if (st & 0x08) {
         // Data offered for the failed sector. Not good data: discard it.
@@ -1067,6 +1191,7 @@ read_timeout:
     // No DRQ in the time allowed: the drive may still be retrying, so abort
     // with SRST (and, if it does not come back, one hardware reset). The
     // sectors before this one are good and go to the host (issue #13).
+    note_failed_sector(lba + s, ms_now() - sector_start);
     record_failure(IDE_FAIL_TIMEOUT, cmd, st, lba + s, s, count);
     soft_reset_restore();
     if (done) *done = s;
@@ -1088,6 +1213,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
         record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);
         return -1;
     }
+    if (!time_to_send(lba, count)) return -1;              // as for a read
 
     bool use_lba48 = config.use_lba_mode && (config.lba_sectors > 0x0FFFFFFF);
 
@@ -1271,21 +1397,39 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba) {
 // but the failure record does (review L-2): the resets, the hardware one
 // above all, which resets both devices on the cable, show in Debug E.
 // `lba` is the task file's LBA, for the record.
-static void sat_abort(const sat_taskfile_t *tf, uint8_t kind, uint8_t st) {
+static uint32_t sat_tf_lba(const sat_taskfile_t *tf) {
     uint32_t lba = (uint32_t)tf->lba_low | ((uint32_t)tf->lba_mid << 8) | ((uint32_t)tf->lba_high << 16);
-    lba |= tf->ext ? (uint32_t)tf->hob_lba_low << 24 : (uint32_t)(tf->device & 0x0F) << 24;
-    record_failure(kind, tf->command, st, lba, 0, tf->sectors);
+    return lba | (tf->ext ? (uint32_t)tf->hob_lba_low << 24 : (uint32_t)(tf->device & 0x0F) << 24);
+}
+
+static void sat_abort(const sat_taskfile_t *tf, uint8_t kind, uint8_t st) {
+    record_failure(kind, tf->command, st, sat_tf_lba(tf), 0, tf->sectors);
     soft_reset_restore();           // on failure, CHS reads refuse until restored
+}
+
+// A SAT command is sent only with its whole SAT_CMD_TIMEOUT_MS of work time
+// left (review of 0.6f3p7, MEDIUM: it used to go out with any time at all,
+// after a recovery carried over from an earlier host command had used most
+// of this one, and was reset if the drive did not finish in the rest). A SAT
+// command is a host command of its own, so it starts with 15 s and this only
+// refuses after such a recovery. Refused: nothing is sent, NO_TIME is
+// recorded (unless this host command recorded a failure already), and the
+// host is told NOT READY, which it retries.
+static bool sat_time_to_send(const sat_taskfile_t *tf) {
+    if (work_ms(SAT_CMD_TIMEOUT_MS) >= SAT_CMD_TIMEOUT_MS) return true;
+    if (!host.recorded) record_failure(IDE_FAIL_NO_TIME, tf->command, ide_read_reg(7), sat_tf_lba(tf), 0, tf->sectors);
+    return false;
 }
 
 // Ready to take a new command: not busy, and not holding data from an
 // earlier one (that is not ours to discard; the READ(10) path's own guard
-// resets it). False means nothing was sent.
-static bool sat_can_issue(void) {
-    if (!recovery_gate() || work_ms(1) == 0) return false;
+// resets it), with the command's whole time ahead of it, also after waiting
+// for the drive to be ready. False means nothing was sent.
+static bool sat_can_issue(const sat_taskfile_t *tf) {
+    if (!recovery_gate() || !sat_time_to_send(tf)) return false;
     if (!ide_wait_until_ready(work_ms(SAT_READY_TIMEOUT_MS))) return false;
     if (ide_read_reg(7) & 0x08) return false;   // stale DRQ
-    return true;
+    return sat_time_to_send(tf);
 }
 
 static void sat_write_taskfile(const sat_taskfile_t *tf) {
@@ -1336,7 +1480,7 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
     memset(regs, 0, sizeof(*regs));
     if (tf->protocol != SAT_PROTO_PIO_IN) return IDE_SAT_NOT_ISSUED;
     if (tf->sectors == 0 || tf->sectors > SAT_MAX_SECTORS) return IDE_SAT_NOT_ISSUED;
-    if (!sat_can_issue()) return IDE_SAT_NOT_ISSUED;
+    if (!sat_can_issue(tf)) return IDE_SAT_NOT_ISSUED;
 
     sat_watch_t w;
     sat_watch_arm(&w);
@@ -1405,7 +1549,7 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
 int ide_sat_nondata(const sat_taskfile_t *tf, ide_sat_regs_t *regs) {
     memset(regs, 0, sizeof(*regs));
     if (tf->protocol != SAT_PROTO_NON_DATA || tf->sectors != 0) return IDE_SAT_NOT_ISSUED;
-    if (!sat_can_issue()) return IDE_SAT_NOT_ISSUED;
+    if (!sat_can_issue(tf)) return IDE_SAT_NOT_ISSUED;
 
     sat_watch_t w;
     sat_watch_arm(&w);

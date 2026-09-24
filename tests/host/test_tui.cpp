@@ -38,6 +38,7 @@ void ide_reset_drive(void) {}
 bool ide_wait_until_ready(uint32_t) { return true; }
 uint8_t ide_read_reg(uint8_t) { return 0x50; }
 void ide_set_iordy(bool) {}
+void ide_iordy_follow_config(void) {}
 bool ide_identify(uint16_t *) { return false; }
 bool ide_set_geometry(uint8_t, uint8_t) { return true; }
 void ide_read_taskfile(uint8_t tf[8]) { for (int i = 0; i < 8; i++) tf[i] = 0; tf[7] = 0x50; }

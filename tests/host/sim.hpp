@@ -29,6 +29,11 @@
 // over RECALIBRATE (t_recal), or answer IDENTIFY with ERR and a block of
 // data (identify_err_drq). The shortest RESET- pulse and the time of the last
 // SRST are kept for the tests.
+//
+// Review of 0.6f3p7 (the MEDIUM on the least time a command is sent with):
+// INITIALIZE DEVICE PARAMETERS can take a while (t_idp), and a drive can stay
+// busy for a while after the last block of a read (busy_after), so that the
+// next command finds it not ready yet.
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -104,6 +109,12 @@ struct SimDrive {
     uint64_t srst_at = 0;                   // when SRST was last set
     // IDENTIFY takes this much longer than a sector (drive busy).
     uint64_t t_identify_extra = 0;
+    uint64_t t_idp = 1000;                  // INITIALIZE DEVICE PARAMETERS (0x91) busy time
+    // BSY for this long after the last block of a PIO data-in command, when
+    // that block is this sector (IDENTIFY's counts as sector 0). The host
+    // does not look at status after the last block of a read, so the next
+    // command finds the drive busy.
+    std::map<uint32_t, uint64_t> busy_after;
 
     // SAT-path features. nsect is the size the drive reports now; a larger
     // native_max models a Host Protected Area (0 = no HPA, same as nsect).
@@ -414,7 +425,7 @@ struct SimDrive {
         case 0x91:
             if (reject_idp) { phase = IDLE; status = 0x51; error = 0x04; intrq = true; break; }
             heads = (reg[6] & 0x0F) + 1; spt = reg[2]; geo_valid = true; init_params++;
-            phase = IDLE; status = 0x80; ready_at = now + 1000;
+            phase = IDLE; status = 0x80; ready_at = now + t_idp;
             break;
         case 0x10:
             phase = IDLE; status = 0x80; ready_at = now + t_recal;
@@ -566,7 +577,10 @@ struct SimDrive {
                     if (more_after_drain) { phase = ERR_DRQ; widx = 0; }
                 } else {
                     cur++; left--;
-                    if (left == 0) { phase = IDLE; status = (df_cmd && cmd == df_cmd) ? 0x70 : 0x50; }
+                    if (left == 0) {
+                        phase = IDLE; status = (df_cmd && cmd == df_cmd) ? 0x70 : 0x50;
+                        if (busy_after.count(cur - 1)) { status = 0x80; ready_at = now + busy_after[cur - 1]; }
+                    }
                     else { phase = BUSY_IN; status = 0x80; ready_at = now + sector_delay(cur); }
                 }
             }
