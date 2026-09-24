@@ -1,0 +1,486 @@
+name: Build ATAboy firmware
+
+# palimpsest fork CI. Builds both this fork's firmware (v.6f3p1) and upstream's
+# latest published source (v.6f3) for the RP2350 (pico2) target, using the
+# exact toolchain/SDK/picotool versions pinned in each source folder's
+# CMakeLists.txt. See FORK-README.md for what this fork changes and why this
+# workflow exists.
+#
+# This workflow never edits, commits, or pushes anything in the repository.
+# The two workspace-only source edits it makes (supplying a missing
+# pico_sdk_import.cmake, and pinning PICO_PROGRAM_BUILD_DATE for determinism)
+# happen in the CI runner's ephemeral checkout only.
+
+on:
+  push:
+    branches:
+      - main
+      - 'palimpsest/**'
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel an in-flight release build for a tag.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  # --- Arm GNU Toolchain 14.2.Rel1 (arm-none-eabi), x86_64 Linux hosted ---
+  # Checksum fetched live from developer.arm.com's own
+  # arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-eabi.tar.xz.sha256asc on
+  # 2026-09-23 and independently re-verified by downloading and hashing the
+  # tarball itself; both agree. Official first-party source.
+  ARM_TOOLCHAIN_URL: https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-eabi.tar.xz
+  ARM_TOOLCHAIN_SHA256: 62a63b981fe391a9cbad7ef51b17e49aeaa3e7b0d029b36ca1e9c3b2a9b78823
+
+  # --- pico-sdk 2.2.0, cloned with submodules (TinyUSB is a submodule) ---
+  PICO_SDK_TAG: '2.2.0'
+  # Commit the '2.2.0' tag pointed to as of 2026-09-23. Checked after every
+  # clone (cache hit or not) so a force-moved upstream tag fails loudly
+  # instead of silently building against a different SDK commit.
+  PICO_SDK_EXPECT_COMMIT: a1438dff1d38bd9c65dbd693f0e5db4b9ae91779
+
+  # --- picotool 2.2.0-a4, prebuilt Linux x86_64 binary ---
+  # raspberrypi/pico-sdk-tools publishes a prebuilt matching this exact
+  # picotoolVersion from the CMakeLists.txt files. Checksum is GitHub's own
+  # asset "digest" (computed by GitHub at upload time, returned by the
+  # releases API) and was independently re-verified locally by downloading
+  # the asset and running sha256sum on it; both agree.
+  PICOTOOL_URL: https://github.com/raspberrypi/pico-sdk-tools/releases/download/v2.2.0-4/picotool-2.2.0-a4-x86_64-lin.tar.gz
+  PICOTOOL_SHA256: 163e1b5fd66b8ab27c44a4c5104e0243fc06ea46e2ce0e6614f42d6f144a1afa
+
+  # sha256 of the vendor-shipped "FW binaries/ATAboy6f3.uf2" already in this
+  # repo, reproduced byte-for-byte on Windows (see docs referenced in
+  # FORK-README.md). Used by the reproduce-upstream job only.
+  UPSTREAM_UF2_SHA256: f6a9ddfeea3b9470f51ccf0f836a04e5161b03611bfb9393e4fa5b9d3b6dd9ba
+
+jobs:
+  build:
+    name: build (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: v.6f3p1
+            src_dir: FW source/v.6f3p1
+          - label: v.6f3
+            src_dir: FW source/v.6f3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Compute build vars (short sha, deterministic build date)
+        id: vars
+        run: |
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          EPOCH=$(git log -1 --format=%ct)
+          BUILD_DATE=$(date -u -d "@$EPOCH" '+%b %e %Y')
+          echo "sha_short=$SHA_SHORT" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_DATE_EPOCH=$EPOCH" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$BUILD_DATE" >> "$GITHUB_ENV"
+          echo "Commit $SHA_SHORT date (UTC): $BUILD_DATE"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libusb-1.0-0
+
+      - name: Cache Arm GNU Toolchain
+        id: cache-toolchain
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/pico-tools/toolchain
+          key: arm-toolchain-${{ env.ARM_TOOLCHAIN_SHA256 }}
+
+      - name: Download + verify + extract Arm GNU Toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/pico-tools/toolchain
+          curl -fL --retry 3 -o /tmp/toolchain.tar.xz "$ARM_TOOLCHAIN_URL"
+          echo "$ARM_TOOLCHAIN_SHA256  /tmp/toolchain.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/toolchain.tar.xz -C ~/pico-tools/toolchain --strip-components=1
+          rm -f /tmp/toolchain.tar.xz
+
+      - name: Cache pico-sdk
+        id: cache-sdk
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/pico-tools/pico-sdk
+          key: pico-sdk-${{ env.PICO_SDK_TAG }}-${{ env.PICO_SDK_EXPECT_COMMIT }}
+
+      - name: Clone pico-sdk (with submodules)
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ~/pico-tools/pico-sdk
+          git clone --branch "$PICO_SDK_TAG" --depth 1 \
+            --recurse-submodules --shallow-submodules \
+            https://github.com/raspberrypi/pico-sdk.git ~/pico-tools/pico-sdk
+
+      - name: Verify pico-sdk commit
+        run: |
+          cd ~/pico-tools/pico-sdk
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "$PICO_SDK_EXPECT_COMMIT" ]; then
+            echo "::error::pico-sdk tag $PICO_SDK_TAG resolved to $ACTUAL, expected $PICO_SDK_EXPECT_COMMIT (tag moved upstream or cache is stale)"
+            exit 1
+          fi
+
+      - name: Cache picotool
+        id: cache-picotool
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/pico-tools/picotool
+          key: picotool-${{ env.PICOTOOL_SHA256 }}
+
+      - name: Download + verify + extract picotool
+        if: steps.cache-picotool.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/pico-tools/picotool
+          curl -fL --retry 3 -o /tmp/picotool.tar.gz "$PICOTOOL_URL"
+          echo "$PICOTOOL_SHA256  /tmp/picotool.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/picotool.tar.gz -C ~/pico-tools/picotool
+          rm -f /tmp/picotool.tar.gz
+
+      - name: Export tool paths
+        run: |
+          chmod +x ~/pico-tools/picotool/picotool/picotool
+          echo "PICO_SDK_PATH=$HOME/pico-tools/pico-sdk" >> "$GITHUB_ENV"
+          echo "PICO_TOOLCHAIN_PATH=$HOME/pico-tools/toolchain" >> "$GITHUB_ENV"
+          echo "PICOTOOL_DIR_VAR=$HOME/pico-tools/picotool/picotool" >> "$GITHUB_ENV"
+          echo "$HOME/pico-tools/toolchain/bin" >> "$GITHUB_PATH"
+          echo "$HOME/pico-tools/picotool/picotool" >> "$GITHUB_PATH"
+
+      - name: Supply pico_sdk_import.cmake if the source tree is missing it
+        run: |
+          SRC="${{ matrix.src_dir }}"
+          if [ ! -f "$SRC/pico_sdk_import.cmake" ]; then
+            echo "::notice::$SRC has no pico_sdk_import.cmake; supplying the SDK's own copy for this build only (workspace-only, never committed)"
+            cp "$PICO_SDK_PATH/external/pico_sdk_import.cmake" "$SRC/pico_sdk_import.cmake"
+          fi
+
+      - name: Pin build date for a deterministic binary (workspace-only)
+        run: |
+          SRC="${{ matrix.src_dir }}"
+          echo "::notice::Pinning PICO_PROGRAM_BUILD_DATE to the commit date ($BUILD_DATE) instead of wall-clock time"
+          {
+            echo ""
+            echo "# --- CI determinism (added by build-firmware.yml, never committed) ---"
+            echo "# Pins the binary-info build-date field to the commit date instead of"
+            echo "# the wall-clock time the CI runner happened to build at."
+            printf 'target_compile_definitions(ATAboy PRIVATE PICO_PROGRAM_BUILD_DATE="%s")\n' "$BUILD_DATE"
+          } >> "$SRC/CMakeLists.txt"
+
+      - name: Configure
+        run: |
+          cmake -S "${{ matrix.src_dir }}" -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPICO_BOARD=pico2 \
+            -DPICO_SDK_PATH="$PICO_SDK_PATH" \
+            -DPICO_TOOLCHAIN_PATH="$PICO_TOOLCHAIN_PATH" \
+            -Dpicotool_DIR="$PICOTOOL_DIR_VAR"
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Collect outputs and checksums
+        run: |
+          mkdir -p out
+          cp build/ATAboy.uf2 build/ATAboy.elf build/ATAboy.bin out/
+          ( cd out && sha256sum ATAboy.uf2 ATAboy.elf ATAboy.bin > SHA256SUMS )
+          cat out/SHA256SUMS
+
+      - name: picotool info -a
+        run: |
+          picotool info -a out/ATAboy.elf | tee out/picotool-info.txt
+
+      - name: Job summary
+        run: |
+          {
+            echo "## build (${{ matrix.label }})"
+            echo ""
+            echo "commit: \`${{ steps.vars.outputs.sha_short }}\`, build date pinned to: \`$BUILD_DATE\`"
+            echo ""
+            echo '```'
+            cat out/SHA256SUMS
+            echo '```'
+            echo ""
+            echo "<details><summary>picotool info -a</summary>"
+            echo ""
+            echo '```'
+            cat out/picotool-info.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ATAboy-${{ matrix.label }}-${{ steps.vars.outputs.sha_short }}
+          path: out/
+          if-no-files-found: error
+
+  reproduce-upstream:
+    name: Reproduce upstream v.6f3 vendor UF2 (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libusb-1.0-0
+
+      - name: Cache Arm GNU Toolchain
+        id: cache-toolchain
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/pico-tools/toolchain
+          key: arm-toolchain-${{ env.ARM_TOOLCHAIN_SHA256 }}
+
+      - name: Download + verify + extract Arm GNU Toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/pico-tools/toolchain
+          curl -fL --retry 3 -o /tmp/toolchain.tar.xz "$ARM_TOOLCHAIN_URL"
+          echo "$ARM_TOOLCHAIN_SHA256  /tmp/toolchain.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/toolchain.tar.xz -C ~/pico-tools/toolchain --strip-components=1
+          rm -f /tmp/toolchain.tar.xz
+
+      - name: Cache pico-sdk
+        id: cache-sdk
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/pico-tools/pico-sdk
+          key: pico-sdk-${{ env.PICO_SDK_TAG }}-${{ env.PICO_SDK_EXPECT_COMMIT }}
+
+      - name: Clone pico-sdk (with submodules)
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ~/pico-tools/pico-sdk
+          git clone --branch "$PICO_SDK_TAG" --depth 1 \
+            --recurse-submodules --shallow-submodules \
+            https://github.com/raspberrypi/pico-sdk.git ~/pico-tools/pico-sdk
+
+      - name: Verify pico-sdk commit
+        run: |
+          cd ~/pico-tools/pico-sdk
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "$PICO_SDK_EXPECT_COMMIT" ]; then
+            echo "::error::pico-sdk tag $PICO_SDK_TAG resolved to $ACTUAL, expected $PICO_SDK_EXPECT_COMMIT"
+            exit 1
+          fi
+
+      - name: Cache picotool
+        id: cache-picotool
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/pico-tools/picotool
+          key: picotool-${{ env.PICOTOOL_SHA256 }}
+
+      - name: Download + verify + extract picotool
+        if: steps.cache-picotool.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/pico-tools/picotool
+          curl -fL --retry 3 -o /tmp/picotool.tar.gz "$PICOTOOL_URL"
+          echo "$PICOTOOL_SHA256  /tmp/picotool.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/picotool.tar.gz -C ~/pico-tools/picotool
+          rm -f /tmp/picotool.tar.gz
+
+      - name: Export tool paths
+        run: |
+          chmod +x ~/pico-tools/picotool/picotool/picotool
+          echo "PICO_SDK_PATH=$HOME/pico-tools/pico-sdk" >> "$GITHUB_ENV"
+          echo "PICO_TOOLCHAIN_PATH=$HOME/pico-tools/toolchain" >> "$GITHUB_ENV"
+          echo "PICOTOOL_DIR_VAR=$HOME/pico-tools/picotool/picotool" >> "$GITHUB_ENV"
+          echo "$HOME/pico-tools/toolchain/bin" >> "$GITHUB_PATH"
+          echo "$HOME/pico-tools/picotool/picotool" >> "$GITHUB_PATH"
+
+      - name: Apply the three reversions to v.6f3 (workspace-only, never committed)
+        run: |
+          SRC="FW source/v.6f3"
+          if [ ! -f "$SRC/pico_sdk_import.cmake" ]; then
+            cp "$PICO_SDK_PATH/external/pico_sdk_import.cmake" "$SRC/pico_sdk_import.cmake"
+          fi
+          python3 - "$SRC" <<'PYEOF'
+          import pathlib
+          import sys
+
+          src = pathlib.Path(sys.argv[1])
+
+          cmake = src / "CMakeLists.txt"
+          text = cmake.read_text()
+          before = text
+          # Reversion 1: program version string back to the pre-6f3 value.
+          text = text.replace(
+              'pico_set_program_version(ATAboy "0.6f3")',
+              'pico_set_program_version(ATAboy "0.6f2")',
+          )
+          if text == before:
+              print("::error::expected pico_set_program_version(ATAboy \"0.6f3\") not found in CMakeLists.txt")
+              sys.exit(1)
+          # Reversion 2: pin the build date to the one baked into the vendor binary.
+          text += '\ntarget_compile_definitions(ATAboy PRIVATE PICO_PROGRAM_BUILD_DATE="Apr  2 2026")\n'
+          cmake.write_text(text)
+
+          menus = src / "menus.c"
+          text = menus.read_text()
+          # Reversion 3: 8 spaces -> 5 spaces after "[F: Force]" in the error box.
+          needle = '[F: Force]" SEL_RED "        " BOX_VH'
+          replacement = '[F: Force]" SEL_RED "     " BOX_VH'
+          if needle not in text:
+              print("::error::expected menus.c anchor text for the [F: Force] spacing reversion was not found; upstream source has drifted since this workflow was written")
+              sys.exit(1)
+          text = text.replace(needle, replacement)
+          menus.write_text(text)
+
+          print("All three reversions applied.")
+          PYEOF
+
+      - name: Configure
+        run: |
+          cmake -S "FW source/v.6f3" -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPICO_BOARD=pico2 \
+            -DPICO_SDK_PATH="$PICO_SDK_PATH" \
+            -DPICO_TOOLCHAIN_PATH="$PICO_TOOLCHAIN_PATH" \
+            -Dpicotool_DIR="$PICOTOOL_DIR_VAR"
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Compare against the vendor-shipped UF2
+        run: |
+          VENDOR="FW binaries/ATAboy6f3.uf2"
+          ACTUAL=$(sha256sum build/ATAboy.uf2 | awk '{print $1}')
+          {
+            echo "## reproduce-upstream: v.6f3 vendor UF2"
+            echo ""
+            echo "| | sha256 |"
+            echo "|---|---|"
+            echo "| \`$VENDOR\` (in this repo) | \`$UPSTREAM_UF2_SHA256\` |"
+            echo "| built on this runner (Linux, Arm GNU 14.2.Rel1) | \`$ACTUAL\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ACTUAL" = "$UPSTREAM_UF2_SHA256" ]; then
+            echo "### Result: MATCH" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The Linux toolchain reproduces the vendor-shipped v0.6f3 binary byte-for-byte." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Result: DIFFER" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            python3 - "build/ATAboy.uf2" "$VENDOR" >> "$GITHUB_STEP_SUMMARY" <<'PYEOF'
+          import struct
+          import sys
+
+          BLOCK_SIZE = 512
+          MAGIC0 = 0x0A324655
+          MAGIC1 = 0x9E5D5157
+          MAGIC_END = 0x0AB16F30
+
+
+          def load_payload(path):
+              with open(path, "rb") as f:
+                  data = f.read()
+              blocks = {}
+              for off in range(0, len(data), BLOCK_SIZE):
+                  block = data[off:off + BLOCK_SIZE]
+                  magic0, magic1, flags, target_addr, payload_size, block_no, num_blocks, file_size = \
+                      struct.unpack_from("<IIIIIIII", block, 0)
+                  magic_end = struct.unpack_from("<I", block, 508)[0]
+                  if magic0 != MAGIC0 or magic1 != MAGIC1 or magic_end != MAGIC_END:
+                      raise ValueError(f"{path}: block at offset {off} is not a valid UF2 block")
+                  blocks[target_addr] = block[32:32 + payload_size]
+              return blocks
+
+
+          def flatten(blocks):
+              out = bytearray()
+              for addr in sorted(blocks):
+                  out += blocks[addr]
+              return bytes(out)
+
+
+          a = flatten(load_payload(sys.argv[1]))
+          b = flatten(load_payload(sys.argv[2]))
+          print(f"built:  {sys.argv[1]} -- {len(a)} payload bytes")
+          print(f"vendor: {sys.argv[2]} -- {len(b)} payload bytes")
+          n = min(len(a), len(b))
+          diff_bytes = sum(1 for i in range(n) if a[i] != b[i]) + abs(len(a) - len(b))
+          first_diff = next((i for i in range(n) if a[i] != b[i]), n)
+          print(f"payload length delta: {len(a) - len(b)} bytes")
+          print(f"differing bytes (incl. length delta): {diff_bytes}")
+          print(f"first differing offset: 0x{first_diff:x}")
+          PYEOF
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload reproduction build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: reproduce-upstream-v.6f3-${{ github.sha }}
+          path: build/ATAboy.uf2
+          if-no-files-found: error
+
+  release:
+    name: Publish release build
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: 'ATAboy-*'
+          path: release-assets
+          merge-multiple: false
+
+      - name: Assemble release files
+        run: |
+          mkdir -p dist
+          for d in release-assets/*/; do
+            name=$(basename "$d")
+            cp "$d"/ATAboy.uf2 "dist/${name}.uf2"
+            cp "$d"/ATAboy.elf "dist/${name}.elf"
+            cp "$d"/ATAboy.bin "dist/${name}.bin"
+            cp "$d"/picotool-info.txt "dist/${name}.picotool-info.txt"
+          done
+          ( cd dist && sha256sum *.uf2 *.elf *.bin > SHA256SUMS )
+          ls -la dist
+          cat dist/SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          prerelease: true
+          files: |
+            dist/*.uf2
+            dist/*.elf
+            dist/*.bin
+            dist/*.picotool-info.txt
+            dist/SHA256SUMS
+          body: |
+            **This is an UNOFFICIAL fork build, not an official upstream ATAboy release.**
+
+            Built by CI from [BarelyBooting/ATAboy](https://github.com/BarelyBooting/ATAboy)
+            (a maintained fork of [redruM0381/ATAboy](https://github.com/redruM0381/ATAboy))
+            at tag `${{ github.ref_name }}`. See `FORK-README.md` in the repository for what
+            this fork changes relative to upstream, and `SHA256SUMS` in these assets for the
+            exact binaries produced.
+
+            Flash and use these at your own risk. If you want the original author's own
+            releases, get them from the upstream repository above.
