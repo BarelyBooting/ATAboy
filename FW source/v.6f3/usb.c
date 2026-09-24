@@ -7,6 +7,13 @@
 #include "config.h"
 #include <string.h>
 
+// ATABOY_STRICT_MEDIA_BOUNDS (default 1): never report data for a sector the
+// drive did not supply. Build with -DATABOY_STRICT_MEDIA_BOUNDS=0 to restore the
+// previous behaviour (zero-fill past the end of the configured medium).
+#ifndef ATABOY_STRICT_MEDIA_BOUNDS
+#define ATABOY_STRICT_MEDIA_BOUNDS 1
+#endif
+
 extern volatile bool is_mounted;
 extern volatile bool media_changed_waiting;
 
@@ -114,7 +121,24 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
         ptr += remaining; remaining = 0;
     }
 
+#if ATABOY_STRICT_MEDIA_BOUNDS
+    // Whatever lies at or beyond `max` was not read from the drive. Returning
+    // it as zero-filled SUCCESS is indistinguishable, to the host, from real
+    // zeros on the platter - so an image of a drive whose configured geometry
+    // is smaller than the drive silently ends in fabricated zeros. Hand back
+    // only the sectors actually read; TinyUSB then calls back for the rest,
+    // which starts at or beyond `max` and fails here.
+    if (remaining > 0) {
+        uint32_t done = bufsize - remaining;
+        if (done == 0) {
+            tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x21, 0x00); // LBA out of range
+            return -1;
+        }
+        return (int32_t)done;
+    }
+#else
     if (remaining > 0) memset(ptr, 0, remaining);
+#endif
     return (int32_t)bufsize;
 }
 
