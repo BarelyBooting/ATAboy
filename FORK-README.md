@@ -32,9 +32,11 @@ Added in 0.6f3p4 (built and host-tested, not yet run on hardware):
 
 11. **READ(10) and WRITE(10) refuse a malformed request.** TinyUSB works the block size out from the host's transfer length and never checks it is 512, so a length that didn't match the block count could make the partial-sector code copy past a 512-byte buffer. A request that isn't whole 512-byte sectors is now refused before anything is read or written. Normal operating systems never send one.
 
-12. **Host tests** in `tests/host/`: the real `ide.c` and `usb.c` run against a simulated drive (`run.sh`, `mutate.py`), and `tui_compare.py` checks the screen output against an older build.
+12. **A slave drive on its own survives a soft reset.** Found on real hardware in 0.6f3p4 (a Seagate with no jumpers, which makes it a slave, alone on the cable): after a soft reset the firmware waited for a master that wasn't there. An empty master position reads 0xFF on this bus, which looks busy, so it waited the full 31 s and then gave up with the empty position still selected. Every command after that failed until the next detect. Now a slave is selected again straight away, and a master that times out is left alone.
 
-The fork's build calls itself `0.6f3p4-palimpsest` and shows `v0.6f3p4 (fork)` in the setup screen (0.6f3p1 before items 6 to 12), so it can't be mistaken for a stock v0.6f3.
+13. **Host tests** in `tests/host/`: the real `ide.c` and `usb.c` run against a simulated drive (`run.sh`, `mutate.py`), and `tui_compare.py` checks the screen output against an older build.
+
+The fork's build calls itself `0.6f3p5-palimpsest` and shows `v0.6f3p5 (fork)` in the setup screen (0.6f3p1 before items 6 to 13), so it can't be mistaken for a stock v0.6f3.
 
 ## Builds
 

@@ -84,6 +84,10 @@ MUTANTS = [
      'IDE_SRST_TIMEOUT_MS 31000', 'IDE_SRST_TIMEOUT_MS 2000'),
     ('no 2 ms wait after SRST before polling', 'ide.c',
      '    busy_wait_us_32(2000);                  // ATA: 2 ms before status is valid\n', ''),
+    # Found on hardware 2026-09-23 (slave-only ST380011A): the reset waited on
+    # an absent master, whose status floats to 0xFF, and gave up unselected.
+    ('slave waits on the absent master after SRST (the bug as found)', 'ide.c',
+     '    if (dev_base == 0xA0) {\n        uint32_t start', '    if (1) {\n        uint32_t start'),
     ('device not selected again after SRST', 'ide.c',
      '    ide_write_reg(6, dev_base);\n    busy_wait_us_32(1);                     // 400 ns', '    busy_wait_us_32(1);                     // 400 ns'),
     ('geometry not marked lost by SRST', 'ide.c',

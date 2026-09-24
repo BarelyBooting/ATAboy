@@ -452,6 +452,23 @@ static void test_slave_after_reset(Mode m) {
     HostRead g = host_read10(100, 8);
     CHECK(g.ok && matches_medium(g, 100), "slave usable after the reset");
     CHECK(sim.violations == 0, "violations %d", sim.violations);
+
+    // Found on hardware (ST380011A, slave-only, 2026-09-23): no master on the
+    // cable, so device 0 reads 0xFF (bus floats high). The reset must not wait
+    // on it, and must leave the slave selected, also when the slave is slow.
+    sim.t_reset = 3000000000ull;
+    sim.bad[5003] = {BAD_HANG, 0};
+    uint64_t t0 = mock_now_ns;
+    uint8_t buf[8 * 512]; uint32_t done = 0;
+    int32_t r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_fail_t f2; ide_last_failure(&f2);
+    CHECK(r < 0 && f2.reset && !f2.reset_failed, "slow slave reset: r %d reset %d failed %d", r, f2.reset, f2.reset_failed);
+    CHECK(mock_now_ns - t0 < 20000000000ull, "reset took %llu ms: waited on the absent master", (unsigned long long)((mock_now_ns - t0) / 1000000));
+    CHECK(((sim.reg[6] >> 4) & 1) == 1, "slave not selected after the reset (DH %02X)", sim.reg[6]);
+    sim.bad.clear();
+    HostRead g2 = host_read10(100, 8);
+    CHECK(g2.ok && matches_medium(g2, 100), "slave usable after a slow reset");
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
 }
 
 // TinyUSB takes the block size from the host's CBW. A non-zero offset or a

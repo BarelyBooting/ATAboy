@@ -60,6 +60,10 @@ struct SimDrive {
     int      widx = 0;
     bool     more_after_drain = false;
     uint8_t  devctl = 0;
+    // ATA: status is not valid for 2 ms after SRST is released; this drive
+    // keeps showing what it showed before the reset during that window.
+    uint8_t  status_before_srst = 0x50;
+    uint64_t srst_released_at = 0;
 
     // bookkeeping for the tests
     int srst = 0, init_params = 0, violations = 0, commands = 0;
@@ -161,7 +165,9 @@ struct SimDrive {
     bool selected() const { return ((reg[6] >> 4) & 1) == (slave ? 1 : 0); }
 
     uint8_t read_status(uint64_t now) {
-        if (!selected()) return 0x00;              // no device 0: DD7 pulled down
+        if (!selected()) return 0xFF;              // no such device: the ATAboy bus floats high (ide.c probe filter)
+        if (phase == IN_RESET && !(devctl & 0x04) && now < srst_released_at + 2000000)
+            return status_before_srst & ~0x80;     // stale during the 2 ms window
         // ATA: status is not valid for 400 ns after a command is written;
         // this drive keeps showing the pre-command status in that window.
         if (commands > 0 && now < cmd_at + 400) return status_at_cmd;
@@ -178,7 +184,13 @@ struct SimDrive {
 
     void write_reg(int r, uint8_t v, uint64_t now) {
         tick(now);
-        if (phase == IN_RESET) { violations++; reset_writes++; return; }  // written during SRST
+        if (phase == IN_RESET) {
+            // Once SRST is released the drives are still busy finishing the
+            // reset. Selecting a device then is latched (Linux does it on a
+            // slave-only cable); any other write is a protocol violation.
+            if (r == 6 && !(devctl & 0x04)) { reg[6] = v; return; }
+            violations++; reset_writes++; return;
+        }
         if (r == 7) {
             if (!selected()) { violations++; return; }  // command sent to the other device
             command(v, now); return;
@@ -220,11 +232,12 @@ struct SimDrive {
     void write_control(uint8_t v, uint64_t now) {
         tick(now);
         if (v & 0x04) {
-            if (!(devctl & 0x04)) srst++;
+            if (!(devctl & 0x04)) { srst++; status_before_srst = status; }
             phase = IN_RESET; status = 0x80;
             reg[6] &= ~0x10;                       // SRST selects device 0
         } else if (devctl & 0x04) {
             ready_at = now + t_reset;
+            srst_released_at = now;
         }
         devctl = v;
     }

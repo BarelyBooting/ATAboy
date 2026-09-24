@@ -328,13 +328,22 @@ static bool srst_and_restore(void) {
     chs_geometry_lost = true;               // SRST drops INITIALIZE DEVICE PARAMETERS
     busy_wait_us_32(2000);                  // ATA: 2 ms before status is valid
     // SRST leaves device 0 selected, and device 0 holds BSY until device 1
-    // has finished too. Wait for that, then select our device again: a slave
-    // would otherwise be polled and addressed through the master.
-    uint32_t start = to_ms_since_boot(get_absolute_time());
-    while (ide_read_reg(7) & 0x80) {
-        if (to_ms_since_boot(get_absolute_time()) - start >= IDE_SRST_TIMEOUT_MS)
-            return false;
-        busy_wait_us_32(10);
+    // has finished too, so a master is waited on right here. A slave is only
+    // ever in use when detection found no usable master (the probe takes the
+    // master first), and an absent device 0 reads 0xFF on this bus, which
+    // looks like BSY for the whole timeout. So a slave skips that wait.
+    // Either way our device is selected again before anything else, even on
+    // a timeout: left pointing at an absent master, every later command
+    // would poll the floating bus and fail until the next detect.
+    // (A master that times out needs no reselect: device 0 is ours, and
+    // writing registers to a drive still in reset would break the protocol.)
+    if (dev_base == 0xA0) {
+        uint32_t start = to_ms_since_boot(get_absolute_time());
+        while (ide_read_reg(7) & 0x80) {
+            if (to_ms_since_boot(get_absolute_time()) - start >= IDE_SRST_TIMEOUT_MS)
+                return false;
+            busy_wait_us_32(10);
+        }
     }
     ide_write_reg(6, dev_base);
     busy_wait_us_32(1);                     // 400 ns before status is valid
