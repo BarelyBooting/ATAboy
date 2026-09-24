@@ -34,6 +34,15 @@ struct SimDrive {
     uint64_t t_bad    = 600000000;  // failing sector (measured ~600 ms on the WD Caviar 280)
     uint64_t t_reset  = 2000000;
     bool     garbage_while_busy = false;  // status reads 0x81 while BSY (bits undefined)
+    // With no INITIALIZE DEVICE PARAMETERS since power-on or SRST, a real drive
+    // translates CHS with its own default geometry; it does not refuse. So a
+    // lost geometry reads the WRONG sector with good status. false = IDNF.
+    bool     default_translation = true;
+    // This drive answers as device 1 (slave). Only the selected device (DEV
+    // bit of register 6) drives status or acts on a command; SRST selects 0.
+    bool     slave = false;
+    int      reset_writes = 0;              // task-file writes while in SRST
+    bool     reject_idp = false;            // ABRT INITIALIZE DEVICE PARAMETERS
 
     // registers
     uint8_t reg[8] = {0};
@@ -76,8 +85,13 @@ struct SimDrive {
             return (uint32_t)reg[3] | ((uint32_t)reg[4] << 8) | ((uint32_t)reg[5] << 16) |
                    ((uint32_t)(reg[6] & 0x0F) << 24);
         uint32_t cyl = reg[4] | (reg[5] << 8), head = reg[6] & 0x0F, sec = reg[3];
-        if (!geo_valid || sec == 0 || sec > spt || head >= heads) return 0xFFFFFFFFu;
-        return (cyl * heads + head) * spt + (sec - 1);
+        uint32_t H = heads, S = spt;
+        if (!geo_valid) {
+            if (!default_translation) return 0xFFFFFFFFu;
+            H = native_heads; S = native_spt;
+        }
+        if (sec == 0 || sec > S || head >= H) return 0xFFFFFFFFu;
+        return (cyl * H + head) * S + (sec - 1);
     }
     void set_addr_regs(uint32_t lba) {
         if (reg[6] & 0x40 || cmd == 0x24) {
@@ -144,7 +158,10 @@ struct SimDrive {
         return t_sector;
     }
 
+    bool selected() const { return ((reg[6] >> 4) & 1) == (slave ? 1 : 0); }
+
     uint8_t read_status(uint64_t now) {
+        if (!selected()) return 0x00;              // no device 0: DD7 pulled down
         // ATA: status is not valid for 400 ns after a command is written;
         // this drive keeps showing the pre-command status in that window.
         if (commands > 0 && now < cmd_at + 400) return status_at_cmd;
@@ -161,8 +178,11 @@ struct SimDrive {
 
     void write_reg(int r, uint8_t v, uint64_t now) {
         tick(now);
-        if (phase == IN_RESET) return;
-        if (r == 7) { command(v, now); return; }
+        if (phase == IN_RESET) { violations++; reset_writes++; return; }  // written during SRST
+        if (r == 7) {
+            if (!selected()) { violations++; return; }  // command sent to the other device
+            command(v, now); return;
+        }
         if (status & 0x88) violations++;       // task file written while BSY or DRQ
         if (r >= 2 && r <= 5) hob[r] = reg[r];
         reg[r] = v;
@@ -185,6 +205,7 @@ struct SimDrive {
             phase = BUSY_OUT; status = 0x80; ready_at = now + 1000;
             break;
         case 0x91:
+            if (reject_idp) { phase = IDLE; status = 0x51; error = 0x04; break; }
             heads = (reg[6] & 0x0F) + 1; spt = reg[2]; geo_valid = true; init_params++;
             phase = IDLE; status = 0x80; ready_at = now + 1000;
             break;
@@ -201,6 +222,7 @@ struct SimDrive {
         if (v & 0x04) {
             if (!(devctl & 0x04)) srst++;
             phase = IN_RESET; status = 0x80;
+            reg[6] &= ~0x10;                       // SRST selects device 0
         } else if (devctl & 0x04) {
             ready_at = now + t_reset;
         }

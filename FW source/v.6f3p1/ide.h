@@ -62,6 +62,7 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
 #define IDE_FAIL_ERR        2   // drive finished the command with ERR set
 #define IDE_FAIL_TIMEOUT    3   // no DRQ / no completion in time
 #define IDE_FAIL_STALE_DRQ  4   // drive still offering data from an earlier command
+#define IDE_FAIL_NO_GEOMETRY 5  // CHS mode, and the drive would not take our geometry
 typedef struct {
     uint8_t  kind;          // IDE_FAIL_*
     uint8_t  command;       // ATA command that failed
@@ -70,6 +71,8 @@ typedef struct {
     uint8_t  tf[5];         // registers 2..6: count, sector, cyl lo, cyl hi, dev/head
     bool     drained;       // drive offered data for the failed sector; discarded
     bool     reset;         // a soft reset was needed to get the drive back
+    bool     reset_failed;  // ...and the drive did not come back ready, or in CHS
+                            // mode did not take the geometry again
     uint32_t lba;           // first sector not transferred
     uint32_t done;          // sectors transferred before the failure
     uint32_t count;         // sectors requested

@@ -720,13 +720,13 @@ static void run_debug_errors(void) {
     if (f.kind == IDE_FAIL_NONE) {
         debug_print(2, FG_WHITE, "[Last Failed I/O] none since power-up");
     } else {
-        static const char *kinds[] = {"?", "not ready", "ERR", "timeout", "stale data"};
+        static const char *kinds[] = {"?", "not ready", "ERR", "timeout", "stale data", "no geometry"};
         debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
-                    f.command, kinds[f.kind < 5 ? f.kind : 0], (unsigned long)f.lba,
+                    f.command, kinds[f.kind < 6 ? f.kind : 0], (unsigned long)f.lba,
                     (unsigned long)f.done, (unsigned long)f.count);
         debug_print(3, FG_WHITE, "ST:%02X ERR:%02X SC:%02X SN:%02X CL:%02X CH:%02X DH:%02X%s%s",
                     f.status, f.error, f.tf[0], f.tf[1], f.tf[2], f.tf[3], f.tf[4],
-                    f.drained ? "  drained" : "", f.reset ? "  reset" : "");
+                    f.drained ? "  drained" : "", f.reset ? (f.reset_failed ? "  reset FAILED" : "  reset") : "");
     }
 }
 

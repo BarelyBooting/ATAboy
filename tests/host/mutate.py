@@ -54,15 +54,15 @@ MUTANTS = [
      '        ide_drain_sector();\n        last_fail.drained = true;',
      '        last_fail.drained = true;'),
     ('CHS geometry not restored after SRST', 'ide.c',
-     '    if (!config.use_lba_mode)\n        ide_set_geometry(config.heads, config.spt);\n    last_fail.reset = true;',
-     '    last_fail.reset = true;'),
+     '    if (config.use_lba_mode) return true;\n    return ide_set_geometry(config.heads, config.spt);',
+     '    return true;'),
     ('read data into the caller buffer when draining', 'ide.c',
      '        ide_drain_sector();\n        last_fail.drained = true;',
      '        set_address(0); xcvr_read(); sio_hw->gpio_clr = (1 << IDE_CS0);\n'
      '        ide_pio_read(256, wbuf + s * 256);\n'
      '        sio_hw->gpio_set = (1 << IDE_CS0); bus_idle();\n'
      '        last_fail.drained = true; s++;'),
-    # --- ide.c: stale DRQ before a read (built with ATABOY_SAT) ---
+    # --- ide.c: stale DRQ before a read ---
     ('no stale DRQ guard: command issued over stranded data', 'ide.c',
      '    if (st & 0x08) {\n        record_failure(IDE_FAIL_STALE_DRQ',
      '    if (0) {\n        record_failure(IDE_FAIL_STALE_DRQ'),
@@ -79,6 +79,37 @@ MUTANTS = [
      '    if (st & 0x08) {\n        record_failure(IDE_FAIL_ERR, 0, st, lba, 0, count);\n'
      '        ide_drain_sector(); last_fail.drained = true;\n'
      '        if (!idle_after_error(2000)) soft_reset_restore();\n        return -1;\n    }'),
+    # --- ide.c: soft reset and CHS geometry restore (review finding F1, F3) ---
+    ('the old reset: 2 s wait, then restore regardless', 'ide.c',
+     'IDE_SRST_TIMEOUT_MS 31000', 'IDE_SRST_TIMEOUT_MS 2000'),
+    ('no 2 ms wait after SRST before polling', 'ide.c',
+     '    busy_wait_us_32(2000);                  // ATA: 2 ms before status is valid\n', ''),
+    ('device not selected again after SRST', 'ide.c',
+     '    ide_write_reg(6, dev_base);\n    busy_wait_us_32(1);                     // 400 ns', '    busy_wait_us_32(1);                     // 400 ns'),
+    ('geometry not marked lost by SRST', 'ide.c',
+     '    chs_geometry_lost = true;               // SRST drops', '    // SRST drops'),
+    ('CHS transfers never refuse on a lost geometry', 'ide.c',
+     '    if (config.use_lba_mode || !chs_geometry_lost) return true;', '    return true;'),
+    ('geometry restore ignores ABRT', 'ide.c',
+     'bool ok = ide_wait_until_ready(1000) && !(ide_read_reg(7) & 0x01);', 'bool ok = ide_wait_until_ready(1000);'),
+    ('reset recorded as fine when it failed', 'ide.c',
+     '    last_fail.reset_failed = !srst_and_restore();', '    (void)srst_and_restore();'),
+    ('no geometry check before a write', 'ide.c',
+     '    uint8_t fail_kind = IDE_FAIL_TIMEOUT;\n    if (count == 0) return -1;\n'
+     '    if (!ide_wait_until_ready(5000)) {\n'
+     '        record_failure(IDE_FAIL_NOT_READY, 0, ide_read_reg(7), lba, 0, count);\n'
+     '        return -1;\n    }\n    if (!chs_geometry_ok()) {',
+     '    uint8_t fail_kind = IDE_FAIL_TIMEOUT;\n    if (count == 0) return -1;\n'
+     '    if (!ide_wait_until_ready(5000)) {\n'
+     '        record_failure(IDE_FAIL_NOT_READY, 0, ide_read_reg(7), lba, 0, count);\n'
+     '        return -1;\n    }\n    if (0) {'),
+    # --- usb.c: host-controlled offsets (review finding F2) ---
+    ('READ(10) accepts a non-zero offset', 'usb.c',
+     '    if (offset != 0 || (bufsize % 512) != 0) {\n        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);\n        return -1;\n    }\n\n    uint64_t max = total_sectors();\n    if (max == 0) return -1;\n\n    uint32_t remaining = bufsize;\n    uint8_t *ptr = (uint8_t *)buffer;',
+     '    if ((bufsize % 512) != 0) {\n        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);\n        return -1;\n    }\n\n    uint64_t max = total_sectors();\n    if (max == 0) return -1;\n\n    uint32_t remaining = bufsize;\n    uint8_t *ptr = (uint8_t *)buffer;'),
+    ('WRITE(10) accepts a length that is not whole sectors', 'usb.c',
+     '    if (offset != 0 || (bufsize % 512) != 0) {\n        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);\n        return -1;\n    }\n\n    uint64_t max = total_sectors();\n    if (max == 0) return -1;\n\n    uint32_t remaining = bufsize;\n    uint8_t *ptr = buffer;',
+     '    if (offset != 0) {\n        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);\n        return -1;\n    }\n\n    uint64_t max = total_sectors();\n    if (max == 0) return -1;\n\n    uint32_t remaining = bufsize;\n    uint8_t *ptr = buffer;'),
 ]
 
 
@@ -109,6 +140,13 @@ def main():
         p = run_tests(src, os.path.join(tmp, 'out'))
         out = p.stdout.strip().splitlines()
         summary = out[-1] if out else ''
+        built = any(os.path.exists(os.path.join(tmp, 'out', 'test_read' + x)) for x in ('', '.exe'))
+        if 'checks,' not in summary and built and p.returncode != 0:
+            # Built, then crashed before its summary (a segfault, say). The
+            # tests caught it, just not gracefully: counts as killed.
+            killed.append(name)
+            print(f'KILLED       {name}\n             crashed: {(p.stderr.strip().splitlines() or ["?"])[-1][:150]}')
+            shutil.rmtree(tmp, ignore_errors=True); continue
         if 'checks,' not in summary:
             bad_setup.append((name, 'did not build or run: ' + (p.stderr.strip().splitlines() or ['?'])[-1]))
             print(f'NO RESULT    {name}'); continue

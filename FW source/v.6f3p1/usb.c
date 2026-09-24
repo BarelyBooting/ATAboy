@@ -75,6 +75,16 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     (void)lun;
     if (!is_mounted) return -1;
 
+    // TinyUSB derives the block size from the host's CBW (length / count)
+    // and never checks it against the 512 we report. With 512-byte blocks
+    // every call has offset 0 and a whole number of sectors. Anything else
+    // comes from a malformed CBW: the partial-sector code below would then
+    // index past its 512-byte buffer, or address the wrong sectors. Refuse.
+    if (offset != 0 || (bufsize % 512) != 0) {
+        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
+        return -1;
+    }
+
     uint64_t max = total_sectors();
     if (max == 0) return -1;
 
@@ -155,6 +165,16 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                            uint8_t *buffer, uint32_t bufsize) {
     (void)lun;
     if (!is_mounted || config.drive_write_protected) return -1;
+
+    // TinyUSB derives the block size from the host's CBW (length / count)
+    // and never checks it against the 512 we report. With 512-byte blocks
+    // every call has offset 0 and a whole number of sectors. Anything else
+    // comes from a malformed CBW: the partial-sector code below would then
+    // index past its 512-byte buffer, or address the wrong sectors. Refuse.
+    if (offset != 0 || (bufsize % 512) != 0) {
+        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
+        return -1;
+    }
 
     uint64_t max = total_sectors();
     if (max == 0) return -1;

@@ -8,6 +8,12 @@
 
 static uint8_t dev_base = 0xA0;   // 0xA0 = master, 0xB0 = slave
 
+// True when the drive's CHS translation is not known to be ours: after a
+// soft reset (which drops it) until INITIALIZE DEVICE PARAMETERS succeeds
+// again. A CHS address would then go through the drive's own default
+// translation and name a different sector, so CHS reads and writes refuse.
+static bool chs_geometry_lost = false;
+
 void ide_select_device(uint8_t base) { dev_base = base; }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +234,11 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     ide_write_reg(2, spt);
     ide_write_reg(7, 0x91);
     wait_after_command();
-    return ide_wait_until_ready(1000);
+    // Only a clean completion counts. With ABRT the drive keeps its own
+    // default translation, which is not the geometry we address it with.
+    bool ok = ide_wait_until_ready(1000) && !(ide_read_reg(7) & 0x01);
+    chs_geometry_lost = !ok;
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -299,21 +309,52 @@ static void record_failure(uint8_t kind, uint8_t cmd, uint8_t st,
     for (int i = 0; i < 5; i++) last_fail.tf[i] = ide_read_reg(2 + i);
     last_fail.drained = false;
     last_fail.reset   = false;
+    last_fail.reset_failed = false;
     last_fail.lba     = lba;
     last_fail.done    = done;
     last_fail.count   = count;
 }
 
-// Soft reset, for a drive that is stuck or did not end the command cleanly.
-static void soft_reset_restore(void) {
+#define IDE_SRST_TIMEOUT_MS 31000   // ATA allows a device up to 31 s after SRST
+
+// Soft reset, then select our device again and put the CHS translation back.
+// True only if the drive came back ready and, in CHS mode, took the geometry.
+// On false, chs_geometry_lost stays set and CHS transfers refuse until a
+// later ide_set_geometry() succeeds.
+static bool srst_and_restore(void) {
     ide_write_control(0x04);
     busy_wait_us_32(10);
     ide_write_control(0x00);
-    ide_wait_until_ready(2000);
-    // SRST clears INITIALIZE DRIVE PARAMETERS, so restore CHS geometry
-    if (!config.use_lba_mode)
-        ide_set_geometry(config.heads, config.spt);
+    chs_geometry_lost = true;               // SRST drops INITIALIZE DEVICE PARAMETERS
+    busy_wait_us_32(2000);                  // ATA: 2 ms before status is valid
+    // SRST leaves device 0 selected, and device 0 holds BSY until device 1
+    // has finished too. Wait for that, then select our device again: a slave
+    // would otherwise be polled and addressed through the master.
+    uint32_t start = to_ms_since_boot(get_absolute_time());
+    while (ide_read_reg(7) & 0x80) {
+        if (to_ms_since_boot(get_absolute_time()) - start >= IDE_SRST_TIMEOUT_MS)
+            return false;
+        busy_wait_us_32(10);
+    }
+    ide_write_reg(6, dev_base);
+    busy_wait_us_32(1);                     // 400 ns before status is valid
+    if (!ide_wait_until_ready(IDE_SRST_TIMEOUT_MS)) return false;
+    if (config.use_lba_mode) return true;
+    return ide_set_geometry(config.heads, config.spt);
+}
+
+// Soft reset, for a drive that is stuck or did not end the command cleanly.
+static void soft_reset_restore(void) {
     last_fail.reset = true;
+    last_fail.reset_failed = !srst_and_restore();
+}
+
+// CHS mode after a reset that could not restore the geometry: try once more
+// (the drive may just have been slow). False if the drive still will not
+// take it; the caller must then refuse the transfer.
+static bool chs_geometry_ok(void) {
+    if (config.use_lba_mode || !chs_geometry_lost) return true;
+    return ide_set_geometry(config.heads, config.spt);
 }
 
 // After a command ends with ERR the drive should be idle again: BSY=0,
@@ -356,11 +397,11 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
         record_failure(IDE_FAIL_NOT_READY, 0, ide_read_reg(7), lba, 0, count);
         return -1;
     }
-#if ATABOY_SAT
     // If the drive is still offering data from an earlier command (a SAT
-    // command that timed out, say), issuing a new one breaks the ATA protocol,
-    // and some drives would then hand that stale block back as this read's
-    // result. This is not a drive ERR, so it must not take the read_err path
+    // command or a debug seek test that gave up, say), issuing a new one
+    // breaks the ATA protocol, and some drives would then hand that stale
+    // block back as this read's result. This is not a drive ERR, so it must
+    // not take the read_err path
     // (which deliberately skips the reset): record it, clear it with a soft
     // reset, and fail this read.
     st = ide_read_reg(7);
@@ -369,7 +410,10 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
         soft_reset_restore();
         return -1;
     }
-#endif
+    if (!chs_geometry_ok()) {
+        record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);
+        return -1;
+    }
 
     bool use_lba48 = config.use_lba_mode && (config.lba_sectors > 0x0FFFFFFF);
 
@@ -466,6 +510,10 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     if (count == 0) return -1;
     if (!ide_wait_until_ready(5000)) {
         record_failure(IDE_FAIL_NOT_READY, 0, ide_read_reg(7), lba, 0, count);
+        return -1;
+    }
+    if (!chs_geometry_ok()) {
+        record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);
         return -1;
     }
 
@@ -631,12 +679,7 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba) {
 // result. A soft reset ends the command. There is no error state worth
 // keeping at this point: the command timed out or ended badly.
 static void sat_abort(void) {
-    ide_write_control(0x04);
-    busy_wait_us_32(10);
-    ide_write_control(0x00);
-    ide_wait_until_ready(2000);
-    if (!config.use_lba_mode)
-        ide_set_geometry(config.heads, config.spt);   // SRST clears the CHS setup
+    (void)srst_and_restore();   // on failure, CHS reads refuse until restored
 }
 
 int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, uint8_t *ata_error) {
