@@ -99,7 +99,14 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     uint32_t aligned = remaining / 512;
     if (aligned > 0 && cur_lba < max) {
         if (cur_lba + aligned > max) aligned = (uint32_t)(max - cur_lba);
-        if (ide_read_sectors(cur_lba, aligned, ptr) < 0) {
+        uint32_t got = 0;
+        if (ide_read_sectors_partial(cur_lba, aligned, ptr, &got) < 0) {
+            // Issue #13: sectors before the failing one are real data, so hand
+            // those back and nothing else. TinyUSB then calls again starting at
+            // the failing sector, which is read again on its own and fails
+            // there if it is still bad. A failed sector is never filled in.
+            uint32_t done = (bufsize - remaining) + (got < aligned ? got : 0) * 512;
+            if (done > 0) return (int32_t)done;
             tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);
             return -1;
         }

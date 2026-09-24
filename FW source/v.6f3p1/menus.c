@@ -220,8 +220,11 @@ static void print_help(const char *text) {
 
 static void draw_bios_frame(void) {
     cdc_printf(BG_BLUE FG_WHITE CLR_SCR HIDE_CUR "\033[H");
-    cdc_printf("\033[1;1H%80s", "");
-    cdc_printf("\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p2 (fork) - (C) 2026 obsoletetech.us");
+    // Paint every cell of the 80x24 screen blue. ESC[2J alone is not enough:
+    // whether an erase uses the current background colour depends on the
+    // terminal (screen with bce off, for one, erases to the default colour).
+    for (int row = 1; row <= 24; row++) cdc_printf("\033[%d;1H%80s", row, "");
+    cdc_printf("\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p4 (fork) - (C) 2026 obsoletetech.us");
 
     bool feat = (current_screen == SCREEN_FEATURES);
 
@@ -280,11 +283,15 @@ static void draw_hdd_status(void) {
     int start_x = (80 - (label_len + text_len + dev_len)) / 2;
 
     draw_at(start_x, 22, FG_WHITE "Current HDD: ");
-    if (is_error)        cdc_printf("\033[91;1m%s" RESET BG_BLUE FG_WHITE "\033[K", display);
-    else if (hdd_model_raw[0]) cdc_printf("\033[32;1m%s" FG_YELLOW "%s" RESET BG_BLUE FG_WHITE "\033[K", display, dev_label);
-    else                 cdc_printf(FG_YELLOW "%s" RESET BG_BLUE FG_WHITE "\033[K", display);
+    if (is_error)        cdc_printf("\033[91;1m%s" RESET BG_BLUE FG_WHITE, display);
+    else if (hdd_model_raw[0]) cdc_printf("\033[32;1m%s" FG_YELLOW "%s" RESET BG_BLUE FG_WHITE, display, dev_label);
+    else                 cdc_printf(FG_YELLOW "%s" RESET BG_BLUE FG_WHITE, display);
 
-    cdc_puts(RESET BG_BLUE FG_WHITE "\033[K");
+    // Blank the rest of the row with blue spaces rather than ESC[K (see
+    // draw_bios_frame): columns up to 77, then the right border as before.
+    cdc_puts(RESET BG_BLUE FG_WHITE);
+    int hdd_end = start_x + label_len + text_len + dev_len;
+    if (hdd_end < 78) cdc_printf("%*s", 78 - hdd_end, "");
     cdc_puts("\033[22;78H  " BOX_VH);
 
     char geo_vals[64];
@@ -303,7 +310,9 @@ static void draw_hdd_status(void) {
                     (!use_lba_mode && cur_cyls > 0 && cur_heads > 0 && cur_spt > 0);
     cdc_printf(is_valid ? "\033[92;1m%s" : "\033[91;1m%s", geo_vals);
 
-    cdc_puts(RESET BG_BLUE FG_WHITE "\033[K");
+    cdc_puts(RESET BG_BLUE FG_WHITE);
+    int geo_end = geo_x + geo_total_len;
+    if (geo_end < 78) cdc_printf("%*s", 78 - geo_end, "");
     cdc_puts("\033[23;78H  " BOX_VH);
     cdc_puts("\033[24;79H");
     cdc_flush();
@@ -695,7 +704,7 @@ static void run_debug_errors(void) {
     ide_read_taskfile(tf);
     uint8_t err = tf[1];
     char eb[64] = {0};
-    if (!err) snprintf(eb, sizeof(eb), "\033[92mNo Errors Reported\033[0m");
+    if (!err) snprintf(eb, sizeof(eb), "\033[92mNo Errors Reported");  // no reset: keeps the box black
     else {
         if (err&0x80) strcat(eb,"BBK "); if (err&0x40) strcat(eb,"UNC ");
         if (err&0x20) strcat(eb,"MC ");  if (err&0x10) strcat(eb,"IDNF ");
@@ -703,6 +712,22 @@ static void run_debug_errors(void) {
         if (err&0x02) strcat(eb,"TK0 "); if (err&0x01) strcat(eb,"AMNF ");
     }
     debug_print(0, FG_RED, "[Error Bits] %s", eb);
+
+    // Registers saved by the last failed sector read/write, before any drain
+    // or reset (the live ones above may since have been changed by a reset).
+    ide_fail_t f;
+    ide_last_failure(&f);
+    if (f.kind == IDE_FAIL_NONE) {
+        debug_print(2, FG_WHITE, "[Last Failed I/O] none since power-up");
+    } else {
+        static const char *kinds[] = {"?", "not ready", "ERR", "timeout", "stale data"};
+        debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
+                    f.command, kinds[f.kind < 5 ? f.kind : 0], (unsigned long)f.lba,
+                    (unsigned long)f.done, (unsigned long)f.count);
+        debug_print(3, FG_WHITE, "ST:%02X ERR:%02X SC:%02X SN:%02X CL:%02X CH:%02X DH:%02X%s%s",
+                    f.status, f.error, f.tf[0], f.tf[1], f.tf[2], f.tf[3], f.tf[4],
+                    f.drained ? "  drained" : "", f.reset ? "  reset" : "");
+    }
 }
 
 static void run_seek_test(void) {
@@ -855,6 +880,9 @@ void core1_entry(void) {
         cdc_puts("\033[24;79H"); cdc_flush();
         int k = get_input();
         if (k == -1) { tight_loop_contents(); continue; }
+
+        // Ctrl+L: redraw the whole screen, e.g. after a terminal resize (issue #9)
+        if (k == 12) { needs_full_redraw = true; continue; }
 
         if (show_detect_result) {
             if (k == KEY_ENTER || k == KEY_ESC) {

@@ -1,0 +1,2 @@
+# run.sh must keep LF line endings on every checkout, or sh cannot run it
+*.sh text eol=lf

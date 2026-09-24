@@ -1,0 +1,113 @@
+"""Mutation check for the host tests.
+
+Each mutant is a small source edit that breaks one property the tests are
+meant to protect (never hand the host a failed or invented sector, keep the
+good prefix, BSY before ERR, and so on). A mutant is KILLED when the tests
+fail against it. A mutant that survives means the tests do not cover that
+property. A mutant whose text is not found, or that does not compile, is
+reported as such and makes the run fail, so it is never counted as killed.
+
+    python tests/host/mutate.py            (CXX picks the compiler, default g++)
+"""
+import os, shutil, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(HERE, '..', '..', 'FW source', 'v.6f3p1')
+
+MUTANTS = [
+    # --- usb.c: what the host is given ---
+    ('zero-fill the failed part and report success (old non-strict behaviour)', 'usb.c',
+     'if (done > 0) return (int32_t)done;',
+     'memset(ptr + got * 512, 0, remaining - got * 512); return (int32_t)bufsize;'),
+    ('count the failed sector as delivered', 'usb.c',
+     '(got < aligned ? got : 0) * 512', '(got + 1 <= aligned ? got + 1 : 0) * 512'),
+    ('discard the good prefix (issue #13 as it was)', 'usb.c',
+     'if (done > 0) return (int32_t)done;', ''),
+    ('strict media bounds off (zero-fill past the end)', 'usb.c',
+     '#if ATABOY_STRICT_MEDIA_BOUNDS', '#if 0'),
+    # --- ide.c: what the read routine reports ---
+    ('take ERR+DRQ data as good (DRQ checked before ERR)', 'ide.c',
+     '            if (st & 0x01) goto read_err;\n            if (st & 0x08) goto drq_read;',
+     '            if (st & 0x08) goto drq_read;\n            if (st & 0x01) goto read_err;'),
+    ('report one sector too many on ERR', 'ide.c',
+     '    if (!idle_after_error(2000)) soft_reset_restore();\n    if (done) *done = s;',
+     '    if (!idle_after_error(2000)) soft_reset_restore();\n    if (done) *done = s + 1;'),
+    ('report one sector too many on timeout', 'ide.c',
+     '    soft_reset_restore();\n    if (done) *done = s;\n    return -1;\n}',
+     '    soft_reset_restore();\n    if (done) *done = s + 1;\n    return -1;\n}'),
+    ('ERR checked before BSY (the old poll order)', 'ide.c',
+     '            if (st & 0x80) { busy_wait_us_32(10); continue; }\n            if (st & 0x01) goto read_err;',
+     '            if (st & 0x01) goto read_err;\n            if (st & 0x80) { busy_wait_us_32(10); continue; }'),
+    ('no 400 ns wait after the READ command', 'ide.c',
+     '    ide_write_reg(7, cmd);                                 // READ SECTORS EXT / READ SECTORS\n    wait_after_command();',
+     '    ide_write_reg(7, cmd);                                 // READ SECTORS EXT / READ SECTORS'),
+    ('registers captured after the reset instead of before', 'ide.c',
+     '    record_failure(IDE_FAIL_ERR, cmd, st, lba + s, s, count);\n    if (st & 0x08) {\n        // Data offered for the failed sector. Not good data: discard it.\n        ide_drain_sector();\n        last_fail.drained = true;\n    }\n    if (!idle_after_error(2000)) soft_reset_restore();',
+     '    soft_reset_restore();\n    record_failure(IDE_FAIL_ERR, cmd, st, lba + s, s, count);'),
+    ('always soft reset after ERR (old recovery)', 'ide.c',
+     '    if (!idle_after_error(2000)) soft_reset_restore();',
+     '    soft_reset_restore();'),
+    ('never soft reset, even when the drive is not idle', 'ide.c',
+     '    if (!idle_after_error(2000)) soft_reset_restore();',
+     '    (void)idle_after_error(2000);'),
+    ('no drain of the flawed data', 'ide.c',
+     '        ide_drain_sector();\n        last_fail.drained = true;',
+     '        last_fail.drained = true;'),
+    ('CHS geometry not restored after SRST', 'ide.c',
+     '    if (!config.use_lba_mode)\n        ide_set_geometry(config.heads, config.spt);\n    last_fail.reset = true;',
+     '    last_fail.reset = true;'),
+    ('read data into the caller buffer when draining', 'ide.c',
+     '        ide_drain_sector();\n        last_fail.drained = true;',
+     '        set_address(0); xcvr_read(); sio_hw->gpio_clr = (1 << IDE_CS0);\n'
+     '        ide_pio_read(256, wbuf + s * 256);\n'
+     '        sio_hw->gpio_set = (1 << IDE_CS0); bus_idle();\n'
+     '        last_fail.drained = true; s++;'),
+]
+
+
+def run_tests(srcdir, outdir):
+    env = dict(os.environ, OUT=outdir)
+    p = subprocess.run(['sh', os.path.join(HERE, 'run.sh'), srcdir], env=env,
+                       capture_output=True, text=True)
+    return p
+
+
+def main():
+    base = run_tests(SRC, tempfile.mkdtemp(prefix='ataboy-host-'))
+    last = base.stdout.strip().splitlines()[-1] if base.stdout.strip() else base.stderr[-500:]
+    print(f'unmutated: rc={base.returncode}  {last}')
+    if base.returncode != 0:
+        print('the unmutated sources must pass first'); return 2
+    bad_setup, survived, killed = [], [], []
+    for name, fname, old, new in MUTANTS:
+        tmp = tempfile.mkdtemp(prefix='ataboy-mut-')
+        src = os.path.join(tmp, 'src')
+        shutil.copytree(SRC, src)
+        path = os.path.join(src, fname)
+        text = open(path, 'rb').read().decode('utf-8').replace('\r\n', '\n')
+        if text.count(old) != 1:
+            bad_setup.append((name, f'text found {text.count(old)} times'))
+            print(f'NOT APPLIED  {name}'); continue
+        open(path, 'wb').write(text.replace(old, new).encode('utf-8'))
+        p = run_tests(src, os.path.join(tmp, 'out'))
+        out = p.stdout.strip().splitlines()
+        summary = out[-1] if out else ''
+        if 'checks,' not in summary:
+            bad_setup.append((name, 'did not build or run: ' + (p.stderr.strip().splitlines() or ['?'])[-1]))
+            print(f'NO RESULT    {name}'); continue
+        if p.returncode != 0:
+            killed.append(name)
+            first = next((l for l in out if l.startswith('FAIL')), '')
+            print(f'KILLED       {name}\n             {summary}; first: {first[:150]}')
+        else:
+            survived.append(name)
+            print(f'SURVIVED     {name}  ({summary})')
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f'\n{len(killed)} killed, {len(survived)} survived, {len(bad_setup)} not run, of {len(MUTANTS)}')
+    for n, why in bad_setup:
+        print(f'  not run: {n}: {why}')
+    return 0 if not survived and not bad_setup else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

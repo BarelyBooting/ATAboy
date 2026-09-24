@@ -1,0 +1,335 @@
+// Host tests for the READ(10) path: the real ide.c and usb.c, compiled for a
+// PC, running against the simulated drive in sim.hpp. The READ(10) driver
+// below follows TinyUSB 0.18's proc_read10_cmd (pico-sdk 2.2.0): it calls
+// tud_msc_read10_cb with at most CFG_TUD_MSC_EP_BUFSIZE bytes at a time,
+// sends whatever the callback returns, calls again for the rest, and fails
+// the command (CSW failed, remaining data not sent) on a negative return.
+//
+// Build and run: see run.sh. Exit status is the number of failed checks.
+#include "mock_pico.h"
+#include "sim.hpp"
+
+#include "ide.c"
+#include "usb.c"
+
+#include <cstdio>
+#include <vector>
+#include <string>
+
+uint64_t mock_now_ns = 0;
+uint32_t mock_gpio_out = 0;
+MockSio mock_sio;
+SimDrive sim;
+config_t config;
+volatile bool is_mounted = false;
+volatile bool media_changed_waiting = false;
+
+static uint8_t last_key, last_asc;
+bool tud_msc_set_sense(uint8_t, uint8_t key, uint8_t asc, uint8_t) {
+    last_key = key; last_asc = asc; return true;
+}
+
+static int failures = 0, checks = 0;
+static std::string current;
+#define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; \
+    std::printf("FAIL [%s] %s:%d: %s -- ", current.c_str(), __FILE__, __LINE__, #cond); \
+    std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
+
+// ---- host side of READ(10) -------------------------------------------------
+struct HostRead {
+    bool ok = false;
+    std::vector<uint8_t> data;   // bytes the host actually received
+    int calls = 0;
+    uint8_t key = 0, asc = 0;    // sense the firmware set (TinyUSB overwrites it today)
+};
+
+static HostRead host_read10(uint32_t lba, uint32_t nblocks) {
+    HostRead h;
+    uint32_t total = nblocks * 512, xferred = 0;
+    static uint8_t epbuf[CFG_TUD_MSC_EP_BUFSIZE];
+    last_key = last_asc = 0;
+    int busy = 0;
+    while (xferred < total) {
+        uint32_t cur = lba + xferred / 512, off = xferred % 512;
+        uint32_t n = total - xferred;
+        if (n > CFG_TUD_MSC_EP_BUFSIZE) n = CFG_TUD_MSC_EP_BUFSIZE;
+        memset(epbuf, 0xA5, sizeof(epbuf));        // poison: anything not written shows up
+        int32_t r = tud_msc_read10_cb(0, cur, off, epbuf, n);
+        h.calls++;
+        if (r < 0) { h.key = last_key; h.asc = last_asc; return h; }
+        if (r == 0) { if (++busy > 100) return h; continue; }
+        if ((uint32_t)r > n) { std::printf("callback returned more than asked\n"); return h; }
+        h.data.insert(h.data.end(), epbuf, epbuf + r);
+        xferred += r;
+    }
+    h.ok = true;
+    return h;
+}
+
+// Every byte the host received must be the medium's real content.
+static bool matches_medium(const HostRead &h, uint32_t lba) {
+    for (size_t i = 0; i < h.data.size(); i++)
+        if (h.data[i] != sim.byte_at(lba + (uint32_t)(i / 512), (int)(i % 512))) return false;
+    return true;
+}
+static bool contains_flawed(const HostRead &h) {
+    for (size_t i = 0; i + 1 < h.data.size(); i += 2)
+        if (h.data[i] == 0xAD && h.data[i + 1] == 0xDE) return true;
+    return false;
+}
+
+// ---- setup -----------------------------------------------------------------
+enum Mode { LBA, CHS };
+static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
+    current = name;
+    sim = SimDrive();
+    mock_now_ns = 0;
+    mock_gpio_out = (1u << 24) | (1u << 25);      // CS0/CS1 idle high
+    memset(&config, 0, sizeof(config));
+    config.dev_base = 0xA0;
+    config.use_lba_mode = (m == LBA);
+    config.cyls = 980; config.heads = 10; config.spt = 17;
+    config.lba_sectors = medium_sectors ? medium_sectors : sim.nsect;
+    if (m == CHS && medium_sectors) config.cyls = (uint16_t)(medium_sectors / 170);
+    ide_select_device(0xA0);
+    ide_hw_init();
+    if (m == CHS) ide_set_geometry(config.heads, config.spt);
+    is_mounted = true;
+    media_changed_waiting = false;
+    sim.srst = 0; sim.init_params = 0; sim.violations = 0; sim.attempts.clear();
+}
+
+// ---- tests -----------------------------------------------------------------
+static void test_clean_reads(Mode m) {
+    setup(m == LBA ? "clean reads, LBA" : "clean reads, CHS", m);
+    const uint32_t starts[] = {0, 1, 7, 8, 15, 1000, 33640, 166600 - 40};
+    const uint32_t lens[] = {1, 2, 7, 8, 9, 16, 17, 40};
+    for (uint32_t s : starts) for (uint32_t n : lens) {
+        HostRead h = host_read10(s, n);
+        CHECK(h.ok, "lba %u n %u", s, n);
+        CHECK(h.data.size() == n * 512u, "lba %u n %u got %zu", s, n, h.data.size());
+        CHECK(matches_medium(h, s), "lba %u n %u", s, n);
+    }
+    CHECK(sim.srst == 0, "srst %d", sim.srst);
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+}
+
+// One bad sector at every position of a 16-sector read.
+static void test_bad_at_each_position(Mode m, BadMode bm, const char *name) {
+    setup(name, m);
+    for (uint32_t k = 0; k < 16; k++) {
+        uint32_t base = 2000 + k * 100, badlba = base + k;
+        sim.bad.clear(); sim.bad[badlba] = {bm, 0};
+        sim.attempts.clear();
+        int srst0 = sim.srst;
+        HostRead h = host_read10(base, 16);
+        CHECK(!h.ok, "k=%u: read must fail", k);
+        CHECK(h.data.size() == k * 512u, "k=%u: got %zu bytes, want %u", k, h.data.size(), k * 512);
+        CHECK(matches_medium(h, base), "k=%u: delivered bytes are not the medium", k);
+        CHECK(!contains_flawed(h), "k=%u: flawed data delivered", k);
+        CHECK(h.key == SCSI_SENSE_MEDIUM_ERROR && h.asc == 0x11, "k=%u sense %u/%02x", k, h.key, h.asc);
+        // ERR ends the command; no soft reset is needed or wanted.
+        CHECK(sim.srst == srst0, "k=%u: %d soft resets", k, sim.srst - srst0);
+        // The bad sector is tried once if it starts a TinyUSB chunk, twice if
+        // it falls inside one (the chunk that stops there, then the retry).
+        int want = (k % 8 == 0) ? 1 : 2;
+        CHECK(sim.attempts[badlba] == want, "k=%u attempts %d want %d", k, sim.attempts[badlba], want);
+        // Good sectors after the bad one must still read one at a time.
+        for (uint32_t j = 0; j < 16; j++) {
+            HostRead s1 = host_read10(base + j, 1);
+            if (base + j == badlba) CHECK(!s1.ok && s1.data.empty(), "k=%u: bad sector single read", k);
+            else CHECK(s1.ok && matches_medium(s1, base + j), "k=%u: good sector %u single read", k, j);
+        }
+    }
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+}
+
+// The case from issue #13 and the hardware test plan: 16 sectors from 33640,
+// bad sector 33648 (a WD Caviar 280 sector that failed 23 of 23 reads).
+static void test_issue13_case(Mode m) {
+    setup(m == LBA ? "issue 13 case 33640+16, LBA" : "issue 13 case 33640+16, CHS", m);
+    sim.bad[33648] = {BAD_ERR_DRQ, 0};
+    HostRead h = host_read10(33640, 16);
+    CHECK(!h.ok, "must fail");
+    CHECK(h.data.size() == 8 * 512, "got %zu", h.data.size());
+    CHECK(matches_medium(h, 33640), "prefix is not the medium");
+    CHECK(sim.srst == 0, "srst %d", sim.srst);
+    // and a read that does not include it is unchanged
+    HostRead g = host_read10(33649, 16);
+    CHECK(g.ok && g.data.size() == 16 * 512 && matches_medium(g, 33649), "read after the bad sector");
+    HostRead g2 = host_read10(33624, 16);
+    CHECK(g2.ok && matches_medium(g2, 33624), "read before the bad sector");
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+}
+
+// Drive never finishes the sector: timeout, soft reset, geometry restored.
+static void test_hang(Mode m) {
+    setup(m == LBA ? "hang -> timeout, LBA" : "hang -> timeout, CHS", m);
+    sim.bad[5003] = {BAD_HANG, 0};
+    int ip0 = sim.init_params;
+    HostRead h = host_read10(5000, 8);
+    CHECK(!h.ok, "must fail");
+    CHECK(h.data.size() == 3 * 512, "got %zu", h.data.size());
+    CHECK(matches_medium(h, 5000), "prefix");
+    CHECK(sim.srst >= 1, "a hung drive must be reset");
+    if (m == CHS) CHECK(sim.init_params > ip0, "CHS geometry must be restored after SRST");
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(f.kind == IDE_FAIL_TIMEOUT && f.reset, "kind %u reset %d", f.kind, f.reset);
+    sim.bad.clear();
+    HostRead g = host_read10(5000, 16);
+    CHECK(g.ok && matches_medium(g, 5000), "drive usable after the reset");
+}
+
+// ERR + DRQ that does not go away after one drained sector: must reset.
+static void test_err_drq_stuck() {
+    setup("ERR with DRQ that stays set", LBA);
+    sim.bad[7002] = {BAD_ERR_DRQ_MORE, 0};
+    HostRead h = host_read10(7000, 4);
+    CHECK(!h.ok && h.data.size() == 2 * 512 && matches_medium(h, 7000), "prefix only");
+    CHECK(!contains_flawed(h), "flawed data delivered");
+    CHECK(sim.srst >= 1, "must reset when DRQ stays after the drain");
+    sim.bad.clear();
+    HostRead g = host_read10(7000, 4);
+    CHECK(g.ok && matches_medium(g, 7000), "usable afterwards");
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+}
+
+// Status bits other than BSY are undefined while BSY=1. This drive shows ERR
+// then; reads must still succeed.
+static void test_garbage_while_busy() {
+    setup("ERR bit set while BSY", LBA);
+    sim.garbage_while_busy = true;
+    HostRead h = host_read10(100, 40);
+    CHECK(h.ok && h.data.size() == 40 * 512 && matches_medium(h, 100), "ok %d size %zu", h.ok, h.data.size());
+    CHECK(sim.srst == 0, "srst %d", sim.srst);
+}
+
+// A failed command leaves ERR in status. With no reset afterwards, the next
+// command must not read that stale status in the first 400 ns.
+static void test_stale_status_after_error() {
+    setup("next read right after an ERR", LBA);
+    sim.bad[300] = {BAD_ERR, 0};
+    HostRead h = host_read10(300, 1);
+    CHECK(!h.ok, "bad sector fails");
+    HostRead g = host_read10(301, 8);
+    CHECK(g.ok && matches_medium(g, 301), "good read straight after a failure");
+}
+
+// Media bounds must hold as before (strict: never zeros past the end).
+static void test_media_bounds() {
+    const uint32_t max = 1000;
+    setup("strict media bounds", LBA, max);
+    HostRead a = host_read10(max - 16, 16);
+    CHECK(a.ok && matches_medium(a, max - 16), "read ending at max");
+    HostRead b = host_read10(max - 4, 16);
+    CHECK(!b.ok && b.data.size() == 4 * 512 && matches_medium(b, max - 4), "straddle: %zu", b.data.size());
+    CHECK(b.key == SCSI_SENSE_ILLEGAL_REQUEST && b.asc == 0x21, "straddle sense %u/%02x", b.key, b.asc);
+    HostRead c = host_read10(max, 8);
+    CHECK(!c.ok && c.data.empty() && c.key == SCSI_SENSE_ILLEGAL_REQUEST && c.asc == 0x21, "beyond");
+    HostRead d = host_read10(0xFFFFFFF0u, 8);
+    CHECK(!d.ok && d.data.empty(), "far beyond");
+    // a bad sector just inside the end: prefix, then medium error (not 5/21)
+    sim.bad[max - 2] = {BAD_ERR, 0};
+    HostRead e = host_read10(max - 8, 16);
+    CHECK(!e.ok && e.data.size() == 6 * 512 && matches_medium(e, max - 8), "bad near end: %zu", e.data.size());
+    CHECK(e.key == SCSI_SENSE_MEDIUM_ERROR, "bad near end sense %u", e.key);
+}
+
+// The failure record must hold what the drive reported, not what a reset left.
+static void test_failure_record(Mode m) {
+    setup(m == LBA ? "failure record, LBA" : "failure record, CHS", m);
+    const uint32_t badlba = 61627;
+    sim.bad[badlba] = {BAD_ERR_DRQ, 0};
+    HostRead h = host_read10(badlba - 3, 8);
+    CHECK(!h.ok && h.data.size() == 3 * 512, "prefix %zu", h.data.size());
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(f.kind == IDE_FAIL_ERR, "kind %u", f.kind);
+    CHECK(f.error == 0x40, "error reg %02x (want UNC 40)", f.error);
+    CHECK((f.status & 0x81) == 0x01, "status %02x", f.status);
+    CHECK(f.lba == badlba, "lba %u", f.lba);
+    CHECK(f.drained && !f.reset, "drained %d reset %d", f.drained, f.reset);
+    CHECK(f.command == 0x20, "command %02x", f.command);
+    if (m == LBA) {
+        uint32_t tl = f.tf[1] | (f.tf[2] << 8) | (f.tf[3] << 16) | ((f.tf[4] & 0x0F) << 24);
+        CHECK(tl == badlba, "drive-reported LBA %u", tl);
+    } else {
+        uint32_t cyl = f.tf[2] | (f.tf[3] << 8), head = f.tf[4] & 0x0F, sec = f.tf[1];
+        CHECK((cyl * 10 + head) * 17 + sec - 1 == badlba, "drive-reported CHS %u/%u/%u", cyl, head, sec);
+    }
+}
+
+// A marginal sector that reads on a later attempt.
+static void test_marginal() {
+    setup("marginal sector", LBA);
+    sim.bad[8004] = {BAD_MARGINAL, 1};     // fails once, then reads
+    HostRead h = host_read10(8000, 8);     // inside the chunk: fails, then the retry reads it
+    CHECK(h.ok && matches_medium(h, 8000), "ok %d size %zu", h.ok, h.data.size());
+    CHECK(sim.attempts[8004] == 2, "attempts %d", sim.attempts[8004]);
+    sim.bad[8008] = {BAD_MARGINAL, 1};     // at a chunk start: the host sees the failure
+    HostRead a = host_read10(8008, 8);
+    CHECK(!a.ok && a.data.empty(), "first try fails");
+    HostRead b = host_read10(8008, 8);
+    CHECK(b.ok && matches_medium(b, 8008), "second try reads");
+}
+
+// Two bad sectors in one request: the prefix stops at the first.
+static void test_two_bad() {
+    setup("two bad sectors", LBA);
+    sim.bad[9003] = {BAD_ERR, 0};
+    sim.bad[9010] = {BAD_ERR, 0};
+    HostRead h = host_read10(9000, 16);
+    CHECK(!h.ok && h.data.size() == 3 * 512 && matches_medium(h, 9000), "got %zu", h.data.size());
+    HostRead g = host_read10(9004, 6);
+    CHECK(g.ok && matches_medium(g, 9004), "between the two");
+}
+
+// Write path still works, and a write error still resets (unchanged policy).
+static void test_writes() {
+    setup("writes", LBA);
+    config.drive_write_protected = false;
+    std::vector<uint8_t> buf(4096);
+    for (size_t i = 0; i < buf.size(); i++) buf[i] = (uint8_t)(i * 7 + 3);
+    int32_t r = tud_msc_write10_cb(0, 400, 0, buf.data(), 4096);
+    CHECK(r == 4096, "write returned %d", r);
+    HostRead h = host_read10(400, 8);
+    CHECK(h.ok && memcmp(h.data.data(), buf.data(), 4096) == 0, "read back");
+    CHECK(sim.srst == 0 && sim.violations == 0, "srst %d violations %d", sim.srst, sim.violations);
+}
+
+static void test_not_ready() {
+    setup("drive not ready", LBA);
+    sim.phase = SimDrive::HUNG; sim.status = 0x80;
+    uint8_t buf[1024]; memset(buf, 0x5A, sizeof(buf));
+    uint32_t done = 99;
+    int32_t r = ide_read_sectors_partial(10, 2, buf, &done);
+    CHECK(r < 0 && done == 0, "r %d done %u", r, done);
+    bool untouched = true;
+    for (uint8_t b : buf) if (b != 0x5A) untouched = false;
+    CHECK(untouched, "buffer written when nothing was read");
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(f.kind == IDE_FAIL_NOT_READY, "kind %u", f.kind);
+}
+
+int main() {
+    test_clean_reads(LBA);
+    test_clean_reads(CHS);
+    test_bad_at_each_position(LBA, BAD_ERR, "bad at each position, ERR, LBA");
+    test_bad_at_each_position(LBA, BAD_ERR_DRQ, "bad at each position, ERR+DRQ, LBA");
+    test_bad_at_each_position(CHS, BAD_ERR_DRQ, "bad at each position, ERR+DRQ, CHS");
+    test_issue13_case(LBA);
+    test_issue13_case(CHS);
+    test_hang(LBA);
+    test_hang(CHS);
+    test_err_drq_stuck();
+    test_garbage_while_busy();
+    test_stale_status_after_error();
+    test_media_bounds();
+    test_failure_record(LBA);
+    test_failure_record(CHS);
+    test_marginal();
+    test_two_bad();
+    test_writes();
+    test_not_ready();
+    std::printf("%d checks, %d failed\n", checks, failures);
+    return failures > 255 ? 255 : failures;
+}

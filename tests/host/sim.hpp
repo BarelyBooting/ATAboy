@@ -1,0 +1,273 @@
+// A simulated ATA drive at register level, driven by the real ide.c through
+// the PIO stand-ins below. It models only what the firmware relies on:
+// BSY/DRDY/DRQ/ERR timing, PIO data in and out, soft reset, INITIALIZE
+// DEVICE PARAMETERS, and a few ways a sector can fail.
+#pragma once
+#include <stdint.h>
+#include <map>
+#include <vector>
+#include <cstdio>
+
+enum BadMode {
+    BAD_ERR,          // UNC, ERR set, no data offered
+    BAD_ERR_DRQ,      // UNC, ERR set and flawed data offered (DRQ=1), as older drives do
+    BAD_ERR_DRQ_MORE, // like BAD_ERR_DRQ, but DRQ stays set after the drain (drive confused)
+    BAD_HANG,         // BSY never clears for this sector (only SRST ends it)
+    BAD_MARGINAL,     // fails (like BAD_ERR) for the first 'fails' attempts, then reads
+};
+struct Bad { BadMode mode; int fails; };
+
+struct SimDrive {
+    // geometry of the medium
+    uint32_t nsect = 980u * 10 * 17;
+    uint8_t  native_heads = 10, native_spt = 17;
+    // current translation (set by 0x91; lost on SRST)
+    bool     geo_valid = false;
+    uint8_t  heads = 0, spt = 0;
+
+    std::map<uint32_t, Bad> bad;
+    std::map<uint32_t, std::vector<uint8_t>> written;
+    std::map<uint32_t, int> attempts;       // media access attempts per sector
+
+    // timing (ns)
+    uint64_t t_sector = 200000;     // good sector
+    uint64_t t_bad    = 600000000;  // failing sector (measured ~600 ms on the WD Caviar 280)
+    uint64_t t_reset  = 2000000;
+    bool     garbage_while_busy = false;  // status reads 0x81 while BSY (bits undefined)
+
+    // registers
+    uint8_t reg[8] = {0};
+    uint8_t hob[8] = {0};           // previous value of regs 2..5 (LBA48)
+    uint8_t status = 0x50, error = 0x01;
+    uint8_t status_at_cmd = 0x50;
+    uint64_t cmd_at = 0;
+
+    enum Phase { IDLE, BUSY_IN, DRQ_IN, ERR_DRQ, HUNG, BUSY_OUT, DRQ_OUT, BUSY_COMMIT, IN_RESET };
+    Phase phase = IDLE;
+    uint64_t ready_at = 0;
+    uint32_t cur = 0, left = 0;
+    uint8_t  cmd = 0;
+    uint16_t xfer[256];
+    int      widx = 0;
+    bool     more_after_drain = false;
+    uint8_t  devctl = 0;
+
+    // bookkeeping for the tests
+    int srst = 0, init_params = 0, violations = 0, commands = 0;
+    std::map<uint8_t, int> cmd_count;
+
+    static uint8_t pattern(uint32_t lba, int i) {
+        uint32_t x = lba * 2654435761u + (uint32_t)i * 40503u + 0x9E37u;
+        x ^= x >> 13; x *= 0x5bd1e995u; x ^= x >> 15;
+        return (uint8_t)x;
+    }
+    uint8_t byte_at(uint32_t lba, int i) const {
+        auto w = written.find(lba);
+        return w != written.end() ? w->second[i] : pattern(lba, i);
+    }
+
+    // ---- register decode --------------------------------------------------
+    uint32_t addr_lba() const {
+        if (cmd == 0x24) {
+            return (uint32_t)reg[3] | ((uint32_t)reg[4] << 8) | ((uint32_t)reg[5] << 16) |
+                   ((uint32_t)hob[3] << 24);
+        }
+        if (reg[6] & 0x40)
+            return (uint32_t)reg[3] | ((uint32_t)reg[4] << 8) | ((uint32_t)reg[5] << 16) |
+                   ((uint32_t)(reg[6] & 0x0F) << 24);
+        uint32_t cyl = reg[4] | (reg[5] << 8), head = reg[6] & 0x0F, sec = reg[3];
+        if (!geo_valid || sec == 0 || sec > spt || head >= heads) return 0xFFFFFFFFu;
+        return (cyl * heads + head) * spt + (sec - 1);
+    }
+    void set_addr_regs(uint32_t lba) {
+        if (reg[6] & 0x40 || cmd == 0x24) {
+            reg[3] = lba & 0xFF; reg[4] = (lba >> 8) & 0xFF; reg[5] = (lba >> 16) & 0xFF;
+            if (cmd != 0x24) reg[6] = (reg[6] & 0xF0) | ((lba >> 24) & 0x0F);
+        } else if (geo_valid) {
+            uint32_t cyl = lba / (heads * spt), r = lba % (heads * spt);
+            reg[4] = cyl & 0xFF; reg[5] = (cyl >> 8) & 0xFF;
+            reg[6] = (reg[6] & 0xF0) | (r / spt); reg[3] = (r % spt) + 1;
+        }
+    }
+
+    // advance the state machine to 'now'
+    void tick(uint64_t now) {
+        if (phase == IN_RESET) {
+            if (!(devctl & 0x04) && now >= ready_at) {
+                phase = IDLE; status = 0x50; error = 0x01;
+                geo_valid = false;              // SRST drops INITIALIZE DEVICE PARAMETERS
+            }
+            return;
+        }
+        if (phase == BUSY_IN && now >= ready_at) resolve_sector();
+        if (phase == BUSY_OUT && now >= ready_at) { phase = DRQ_OUT; widx = 0; status = 0x58; }
+        if (phase == BUSY_COMMIT && now >= ready_at) {
+            if (left == 0) { phase = IDLE; status = 0x50; }
+            else { phase = DRQ_OUT; widx = 0; status = 0x58; }
+        }
+        if (phase == IDLE && (status & 0x80) && now >= ready_at) status = 0x50;
+    }
+
+    void fail_here(uint8_t err, bool offer) {
+        set_addr_regs(cur);
+        reg[2] = (uint8_t)left;
+        error = err;
+        if (offer) {
+            for (int i = 0; i < 256; i++) xfer[i] = 0xDEAD;   // flawed data, never valid
+            widx = 0; phase = ERR_DRQ; status = 0x59;
+        } else { phase = IDLE; status = 0x51; }
+    }
+
+    void resolve_sector() {
+        if (cur == 0xFFFFFFFFu || cur >= nsect) { fail_here(0x10, false); return; } // IDNF
+        attempts[cur]++;
+        auto b = bad.find(cur);
+        if (b != bad.end()) {
+            Bad &bd = b->second;
+            switch (bd.mode) {
+            case BAD_ERR: fail_here(0x40, false); return;
+            case BAD_ERR_DRQ: fail_here(0x40, true); more_after_drain = false; return;
+            case BAD_ERR_DRQ_MORE: fail_here(0x40, true); more_after_drain = true; return;
+            case BAD_HANG: phase = HUNG; status = 0x80; return;
+            case BAD_MARGINAL:
+                if (bd.fails > 0) { bd.fails--; fail_here(0x40, false); return; }
+                break;
+            }
+        }
+        for (int i = 0; i < 256; i++) xfer[i] = byte_at(cur, 2 * i) | (byte_at(cur, 2 * i + 1) << 8);
+        widx = 0; phase = DRQ_IN; status = 0x58;
+    }
+
+    uint64_t sector_delay(uint32_t lba) const {
+        auto b = bad.find(lba);
+        if (b != bad.end() && (b->second.mode != BAD_MARGINAL || b->second.fails > 0)) return t_bad;
+        return t_sector;
+    }
+
+    uint8_t read_status(uint64_t now) {
+        // ATA: status is not valid for 400 ns after a command is written;
+        // this drive keeps showing the pre-command status in that window.
+        if (commands > 0 && now < cmd_at + 400) return status_at_cmd;
+        tick(now);
+        if ((status & 0x80) && garbage_while_busy) return 0x81;
+        return status;
+    }
+
+    uint16_t read_reg(int r, uint64_t now) {
+        if (r == 7) return read_status(now);
+        if (r == 1) return error;
+        return reg[r];
+    }
+
+    void write_reg(int r, uint8_t v, uint64_t now) {
+        tick(now);
+        if (phase == IN_RESET) return;
+        if (r == 7) { command(v, now); return; }
+        if (status & 0x88) violations++;       // task file written while BSY or DRQ
+        if (r >= 2 && r <= 5) hob[r] = reg[r];
+        reg[r] = v;
+    }
+
+    void command(uint8_t c, uint64_t now) {
+        commands++; cmd_count[c]++;
+        if (status & 0x88) violations++;       // command written while BSY or DRQ
+        status_at_cmd = status; cmd_at = now;
+        cmd = c; error = 0;
+        switch (c) {
+        case 0x20: case 0x21: case 0x24:
+            left = reg[2] ? reg[2] : 256;
+            cur = addr_lba();
+            phase = BUSY_IN; status = 0x80; ready_at = now + sector_delay(cur);
+            break;
+        case 0x30: case 0x34:
+            left = reg[2] ? reg[2] : 256;
+            cur = addr_lba();
+            phase = BUSY_OUT; status = 0x80; ready_at = now + 1000;
+            break;
+        case 0x91:
+            heads = (reg[6] & 0x0F) + 1; spt = reg[2]; geo_valid = true; init_params++;
+            phase = IDLE; status = 0x80; ready_at = now + 1000;
+            break;
+        case 0x10:
+            phase = IDLE; status = 0x80; ready_at = now + 1000;
+            break;
+        default:
+            phase = IDLE; status = 0x51; error = 0x04;   // ABRT
+        }
+    }
+
+    void write_control(uint8_t v, uint64_t now) {
+        tick(now);
+        if (v & 0x04) {
+            if (!(devctl & 0x04)) srst++;
+            phase = IN_RESET; status = 0x80;
+        } else if (devctl & 0x04) {
+            ready_at = now + t_reset;
+        }
+        devctl = v;
+    }
+
+    uint16_t read_data(uint64_t now) {
+        tick(now);
+        if (phase == DRQ_IN || phase == ERR_DRQ) {
+            uint16_t w = xfer[widx++];
+            if (widx == 256) {
+                if (phase == ERR_DRQ) {
+                    phase = IDLE; status = more_after_drain ? 0x59 : 0x51;
+                    if (more_after_drain) { phase = ERR_DRQ; widx = 0; }
+                } else {
+                    cur++; left--;
+                    if (left == 0) { phase = IDLE; status = 0x50; }
+                    else { phase = BUSY_IN; status = 0x80; ready_at = now + sector_delay(cur); }
+                }
+            }
+            return w;
+        }
+        violations++;                              // data read without DRQ
+        return 0xFFFF;
+    }
+
+    void write_data(uint16_t w, uint64_t now) {
+        tick(now);
+        if (phase != DRQ_OUT) { violations++; return; }
+        xfer[widx++] = w;
+        if (widx == 256) {
+            std::vector<uint8_t> s(512);
+            for (int i = 0; i < 256; i++) { s[2 * i] = xfer[i] & 0xFF; s[2 * i + 1] = xfer[i] >> 8; }
+            written[cur] = s;
+            cur++; left--;
+            phase = BUSY_COMMIT; status = 0x80; ready_at = now + 1000;
+        }
+    }
+};
+
+extern SimDrive sim;
+
+// ---- PIO stand-ins: decode CS0/CS1 and A0-A2 from the SIO output state ----
+inline int bus_reg(bool &cs1) {
+    bool cs0_low = !(mock_gpio_out & (1u << 24));
+    bool cs1_low = !(mock_gpio_out & (1u << 25));
+    cs1 = cs1_low && !cs0_low;
+    if (cs0_low == cs1_low) { sim.violations++; return -1; }
+    return (mock_gpio_out >> 20) & 7;
+}
+void ide_pio_init(void) {}
+void ide_pio_read(uint32_t count, uint16_t *buf) {
+    bool cs1; int r = bus_reg(cs1);
+    for (uint32_t i = 0; i < count; i++) {
+        if (r < 0) { buf[i] = 0xFFFF; continue; }
+        if (cs1) buf[i] = (r == 6) ? sim.read_status(mock_now_ns) : 0xFF;  // alt status
+        else if (r == 0) buf[i] = sim.read_data(mock_now_ns);
+        else buf[i] = sim.read_reg(r, mock_now_ns);
+    }
+}
+void ide_pio_write(uint32_t count, const uint16_t *buf) {
+    bool cs1; int r = bus_reg(cs1);
+    for (uint32_t i = 0; i < count; i++) {
+        if (r < 0) continue;
+        if (cs1) { if (r == 6) sim.write_control((uint8_t)buf[i], mock_now_ns); }
+        else if (r == 0) sim.write_data(buf[i], mock_now_ns);
+        else sim.write_reg(r, (uint8_t)buf[i], mock_now_ns);
+    }
+}
+bool mock_intrq(void) { return false; }
