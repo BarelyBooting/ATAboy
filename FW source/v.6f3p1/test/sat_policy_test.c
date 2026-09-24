@@ -34,6 +34,9 @@
 //   every other verdict must have it clear. Sections 0 to 10 run with a
 //   drive that shows everything; section 11 sweeps every combination of
 //   those bits.
+//   A drive set up by Ctrl+G (manual CHS, never asked IDENTIFY; review of
+//   0.6f3p8 L-2) gets nothing: every CDB refused, 5/24/00 when mounted,
+//   NOT READY first when not. Sections 5 and 12 cover it.
 
 #include "sat_policy.h"
 #include <stdio.h>
@@ -53,13 +56,14 @@ typedef struct { bool captured; uint16_t w82, w83, w84, w85, w87; } idcaps_t;
 // enabled (85), valid signatures (83, 84, 87).
 static const idcaps_t FULL_CAPS = { true, 0x4401, 0x4400, 0x4001, 0x4401, 0x4000 };
 static idcaps_t caps;          // what check() passes in; FULL_CAPS unless a section says otherwise
+static bool mchs;              // what check() passes as manual_chs (Ctrl+G); false unless a section says otherwise
 
 static void fail(const char *what, const uint8_t *cdb, int len, bool dir_in, uint32_t xfer,
                  bool mounted, bool lba_mode) {
     n_fail++;
     if (n_fail > 40) return;
-    printf("  FAIL [%s] %s: len=%d dir_in=%d xfer=%u mounted=%d lba=%d id=%d/%04X/%04X/%04X/%04X/%04X cdb=",
-           section, what, len, dir_in, (unsigned)xfer, mounted, lba_mode,
+    printf("  FAIL [%s] %s: len=%d dir_in=%d xfer=%u mounted=%d lba=%d mchs=%d id=%d/%04X/%04X/%04X/%04X/%04X cdb=",
+           section, what, len, dir_in, (unsigned)xfer, mounted, lba_mode, mchs,
            caps.captured, caps.w82, caps.w83, caps.w84, caps.w85, caps.w87);
     for (int i = 0; i < 16; i++) printf("%02X%s", cdb[i], i == 15 ? "\n" : " ");
 }
@@ -174,7 +178,7 @@ static bool id_shows(const idcaps_t *k, uint8_t cmd, uint8_t feat) {
 
 // Would a correct policy allow this?
 static bool expect_allow_caps(const uint8_t *c, int len, bool dir_in, uint32_t xfer,
-                              bool mounted, bool lba_mode, const idcaps_t *k, expect_t *e_out) {
+                              bool mounted, bool lba_mode, const idcaps_t *k, bool manual, expect_t *e_out) {
     bool is16;
     if (c[0] == 0xA1 && len == 12) is16 = false;
     else if (c[0] == 0x85 && len == 16) is16 = true;
@@ -257,6 +261,7 @@ static bool expect_allow_caps(const uint8_t *c, int len, bool dir_in, uint32_t x
     if (e.nondata) { if (xfer != 0) return false; }
     else if (!dir_in || xfer != e.count * 512u) return false;
     if (!mounted) return false;
+    if (manual) return false;                                   // Ctrl+G: nothing at all
     if (user_data && !lba_mode) return false;
     if (!id_shows(k, cmd, feat)) return false;
     if (e_out) *e_out = e;
@@ -265,7 +270,7 @@ static bool expect_allow_caps(const uint8_t *c, int len, bool dir_in, uint32_t x
 
 static bool expect_allow(const uint8_t *c, int len, bool dir_in, uint32_t xfer,
                          bool mounted, bool lba_mode, expect_t *e_out) {
-    return expect_allow_caps(c, len, dir_in, xfer, mounted, lba_mode, &caps, e_out);
+    return expect_allow_caps(c, len, dir_in, xfer, mounted, lba_mode, &caps, mchs, e_out);
 }
 
 static void set_caps(sat_input_t *in, const idcaps_t *k) {
@@ -282,8 +287,9 @@ static bool check(const uint8_t cdb_in[16], int len, bool dir_in, uint32_t xfer,
                   bool mounted, bool lba_mode) {
     uint8_t cdb[16];
     memcpy(cdb, cdb_in, 16);
-    sat_input_t in = { cdb, (uint8_t)len, dir_in, xfer, mounted, lba_mode, false, 0, 0, 0, 0, 0 };
+    sat_input_t in = { cdb, (uint8_t)len, dir_in, xfer, mounted, lba_mode, false, 0, 0, 0, 0, 0, false };
     set_caps(&in, &caps);
+    in.manual_chs = mchs;
     sat_taskfile_t tf;
     memset(&tf, 0xAA, sizeof(tf));
     sat_verdict_t v = sat_policy_check(&in, &tf);
@@ -361,7 +367,7 @@ static bool check(const uint8_t cdb_in[16], int len, bool dir_in, uint32_t xfer,
         // NOT READY exactly when nothing is mounted and the CDB itself is
         // valid. (With nothing mounted, the LBA-mode setting and the drive's
         // IDENTIFY mean nothing: NOT READY comes first.)
-        bool only_unmounted = !mounted && expect_allow_caps(cdb, len, dir_in, xfer, true, true, &FULL_CAPS, NULL);
+        bool only_unmounted = !mounted && expect_allow_caps(cdb, len, dir_in, xfer, true, true, &FULL_CAPS, false, NULL);
         if (only_unmounted != (v.sense_key == 0x02))
             fail(only_unmounted ? "unmounted: expected NOT READY" : "NOT READY for a CDB that is invalid anyway",
                  cdb, len, dir_in, xfer, mounted, lba_mode);
@@ -544,21 +550,24 @@ int main(void) {
             check(seeds[i].cdb, len, seeds[i].dir_in, seeds[i].xfer, true, true);
     printf("[4] CB length 0..255: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
 
-    // 5. State: mounted x LBA mode, for every seed and for its single-byte changes.
+    // 5. State: mounted x LBA mode x Ctrl+G, for every seed and for its single-byte changes.
     section = "5 state";
     a0 = n_allow; c0 = n_checks;
     for (int i = 0; i < n_seeds; i++)
         for (int m = 0; m < 2; m++)
-            for (int l = 0; l < 2; l++) {
-                check(seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, m != 0, l != 0);
-                for (int pos = 0; pos < 16; pos++) {
-                    uint8_t c[16];
-                    memcpy(c, seeds[i].cdb, 16);
-                    c[pos] ^= 0x01;
-                    check(c, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, m != 0, l != 0);
+            for (int l = 0; l < 2; l++)
+                for (int g = 0; g < 2; g++) {
+                    mchs = g != 0;
+                    check(seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, m != 0, l != 0);
+                    for (int pos = 0; pos < 16; pos++) {
+                        uint8_t c[16];
+                        memcpy(c, seeds[i].cdb, 16);
+                        c[pos] ^= 0x01;
+                        check(c, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, m != 0, l != 0);
+                    }
                 }
-            }
-    printf("[5] mounted x LBA mode: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
+    mchs = false;
+    printf("[5] mounted x LBA mode x Ctrl+G: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
 
     // 5b. The CHS-mode rule stated directly, not through expect_allow(): with
     //     the drive set up in CHS mode, a seed is allowed exactly when it names
@@ -734,7 +743,7 @@ int main(void) {
         sat_taskfile_t tf;
         sat_verdict_t v = sat_policy_check(NULL, &tf);
         n_checks++; if (v.allow) { n_fail++; printf("  FAIL NULL input allowed\n"); }
-        sat_input_t in = { NULL, 12, true, 512, true, true, false, 0, 0, 0, 0, 0 };
+        sat_input_t in = { NULL, 12, true, 512, true, true, false, 0, 0, 0, 0, 0, false };
         set_caps(&in, &FULL_CAPS);
         v = sat_policy_check(&in, &tf);
         n_checks++; if (v.allow) { n_fail++; printf("  FAIL NULL cdb allowed\n"); }
@@ -773,7 +782,7 @@ int main(void) {
                 if (out.xfer_len != len || out.dir_in != (m[12] == 0x80) || out.cb_len != m[14])
                     fail("cbw parse fields wrong", cdb, pos, 0, val, 0, 0);
                 // and through the policy: only the untouched image (or a changed tag) may be allowed
-                sat_input_t in = { cdb, out.cb_len, out.dir_in, out.xfer_len, true, true, false, 0, 0, 0, 0, 0 };
+                sat_input_t in = { cdb, out.cb_len, out.dir_in, out.xfer_len, true, true, false, 0, 0, 0, 0, 0, false };
                 set_caps(&in, &FULL_CAPS);
                 sat_taskfile_t tf;
                 bool allowed = sat_policy_check(&in, &tf).allow;
@@ -798,7 +807,7 @@ int main(void) {
         sat_cbw_t o;
         n_checks++;
         if (!sat_cbw_parse(out_img, 0, cdb, 512, &o) || o.dir_in) { n_fail++; printf("  FAIL data-out CBW parse\n"); }
-        sat_input_t in = { cdb, o.cb_len, o.dir_in, o.xfer_len, true, true, false, 0, 0, 0, 0, 0 };
+        sat_input_t in = { cdb, o.cb_len, o.dir_in, o.xfer_len, true, true, false, 0, 0, 0, 0, 0, false };
         set_caps(&in, &FULL_CAPS);
         sat_taskfile_t tf;
         n_checks++;
@@ -818,7 +827,7 @@ int main(void) {
                     mimic[10] = (uint8_t)hi;           // try 0x0001xxxx as well
                     sat_cbw_t mo;
                     if (!sat_cbw_parse(mimic, 0, v, (uint16_t)real, &mo)) continue;
-                    sat_input_t mi = { v, mo.cb_len, mo.dir_in, mo.xfer_len, true, true, false, 0, 0, 0, 0, 0 };
+                    sat_input_t mi = { v, mo.cb_len, mo.dir_in, mo.xfer_len, true, true, false, 0, 0, 0, 0, 0, false };
                     set_caps(&mi, &FULL_CAPS);
                     n_checks++;
                     if (sat_policy_check(&mi, &tf).allow) { n_fail++; printf("  FAIL non-data row allowed through a data-out mimic, len %u\n", real); }
@@ -923,6 +932,61 @@ int main(void) {
     }
     printf("[11c] SMART supported, not enabled, direct: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
     caps = FULL_CAPS;
+
+    // 12. A drive set up by Ctrl+G (review of 0.6f3p8, L-2), stated directly,
+    //     not through expect_allow(): mounted, every seed is refused with
+    //     exactly 5/24/00 and no needs_identity, and so is a sample of single-
+    //     byte changes to it, in LBA and CHS mode, with full IDENTIFY words
+    //     held and with none (the firmware never has both the flag and held
+    //     words, but the policy must not depend on that); not mounted, every
+    //     seed is NOT READY.
+    section = "12 ctrl+g";
+    a0 = n_allow; c0 = n_checks;
+    {
+        static const idcaps_t ks[] = {
+            { true,  0x4401, 0x4400, 0x4001, 0x4401, 0x4000 },
+            { false, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000 },
+        };
+        mchs = true;
+        for (unsigned j = 0; j < sizeof(ks) / sizeof(ks[0]); j++) {
+            caps = ks[j];
+            for (int i = 0; i < n_seeds; i++)
+                for (int l = 0; l < 2; l++) {
+                    uint8_t cmd = seeds[i].len == 16 ? seeds[i].cdb[14] : seeds[i].cdb[9];
+                    sat_input_t in = { seeds[i].cdb, (uint8_t)seeds[i].len, seeds[i].dir_in, seeds[i].xfer,
+                                       true, l != 0, false, 0, 0, 0, 0, 0, true };
+                    set_caps(&in, &caps);
+                    sat_taskfile_t tf;
+                    sat_verdict_t v = sat_policy_check(&in, &tf);
+                    n_checks++;
+                    if (v.allow || v.sense_key != 0x05 || v.asc != 0x24 || v.ascq != 0 || v.needs_identity) {
+                        n_fail++; printf("  FAIL Ctrl+G rule, command %02X, LBA mode %d: allow %d sense %X/%02X/%02X\n",
+                                         cmd, l, v.allow, v.sense_key, v.asc, v.ascq);
+                    }
+                    in.mounted = false;
+                    v = sat_policy_check(&in, &tf);
+                    n_checks++;
+                    if (v.allow || v.sense_key != 0x02 || v.asc != 0x04 || v.ascq != 0) {
+                        n_fail++; printf("  FAIL Ctrl+G rule unmounted, command %02X: sense %X/%02X\n", cmd, v.sense_key, v.asc);
+                    }
+                    if (check(seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, true, l != 0)) {
+                        n_fail++; printf("  FAIL Ctrl+G: command %02X allowed\n", cmd);
+                    }
+                    for (int pos = 0; pos < 16; pos++)
+                        for (unsigned val = 0; val < 256; val += 17) {
+                            uint8_t c[16];
+                            memcpy(c, seeds[i].cdb, 16);
+                            c[pos] = (uint8_t)val;
+                            if (check(c, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, true, l != 0)) {
+                                n_fail++; printf("  FAIL Ctrl+G: a changed command %02X allowed\n", cmd);
+                            }
+                        }
+                }
+        }
+        mchs = false;
+        caps = FULL_CAPS;
+    }
+    printf("[12] Ctrl+G, direct: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
 
     printf("\n%ld assertions, %ld allowed, %ld refused, %ld failures\n", n_checks, n_allow, n_refuse, n_fail);
     if (n_fail) { printf("SAT POLICY TEST: FAIL\n"); return 1; }

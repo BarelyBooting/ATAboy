@@ -272,6 +272,9 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
 
     // ---- state ----------------------------------------------------------
     if (!in->mounted) return refuse(SAT_SK_NOT_READY, SAT_ASC_NOT_READY);
+    // Set up by Ctrl+G, never asked IDENTIFY: nothing at all goes through,
+    // IDENTIFY first among them (sat_policy.h, review of 0.6f3p8 L-2).
+    if (in->manual_chs) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
     // An LBA address sent to a drive that was set up in CHS mode may not be
     // understood as LBA at all; an old CHS-only drive would act on some other
     // sector and report success. So reads and verifies need LBA mode.

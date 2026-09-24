@@ -109,6 +109,7 @@ static void fresh(const char *name) {
     current_screen = SCREEN_MAIN; is_mounted = false;
     rec.stage = REC_NONE; memset(&last_fail, 0, sizeof last_fail);
     chs_geometry_lost = false;
+    manual_chs_active = false; iordy_held = false;
     saves = 0; busy_until_ns = 0; pend_at_ns = 0;
     tty.clear(); rx.clear(); rxi = 0;
     hang_limit_ns = mock_now_ns + 300000000000ull;  // 300 s of mock time
@@ -303,6 +304,7 @@ static void test_refused() {
     CHECK(cur_cyls == 0 && config.cyls == 0, "geometry set");
     ide_fail_t g; ide_last_failure(&g);
     CHECK(g.kind == IDE_FAIL_MANUAL_CHS && g.command == 0x10, "record kind %u cmd %02X", g.kind, g.command);
+    CHECK(chs_geometry_lost, "RESET- sent, geometry not marked lost (M-1)");
     tty.clear(); run_debug_errors();
     CHECK(has("[Last Failed I/O] cmd 10, manual CHS: RECALIBRATE did not end"), "Debug E");
 
@@ -317,6 +319,7 @@ static void test_refused() {
     CHECK(ms >= 2000 + IDE_MCHS_READY_MS && ms < 2000 + IDE_MCHS_READY_MS + 1000, "gave up after %llu ms", (unsigned long long)ms);
     CHECK(strstr(hdd_status_text, "Manual CHS: drive still busy (ST:80)") != nullptr, "\"%s\"", hdd_status_text);
     CHECK(cur_cyls == 0 && config.cyls == 0 && hdd_model_raw[0] == 0, "old geometry kept after RESET-");
+    CHECK(chs_geometry_lost, "RESET- sent, geometry not marked lost (M-1)");
 
     fresh("no drive");
     sim.slave = true;                               // nothing answers as device 0
@@ -326,6 +329,7 @@ static void test_refused() {
     CHECK(sim.commands == 0 && no_identify(), "commands %d", sim.commands);
     CHECK(mock_now_ns - t0 < 4000000000ull, "took %llu ms", (unsigned long long)((mock_now_ns - t0) / 1000000));
     CHECK(strstr(hdd_status_text, "Manual CHS: no drive answered (ST:FF)") != nullptr, "\"%s\"", hdd_status_text);
+    CHECK(chs_geometry_lost, "RESET- sent, geometry not marked lost (M-1)");
 
     fresh("slave alone");
     sim.slave = true;
@@ -346,7 +350,8 @@ static void test_refused() {
 // ---- 5. backing out, and refusals: the drive gets nothing ------------------
 static void test_nothing_sent() {
     const char *esc[] = { "\x1b", "10\x1b", "1045\r\x1b", "1045\r2\r4\x1b", "1045\r2\r40\r\x1b",
-                          "1045\r2\r40\rn\x1b", "1045\r2\r40\r\x07\x06x\x1b", "\r\r\r\x1b" };
+                          "1045\r2\r40\rn\x1b", "1045\r2\r40\r\x07\x06x\x1b", "\r\r\r\x1b",
+                          "1045\r2\r40\r\r\x1b", "1045\r2\r40\r\t \x1b" };
     for (const char *e : esc) {
         fresh("Esc");
         earlier_setup();
@@ -458,6 +463,210 @@ static void test_after_auto_detect() {
 #endif
 }
 
+// ---- 8. review of 0.6f3p8 ----------------------------------------------------
+// One sector read at lba outside a host command, as test_accepted does. True
+// when it came back with the medium's own bytes.
+static bool read_right(uint32_t lba, int32_t *got_out = nullptr) {
+    uint8_t buf[512];
+    int32_t got = ide_read_sectors(lba, 1, buf);
+    if (got_out) *got_out = got;
+    bool right = got >= 0;
+    for (int i = 0; right && i < 512; i++) right = buf[i] == sim.byte_at(lba, i);
+    return right;
+}
+static std::vector<uint8_t> cmds_since(size_t n) {
+    return std::vector<uint8_t>(sim.cmd_log.begin() + (long)n, sim.cmd_log.end());
+}
+static void ctrl_g() {
+    keys("1045\r2\r40\ry");
+    run_manual_chs();
+}
+static void debug_reset() {
+    current_screen = SCREEN_DEBUG;
+    debug_key('R');                                 // ide_reset_drive(): RESET-, RECALIBRATE
+    current_screen = SCREEN_MAIN;
+}
+
+// Power-up: nothing sent yet, so no geometry is believed. The first CHS read
+// sends 0x91 before it names a sector. Runs first, on the state as the
+// program starts (M-1: every reset marks the geometry lost, and power-up is one).
+static void test_power_up() {
+    current = "M-1: power-up";
+    config.cyls = C; config.heads = H; config.spt = S; config.use_lba_mode = false;
+    sim.nsect = C * H * S; sim.native_heads = 4; sim.native_spt = 40;
+    CHECK(read_right(1234), "first read after power-up went to another sector");
+    CHECK(!sim.cmd_log.empty() && sim.cmd_log[0] == 0x91, "0x91 not sent first: %zu commands", sim.cmd_log.size());
+}
+
+// M-1, the review's P1 (exp2.cpp): Ctrl+G, then Debug R, then a read. On
+// bb94c26 the read came back GOOD from another sector: RESET- had dropped the
+// drive's 0x91 and nothing marked it. Now the read sends 0x91 again first.
+static void test_m1_debug_r() {
+    fresh("M-1 P1: Ctrl+G, Debug R, read");
+    ctrl_g();
+    CHECK(read_right(1234), "read after Ctrl+G");
+    debug_reset();
+    CHECK(sim.hw_resets == 2 && !sim.geo_valid, "Debug R: resets %d, drive geometry %d", sim.hw_resets, sim.geo_valid);
+    size_t m = sim.cmd_log.size();
+    CHECK(read_right(1234), "read after Debug R went to another sector");
+    CHECK(cmds_since(m) == (std::vector<uint8_t>{ 0x91, 0x20 }) && sim.heads == H && sim.spt == S,
+          "0x91 not sent again first: %zu commands", sim.cmd_log.size() - m);
+    CHECK(no_identify(), "IDENTIFY sent");
+
+    // The drive refuses 0x91 this time: the read refuses, naming no sector.
+    fresh("M-1 P1: Debug R, then 0x91 refused");
+    ctrl_g();
+    debug_reset();
+    sim.reject_idp = true;
+    m = sim.cmd_log.size();
+    int32_t got = 0;
+    read_right(1234, &got);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(got < 0 && cmds_since(m) == std::vector<uint8_t>{ 0x91 } && f.kind == IDE_FAIL_NO_GEOMETRY,
+          "read %d, %zu commands, record %u", (int)got, sim.cmd_log.size() - m, f.kind);
+}
+
+// M-1, the review's P2: Ctrl+G, then Auto Detect (the drive answers IDENTIFY),
+// then Esc in the picker. On bb94c26 the Ctrl+G geometry was kept against a
+// drive the probe had reset, and a mount read the wrong sectors. Now the
+// geometry is cleared at the probe, so there is nothing to mount; and ide.c
+// on its own would have sent 0x91 again first.
+static void test_m1_auto_detect_esc() {
+    fresh("M-1 P2: Ctrl+G, Auto Detect, Esc");
+    sim.identify_ok = true;
+    ctrl_g();
+    CHECK(cur_cyls == C && ide_manual_chs_active(), "Ctrl+G did not set it");
+    keys("\x1b");
+    run_auto_detect();
+    CHECK(sim.id_commands() == 1 && !ide_manual_chs_active(), "Auto Detect: %d IDENTIFY, flag %d",
+          sim.id_commands(), ide_manual_chs_active());
+    CHECK(cur_cyls == 0 && cur_heads == 0 && cur_spt == 0 && !use_lba_mode && total_lba_sectors == 0,
+          "the Ctrl+G geometry kept: %u/%u/%u", cur_cyls, cur_heads, cur_spt);
+    CHECK(config.cyls == 0 && config.heads == 0 && config.spt == 0 && !config.use_lba_mode && config.lba_sectors == 0,
+          "config kept it: %u/%u/%u", config.cyls, config.heads, config.spt);
+    // Mount Drive's own test (core1_entry, main menu item 1): nothing to mount.
+    bool gv = (use_lba_mode && total_lba_sectors > 0) || (!use_lba_mode && cur_cyls > 0 && cur_heads > 0 && cur_spt > 0);
+    CHECK(!gv && saves == 0, "a geometry to mount, or the EEPROM written");
+    // A read regardless (usb.c would refuse it first: nothing is mounted)
+    // sends nothing: there is no geometry to send.
+    size_t m = sim.cmd_log.size();
+    int32_t got = 0;
+    read_right(1234, &got);
+    CHECK(got < 0 && sim.cmd_log.size() == m, "read with no geometry: %d, %zu commands", (int)got, sim.cmd_log.size() - m);
+    // ide.c's guard alone: the old geometry put back as bb94c26 kept it. The
+    // probe's RESET- marked it lost, so 0x91 goes first and the read is right.
+    config.cyls = C; config.heads = H; config.spt = S;
+    m = sim.cmd_log.size();
+    CHECK(read_right(1234), "read after Auto Detect went to another sector");
+    CHECK(cmds_since(m) == (std::vector<uint8_t>{ 0x91, 0x20 }), "0x91 not sent again first: %zu commands",
+          sim.cmd_log.size() - m);
+
+    // The drive refuses IDENTIFY (the CP3044 case): the error box with F:
+    // Force, and the Ctrl+G geometry is not kept for the forced entry either.
+    fresh("M-1 P2: Ctrl+G, Auto Detect, IDENTIFY refused");
+    ctrl_g();
+    CHECK(run_auto_detect() && force_detect, "no error box offering F: Force");
+    CHECK(cur_cyls == 0 && cur_heads == 0 && config.cyls == 0 && config.heads == 0, "the Ctrl+G geometry kept");
+    CHECK(ide_manual_chs_active(), "flag cleared by an IDENTIFY that failed");
+}
+
+// N5: Ctrl+G after an Auto Detect that chose LBA must leave LBA mode, or the
+// next reads send LBA addresses to a drive set up in CHS. This drive takes no
+// notice of the LBA bit, as a drive older than LBA would, so an LBA read would
+// come back GOOD from another sector.
+static void test_mchs_after_lba_detect() {
+    fresh("Ctrl+G after an LBA Auto Detect");
+    sim.identify_ok = true;
+    sim.lba_ignored = true;
+    keys("\r");                                     // the picker offers LBA first for an LBA drive
+    run_auto_detect();
+    CHECK(use_lba_mode && config.use_lba_mode && total_lba_sectors > 0, "Auto Detect did not choose LBA");
+    ctrl_g();
+    CHECK(!use_lba_mode && !config.use_lba_mode && total_lba_sectors == 0 && config.lba_sectors == 0,
+          "LBA mode kept: %d %d %llu", use_lba_mode, config.use_lba_mode, (unsigned long long)config.lba_sectors);
+    CHECK(cur_cyls == C && config.heads == H && config.spt == S, "geometry %u/%u/%u", cur_cyls, config.heads, config.spt);
+    size_t m = sim.cmd_log.size();
+    CHECK(read_right(1234), "read went to another sector");
+    CHECK(cmds_since(m) == std::vector<uint8_t>{ 0x20 } && !(sim.reg[6] & 0x40),
+          "not a CHS read: device register %02X", sim.reg[6]);
+}
+
+// N3: Enter at the Y/N question is not Y (the same keys are in
+// test_nothing_sent too; here with Tab and Space as well).
+static void test_mchs_enter_not_yes() {
+    fresh("Enter at the question");
+    earlier_setup();
+    Snap before = snap();
+    keys("1045\r2\r40\r\r\t \x1b");
+    CHECK(!run_manual_chs() && nothing_sent() && same(before, snap()) && rxi == rx.size(),
+          "writes %d commands %d", sim.reg_writes, sim.commands);
+}
+
+// N7: with IORDY on in Features, it is ignored from Ctrl+G's RESET- until the
+// drive is past its power-on diagnostics (a drive holds IORDY low through
+// them, and a register cycle that believed it would never end), then believed
+// again.
+static void test_mchs_iordy_held() {
+    fresh("Ctrl+G with IORDY on");
+    sim.t_hw_reset = 5000000000ull;                 // diagnostics outlast the 2 s wait
+    config.iordy_enabled = true;
+    ide_iordy_follow_config();
+    CHECK(mock_iordy_inover == GPIO_OVERRIDE_NORMAL, "IORDY not believed before");
+    ctrl_g();
+    CHECK(sent_exactly_recal_idp() && cur_cyls == C, "commands %zu", sim.cmd_log.size());
+    CHECK(sim.iordy_stalls == 0, "%d register cycles with IORDY believed in the diagnostics", sim.iordy_stalls);
+    CHECK(mock_iordy_inover == GPIO_OVERRIDE_NORMAL, "IORDY not believed again after");
+    config.iordy_enabled = false;
+    ide_iordy_follow_config();
+}
+
+// L-2's flag (ide_manual_chs_active): set by an accepted 0x91, kept over a
+// reset that asks no IDENTIFY, cleared only by an IDENTIFY that answers.
+static void test_mchs_flag() {
+    fresh("Ctrl+G flag: set, kept by Debug R");
+    CHECK(!ide_manual_chs_active(), "set before Ctrl+G");
+    ctrl_g();
+    CHECK(ide_manual_chs_active(), "not set by an accepted 0x91");
+    debug_reset();
+    CHECK(ide_manual_chs_active(), "cleared by Debug R");
+    current_screen = SCREEN_DEBUG; debug_key('I'); current_screen = SCREEN_MAIN;   // IDENTIFY refused
+    CHECK(ide_manual_chs_active(), "cleared by an IDENTIFY that failed");
+
+    fresh("Ctrl+G flag: cleared by an IDENTIFY that answers");
+    sim.identify_ok = true;
+    ctrl_g();
+    current_screen = SCREEN_DEBUG; debug_key('i'); current_screen = SCREEN_MAIN;
+    CHECK(!ide_manual_chs_active() && sim.id_commands() == 1, "kept after Debug I answered");
+
+    fresh("Ctrl+G flag: not set by a refused 0x91");
+    sim.reject_idp = true;
+    ctrl_g();
+    CHECK(!ide_manual_chs_active(), "set by a refused 0x91");
+}
+
+// L-1: F10 does not save a Ctrl+G geometry with Auto Mount on (its power-up
+// IDENTIFY would reach the drive), and does otherwise.
+static void test_save_setup() {
+    fresh("F10, Ctrl+G geometry, Auto Mount on");
+    ctrl_g();
+    config.auto_mount = true;
+    tty.clear();
+    keys("x");
+    CHECK(!save_setup() && saves == 0 && has(SAVE_REFUSED_MCHS), "saved %d", saves);
+
+    fresh("F10, Ctrl+G geometry, Auto Mount off");
+    ctrl_g();
+    CHECK(save_setup() && saves == 1 && config.cyls == C && config.heads == H && config.spt == S, "saves %d", saves);
+
+    fresh("F10, Auto Mount on, after an Auto Detect that answered");
+    sim.identify_ok = true;
+    ctrl_g();
+    keys("\r");
+    run_auto_detect();
+    config.auto_mount = true;
+    CHECK(save_setup() && saves == 1 && config.use_lba_mode, "saves %d", saves);
+}
+
 // ---- 7. through the main loop: Ctrl+G reaches the entry ---------------------
 // Last, since core1_entry never returns (on_idle ends the program).
 static void core1_done() {
@@ -466,12 +675,20 @@ static void core1_done() {
           "geometry %u/%u/%u", cur_cyls, cur_heads, cur_spt);
     CHECK(has("Ctrl+G: Manual CHS") && has("Manual CHS (no IDENTIFY)") && has("1045 Cyl / 2 Hd / 40 SPT"), "screens");
     CHECK(saves == 0, "EEPROM written %d times", saves);
+    CHECK(has(SAVE_REFUSED_MCHS), "F10 with Auto Mount on: no refusal shown (L-1)");
     printf("%d checks, %d failed\n", checks, failures);
     exit(failures > 255 ? 255 : failures);
 }
 static void test_core1() {
     fresh("main loop");
+    config.auto_mount = true;                       // with no geometry saved, nothing mounts at start-up
     keys("\x07" "1045\r2\r40\ry", 500);             // once the menu is up
+    // Then F10 (its escape sequence as a terminal sends it, 1 ms apart), Y,
+    // and a key for the refusal (L-1).
+    uint64_t t = rx.back().at_us + 20000;
+    for (char c : std::string("\x1b[21~")) { rx.push_back({ t, c }); t += 1000; }
+    rx.push_back({ t + 20000, 'y' });
+    rx.push_back({ t + 40000, 'x' });
     idle_after_ns = mock_now_ns + 20000000000ull;
     on_idle = core1_done;
     core1_entry();
@@ -479,6 +696,7 @@ static void test_core1() {
 
 int main() {
     ide_hw_init();                                  // the bus idle, as at power-up
+    test_power_up();                                // first: the state as the program starts
     test_decisions();
     test_accepted();
     test_limits_accepted();
@@ -487,6 +705,13 @@ int main() {
     test_nothing_sent();
     test_guards();
     test_after_auto_detect();
+    test_m1_debug_r();
+    test_m1_auto_detect_esc();
+    test_mchs_after_lba_detect();
+    test_mchs_enter_not_yes();
+    test_mchs_iordy_held();
+    test_mchs_flag();
+    test_save_setup();
     test_core1();                                   // does not return
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;

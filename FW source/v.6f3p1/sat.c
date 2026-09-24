@@ -158,6 +158,9 @@ int32_t sat_scsi(uint8_t lun, uint8_t const cdb[16], void *buffer, uint16_t host
     in.id_w84 = id.w84;
     in.id_w85 = id.w85;
     in.id_w87 = id.w87;
+    // Set up by Ctrl+G with no IDENTIFY: the policy refuses everything,
+    // IDENTIFY included (review of 0.6f3p8, L-2).
+    in.manual_chs = ide_manual_chs_active();
 
     sat_taskfile_t tf;
     sat_verdict_t v = sat_policy_check(&in, &tf);

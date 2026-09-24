@@ -103,6 +103,16 @@
 // CDB to this drive. The check comes after the mounted and LBA-mode checks,
 // so an unmounted drive still reports NOT READY.
 //
+// A drive set up by Ctrl+G (manual CHS with no IDENTIFY, 0.6f3p8; manual_chs
+// in sat_input_t) gets NOTHING through this path, IDENTIFY included (review
+// of 0.6f3p8, L-2). That entrance exists for drives that must never be asked
+// IDENTIFY, such as the Conner CP3044, and a host tool (smartctl, smartd,
+// CrystalDiskInfo) sends IDENTIFY first on its own. Every row is refused with
+// 5/24/00 until an IDENTIFY the firmware sent itself has answered (Auto Detect,
+// the debug screen), which clears the flag. As with the other state checks,
+// this comes after the mounted check, so an unmounted drive still reports
+// NOT READY.
+//
 // SAT reads are NOT clipped to the configured geometry (unlike READ(10)).
 // They address the drive, and the drive's own IDNF is what stops a read past
 // its end; that failure is passed on, and nothing on the SAT path zero-fills
@@ -160,6 +170,9 @@ typedef struct {
     // Words 85 (command sets and features enabled) and 87 (bits 15:14 = 01b
     // when words 85..87 are valid), from the same IDENTIFY.
     uint16_t id_w85, id_w87;
+    // The geometry was set by Ctrl+G, with no IDENTIFY (ide.c,
+    // ide_manual_chs_active): every row is refused, 5/24/00.
+    bool     manual_chs;
 } sat_input_t;
 
 // The ATA task file to issue for an allowed CDB. `device` never carries the

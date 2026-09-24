@@ -411,6 +411,29 @@ $mutants = @(
     @{ Name = 'capability checked before the mounted check (NOT READY lost)'
        Find = "    if (!in->mounted) return refuse(SAT_SK_NOT_READY, SAT_ASC_NOT_READY);"
        Repl = "    if ((drive_caps(in) & need) != need) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);`n    if (!in->mounted) return refuse(SAT_SK_NOT_READY, SAT_ASC_NOT_READY);" }
+
+    # ---- review of 0.6f3p8 (L-2): nothing through to a drive set up by Ctrl+G ----
+    @{ Name = 'Ctrl+G: flag ignored'
+       Find = '    if (in->manual_chs) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);'
+       Repl = '' }
+    @{ Name = 'Ctrl+G: only IDENTIFY refused'
+       Find = 'if (in->manual_chs) return'
+       Repl = 'if (in->manual_chs && cmd == ATA_IDENTIFY) return' }
+    @{ Name = 'Ctrl+G: IDENTIFY let through (every other row refused)'
+       Find = 'if (in->manual_chs) return'
+       Repl = 'if (in->manual_chs && cmd != ATA_IDENTIFY) return' }
+    @{ Name = 'Ctrl+G: only the rows gated on IDENTIFY words refused'
+       Find = 'if (in->manual_chs) return'
+       Repl = 'if (in->manual_chs && need) return' }
+    @{ Name = 'Ctrl+G: refusal is 5/20 (invalid opcode)'
+       Find = '    if (in->manual_chs) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);'
+       Repl = '    if (in->manual_chs) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_OPCODE);' }
+    @{ Name = 'Ctrl+G: checked before the mounted check (NOT READY lost)'
+       Find = "    if (!in->mounted) return refuse(SAT_SK_NOT_READY, SAT_ASC_NOT_READY);"
+       Repl = "    if (in->manual_chs) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);`n    if (!in->mounted) return refuse(SAT_SK_NOT_READY, SAT_ASC_NOT_READY);" }
+    @{ Name = 'Ctrl+G: only refused in CHS mode'
+       Find = 'if (in->manual_chs) return'
+       Repl = 'if (in->manual_chs && !in->lba_mode) return' }
 )
 
 $orig = [IO.File]::ReadAllText($policy).Replace("`r`n", "`n")

@@ -882,6 +882,9 @@ static void sync_to_config(void) {
 //  Auto-mount — runs on core 1 so IDE ops never block USB on core 0
 // ---------------------------------------------------------------------------
 
+// It resets the drive and sends IDENTIFY whenever a geometry is saved, so a
+// Ctrl+G geometry is not saved with Auto Mount on (save_setup, review of
+// 0.6f3p8 L-1).
 static void try_auto_mount(void) {
     if (!config.auto_mount) return;
 
@@ -987,6 +990,17 @@ static bool run_auto_detect(void) {
     uint16_t id_buf[256];
     bool detected = false;
     uint8_t found = ide_probe_devices();
+    // Review of 0.6f3p8 (M-1): the probe's RESET- has dropped whatever
+    // geometry the drive had, and the probe may have found another device
+    // than the one it was set for (a Ctrl+G geometry for the slave, say, with
+    // a master now found first). So the old geometry is cleared here, not
+    // kept: leaving the picker with Esc (or the forced entry after a failed
+    // IDENTIFY) sets nothing, and there is nothing to mount until a geometry
+    // is chosen. Kept, it would only have been sent again as 0x91 at the
+    // first CHS transfer (ide.c marks it lost), possibly to the wrong drive.
+    // The EEPROM is not touched; F10 still saves only what is set.
+    cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;
+    sync_to_config();
     if (found) {
         ide_select_device(found);
         config.dev_base = found;
@@ -1081,7 +1095,7 @@ static bool run_auto_detect(void) {
 // (ide.h), never IDENTIFY. Only a 0x91 the drive accepted sets the geometry;
 // otherwise the error box says why, the geometry is 0 (nothing to mount),
 // and Debug E has the registers. Nothing here saves to EEPROM (F10 still can,
-// on purpose, later).
+// on purpose, later, but not with Auto Mount on: save_setup).
 #define MCHS_COL   9                    // the box: 64 wide, as the picker
 #define MCHS_ROW   5
 #define MCHS_W     64
@@ -1210,6 +1224,28 @@ static bool run_manual_chs(void) {
     sync_to_config();
     force_detect = false;
     show_detect_result = true;
+    return true;
+}
+
+// Y at "Save Current Setup to EEPROM" (F10, or the main menu item). Review of
+// 0.6f3p8 (L-1): with Auto Mount on, every power-up resets the drive and
+// sends it IDENTIFY before anything else (try_auto_mount), whenever a
+// geometry is saved. A geometry from Ctrl+G is for a drive that must never
+// get IDENTIFY, so while it is the one in use (ide_manual_chs_active) it is
+// not saved with Auto Mount on: the box says so and nothing is written. With
+// Auto Mount off it is saved as before. The EEPROM layout is unchanged, so a
+// saved geometry does not say where it came from: after a power-up, Auto
+// Mount switched on and F10 again will save it (FORK-README item 22).
+// True if saved.
+#define SAVE_REFUSED_MCHS "Not saved: Auto Mount would IDENTIFY. Press a key"
+static bool save_setup(void) {
+    if (config.auto_mount && ide_manual_chs_active()) {
+        draw_confirm_box(SAVE_REFUSED_MCHS);
+        while (get_input() == -1) tight_loop_contents();
+        return false;
+    }
+    sync_to_config();
+    config_save();
     return true;
 }
 
@@ -1355,7 +1391,7 @@ void core1_entry(void) {
         if (current_screen == SCREEN_CONFIRM) {
             if (k == 'y' || k == 'Y') {
                 if (confirm_type == 0) { config_defaults(); sync_from_config(); config_save(); current_screen = SCREEN_MAIN; }
-                else if (confirm_type == 1) { sync_to_config(); config_save(); current_screen = confirm_return_screen; }
+                else if (confirm_type == 1) { (void)save_setup(); current_screen = confirm_return_screen; }
                 else if (confirm_type == 3) { is_mounted = true; media_changed_waiting = true; current_screen = SCREEN_MOUNTED; }
                 else if (confirm_type == 4) { menu_unmount(); current_screen = SCREEN_MAIN; }
                 else if (confirm_type == 5) {

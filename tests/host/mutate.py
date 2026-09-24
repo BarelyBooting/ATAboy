@@ -606,6 +606,58 @@ MUTANTS = [
      '    if (heads < 1 || heads > 16 || spt < 1) return IDE_MCHS_BAD_ARGS;\n', ''),
     ('ide mchs: recovery pending never reported', 'ide.c',
      'bool ide_recovery_pending(void) { return rec.stage != REC_NONE; }', 'bool ide_recovery_pending(void) { return false; }'),
+    # --- review of 0.6f3p8 ---
+    # M-1: every reset marks the CHS geometry lost, so the next CHS transfer
+    # sends 0x91 first (ide.c, chs_geometry_lost has the table). Not listed:
+    # hw_reset_start()'s own line. It is an equivalent mutant: the recovery
+    # only reaches a hardware reset from REC_SRST, after soft_reset_restore()
+    # has set the flag, and nothing clears it in between (only a 0x91 the
+    # drive accepts does, and none is sent before REC_GEO). The line is there
+    # so that no reset path depends on another having run first.
+    ('M-1: Debug R (ide_reset_drive) does not mark the geometry lost (review T21)', 'ide.c',
+     '    chs_geometry_lost = true;   // RESET- drops 0x91 (review of 0.6f3p8, M-1)\n', ''),
+    ('M-1: the probe does not mark the geometry lost', 'ide.c',
+     '    chs_geometry_lost = true; // RESET- drops 0x91 (review of 0.6f3p8, M-1)\n', ''),
+    ('M-1: geometry believed at power-up', 'ide.c',
+     'static bool chs_geometry_lost = true;', 'static bool chs_geometry_lost = false;'),
+    ('M-1: Ctrl+G RESET- does not mark the geometry lost (review N11)', 'ide.c',
+     '    chs_geometry_lost = true;       // RESET- drops any geometry the drive had\n', ''),
+    ('M-1: Auto Detect keeps the old geometry (review P2)', 'menus.c',
+     '    cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;\n    sync_to_config();\n    if (found) {',
+     '    if (found) {'),
+    ('M-1: Auto Detect clears the geometry on screen, not in config', 'menus.c',
+     '    cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;\n    sync_to_config();\n    if (found) {',
+     '    cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;\n    if (found) {'),
+    ('M-1: 0x91 sent with no geometry at all', 'ide.c',
+     '    if (config.heads == 0 || config.spt == 0) return false;\n', ''),
+    # The review's surviving mutants, as it wrote them.
+    ('Ctrl+G: Enter also confirms (review N3)', 'menus.c',
+     "        while (k != 'y' && k != 'Y' && k != 'n' && k != 'N' && k != KEY_ESC);",
+     "        while (k != 'y' && k != 'Y' && k != 'n' && k != 'N' && k != KEY_ESC && k != KEY_ENTER); if (k == KEY_ENTER) k = 'y';"),
+    ('Ctrl+G: success leaves LBA mode (review N5)', 'menus.c',
+     '        use_lba_mode = false; total_lba_sectors = 0;\n        cur_cyls = (uint16_t)v[0];', '        cur_cyls = (uint16_t)v[0];'),
+    ('ide mchs: no IORDY hold over the reset (review N7)', 'ide.c',
+     '    recovery_forget();              // RESET- supersedes any recovery (none is pending: menus.c)\n    iordy_hold();',
+     '    recovery_forget();              // RESET- supersedes any recovery (none is pending: menus.c)'),
+    ('write proceeds with a recovery pending (review T19)', 'ide.c',
+     '    if (!recovery_gate()) return -1;                       // as for a read (review M-1)',
+     '    (void)recovery_gate();'),
+    # L-2: nothing through SAT to a drive set up by Ctrl+G.
+    ('L-2: SAT not told about Ctrl+G', 'sat.c',
+     '    in.manual_chs = ide_manual_chs_active();', '    in.manual_chs = false;'),
+    ('L-2: an accepted Ctrl+G does not set the flag', 'ide.c',
+     '    manual_chs_active = true;       // no pass-through to this drive (sat_policy.h)\n', ''),
+    ('L-2: an IDENTIFY that answers does not clear the flag', 'ide.c',
+     '    if (ok) manual_chs_active = false;\n', ''),
+    ('L-2: an IDENTIFY that fails clears the flag too', 'ide.c',
+     '    if (ok) manual_chs_active = false;', '    manual_chs_active = false;'),
+    # L-1: F10 does not save a Ctrl+G geometry with Auto Mount on.
+    ('L-1: F10 saves a Ctrl+G geometry with Auto Mount on', 'menus.c',
+     '    if (config.auto_mount && ide_manual_chs_active()) {', '    if (0) {'),
+    ('L-1: F10 refuses any Ctrl+G geometry', 'menus.c',
+     '    if (config.auto_mount && ide_manual_chs_active()) {', '    if (ide_manual_chs_active()) {'),
+    ('L-1: F10 refuses whenever Auto Mount is on', 'menus.c',
+     '    if (config.auto_mount && ide_manual_chs_active()) {', '    if (config.auto_mount) {'),
 ]
 
 

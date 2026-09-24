@@ -160,6 +160,7 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     memset(&last_fail, 0, sizeof last_fail);
     iordy_held = false;
     chs_geometry_lost = false;
+    manual_chs_active = false;
     tud_mount_cb();
     reset_worst();
     mock_gpio_out = (1u << 24) | (1u << 25);      // CS0/CS1 idle high
@@ -2637,6 +2638,103 @@ static void test_sat_smart_saves_off(Mode m) {
 }
 #endif
 
+// ---------------------------------------------------------------------------
+//  Review of 0.6f3p8
+// ---------------------------------------------------------------------------
+
+// T19: a WRITE(10) while a reset from an earlier command is still pending is
+// refused as a read is (recovery_gate): nothing is written when the recovery
+// ends without the drive back. Here the drive stays busy after SRST, RESET-
+// follows, and the drive is back one second after the recovery's 31 s are
+// over, inside the 5 s a write would wait for it to be ready: a write that went
+// on regardless would be written to it.
+static void test_write_refused_while_pending() {
+    setup("WRITE(10) refused while a reset is pending", LBA);
+    sim.srst_wedges = true;
+    sim.t_hw_reset = (IDE_SRST_TIMEOUT_MS + 1000) * 1000000ull;
+    sim.bad[5003] = {BAD_HANG, 0};
+    HostRead h = host_read10(5000, 8);              // SRST, still busy: pending
+    sim.bad.clear();
+    mock_now_ns = sim.srst_at + (IDE_SRST_TIMEOUT_MS - 1) * 1000000ull;
+    h = host_read10(5000, 8);                       // the SRST's 31 s over: RESET-, pending
+    CHECK(!h.ok && sim.hw_resets == 1 && rec.stage == REC_HW, "hw %d stage %u", sim.hw_resets, rec.stage);
+    mock_now_ns = ((uint64_t)rec.since + IDE_SRST_TIMEOUT_MS - 100) * 1000000ull;
+    int cmds = sim.commands;
+    std::vector<uint8_t> data = fill512(8, 0x5A);
+    int32_t r = host_write10(6000, data.data(), 8);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(r < 0 && sim.written.empty() && sim.commands == cmds, "write %d, %zu sectors written, %d commands",
+          r, sim.written.size(), sim.commands - cmds);
+    CHECK(!f.pending && f.reset_failed, "record: pending %d, reset failed %d", f.pending, f.reset_failed);
+    // The recovery is over; the drive is back now, and the next write goes.
+    mock_now_ns += 2000000000ull;
+    r = host_write10(6000, data.data(), 8);
+    CHECK(r == 8 * 512 && written_is(6000, data.data()), "write after the drive is back: %d", r);
+}
+
+// M-1: the state after each reset. Since hw_reset_start() marks the geometry
+// lost as well, and every way out of a pending recovery either sends 0x91 or
+// resets again, a soft reset that forgot to mark it would no longer read a
+// wrong sector in any test; so the flag itself is checked while an SRST's
+// recovery is still waiting for the drive (no hardware reset yet).
+static void test_srst_marks_geometry_lost() {
+    setup("SRST pending: geometry marked lost", CHS);
+    chs_user_geometry();
+    CHECK(!chs_geometry_lost, "lost before any reset");
+    sim.t_reset = 20000000000ull;                   // back from SRST after 20 s: inside its 31 s
+    sim.bad[5003] = {BAD_HANG, 0};
+    HostRead h = host_read10(5000, 8);
+    CHECK(!h.ok && rec.stage == REC_SRST && sim.hw_resets == 0, "stage %u hw %d", rec.stage, sim.hw_resets);
+    CHECK(chs_geometry_lost, "SRST sent, geometry not marked lost");
+    sim.bad.clear();
+    mock_now_ns += 21000000000ull;
+    h = host_read10(1234, 8);
+    CHECK(h.ok && matches_medium(h, 1234) && sim.geo_valid && !chs_geometry_lost, "read once back: ok %d", h.ok);
+}
+
+#if ATABOY_SAT
+// L-2: a drive set up by Ctrl+G (no IDENTIFY) gets nothing through ATA
+// PASS-THROUGH, IDENTIFY first: refused 5/24/00 before anything reaches the
+// drive, until an IDENTIFY the firmware sent itself has answered. READ(10)
+// works throughout.
+static void test_sat_manual_chs_refused() {
+    setup("SAT refuses everything to a drive set up by Ctrl+G", CHS);
+    is_mounted = false;
+    uint8_t st = 0;
+    CHECK(ide_manual_chs(10, 17, &st) == IDE_MCHS_OK && ide_manual_chs_active(), "Ctrl+G: st %02X", st);
+    is_mounted = true;
+    int cmds = sim.commands;
+    struct { const char *name; std::vector<uint8_t> cdb; uint32_t xfer; bool in; } rows[] = {
+        { "IDENTIFY (12)",      pt12(4, 0x0E, 0, 1, 0, 0xA0, 0xEC), 512, true },
+        { "IDENTIFY (16)",      pt16(4, false, 0x0E, 0, 1, 0, 0x00, 0xEC), 512, true },
+        { "READ SECTORS",       pt12(4, 0x0E, 0, 1, 100, 0xE0, 0x20), 512, true },
+        { "READ VERIFY",        verify12(0x00, 4, 100), 0, false },
+    };
+    for (auto &e : rows) {
+        SatResult s = sat_cmd(e.cdb, e.xfer, e.in);
+        CHECK(!s.ok() && s.sense.size() == 18 && sense_is(s.sense, 0x05, 0x24, 0x00), "%s: r %d", e.name, s.r);
+    }
+    for (auto &g : gated_rows()) {
+        SatResult s = sat_cmd(g.cdb, g.xfer, g.in);
+        CHECK(!s.ok() && sense_is(s.sense, 0x05, 0x24, 0x00), "%s: r %d", g.name, s.r);
+    }
+    CHECK(sim.commands == cmds && sim.data_reads == 0, "reached the drive: %d commands", sim.commands - cmds);
+    HostRead h = host_read10(100, 8);
+    CHECK(h.ok && matches_medium(h, 100), "READ(10) after Ctrl+G");
+    // Unmounted: NOT READY still comes first.
+    is_mounted = false;
+    SatResult u = sat_cmd(rows[0].cdb, 512, true);
+    CHECK(!u.ok() && sense_is(u.sense, 0x02, 0x04, 0x00), "unmounted: not NOT READY");
+    // Detection: the drive answers the firmware's own IDENTIFY. Allowed again.
+    uint16_t id[256];
+    CHECK(ide_identify(id) && !ide_manual_chs_active(), "flag kept after IDENTIFY answered");
+    is_mounted = true;
+    int ids = sim.id_commands();
+    SatResult a = sat_cmd(rows[0].cdb, 512, true);
+    CHECK(a.r == 512 && sim.id_commands() == ids + 1, "IDENTIFY after detection: r %d", a.r);
+}
+#endif
+
 int main() {
     // The budget is a design number, not only what the helpers measure
     // against: 10 s under the 30 s that Linux and the project's tools give a
@@ -2724,6 +2822,8 @@ int main() {
     test_geometry_waits_for_time();
     test_unmounted_callback_untimed();
     test_iordy_setting_deferred();
+    test_write_refused_while_pending();
+    test_srst_marks_geometry_lost();
 #if ATABOY_SAT
     test_sat_smart_status(LBA);
     test_sat_smart_status(CHS);
@@ -2748,6 +2848,7 @@ int main() {
     test_sat_never_starts();
     test_sat_fast_command();
     test_sat_device_fault();
+    test_sat_manual_chs_refused();
 #else
     test_no_sat();
 #endif

@@ -151,6 +151,12 @@ bool    ide_recovery_pending(void);
 #define IDE_MCHS_READY_MS   45000
 int     ide_manual_chs(uint8_t heads, uint8_t spt, uint8_t *status);
 
+// True from a Ctrl+G whose 0x91 the drive accepted until an IDENTIFY answers
+// (ide_identify). RAM only. While true, sat.c refuses every pass-through
+// command (review of 0.6f3p8, L-2), and menus.c will not save the geometry
+// with Auto Mount on, whose IDENTIFY at power-up this drive must not get (L-1).
+bool    ide_manual_chs_active(void);
+
 // Read task file registers 1-7 into tf[1]..tf[7] (tf[0] unused).
 void    ide_read_taskfile(uint8_t tf[8]);
 

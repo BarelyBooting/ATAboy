@@ -38,6 +38,9 @@
 // (cmd_log). A drive older than ATA can leave DRDY clear until it has had
 // INITIALIZE DEVICE PARAMETERS (drdy_needs_idp: idle status 10h, not 50h),
 // and can abort RECALIBRATE (abort_recal).
+// Review of 0.6f3p8: a drive older than LBA takes no notice of the LBA bit
+// in the device register and reads the address registers as CHS
+// (lba_ignored), so an LBA address names some other sector, with good status.
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -121,6 +124,7 @@ struct SimDrive {
     std::map<uint32_t, uint64_t> busy_after;
     bool     drdy_needs_idp = false;        // DRDY only once 0x91 has set a geometry
     bool     abort_recal = false;           // RECALIBRATE (0x10) ends at once with ABRT
+    bool     lba_ignored = false;           // the LBA bit means nothing: every address is CHS
     std::vector<uint8_t> cmd_log;           // every command byte, in order
     int      reg_writes = 0;                // any task file or Device Control write
     uint8_t idle_status() const { return (drdy_needs_idp && !geo_valid) ? 0x10 : 0x50; }
@@ -221,7 +225,7 @@ struct SimDrive {
             return (uint32_t)reg[3] | ((uint32_t)reg[4] << 8) | ((uint32_t)reg[5] << 16) |
                    ((uint32_t)hob[3] << 24);
         }
-        if (reg[6] & 0x40)
+        if ((reg[6] & 0x40) && !lba_ignored)
             return (uint32_t)reg[3] | ((uint32_t)reg[4] << 8) | ((uint32_t)reg[5] << 16) |
                    ((uint32_t)(reg[6] & 0x0F) << 24);
         uint32_t cyl = reg[4] | (reg[5] << 8), head = reg[6] & 0x0F, sec = reg[3];

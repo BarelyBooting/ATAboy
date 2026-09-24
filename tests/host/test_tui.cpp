@@ -54,6 +54,9 @@ void ide_last_failure(ide_fail_t *out) { *out = stub_fail; }
 bool ide_recovery_pending(void) { return false; }
 int ide_manual_chs(uint8_t, uint8_t, uint8_t *st) { *st = 0x50; return IDE_MCHS_OK; }
 #endif
+#ifdef SAVE_REFUSED_MCHS    // review of 0.6f3p8, L-1
+bool ide_manual_chs_active(void) { return true; }
+#endif
 
 static void save(const char *dir, const char *name) {
     std::string p = std::string(dir) + "/" + name + ".bin";
@@ -170,6 +173,15 @@ int main(int argc, char **argv) {
         draw_bios_frame(); draw_debug_overlay(); run_debug_errors();
         save(dir, "debug-errors-mchs");
     }
+#endif
+#ifdef SAVE_REFUSED_MCHS
+    // F10 with Auto Mount on and a Ctrl+G geometry: not saved (review of
+    // 0.6f3p8, L-1). New in this build.
+    reset_state();
+    config.auto_mount = true;
+    strcpy(hdd_model_raw, MCHS_MODEL); cur_cyls = 1045; cur_heads = 2; cur_spt = 40;
+    draw_bios_frame(); update_main_menu(); draw_confirm_box(SAVE_REFUSED_MCHS);
+    save(dir, "save-refused-mchs");
 #endif
     return 0;
 }

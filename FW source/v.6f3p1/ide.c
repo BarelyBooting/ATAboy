@@ -12,7 +12,38 @@ static uint8_t dev_base = 0xA0;   // 0xA0 = master, 0xB0 = slave
 // soft reset (which drops it) until INITIALIZE DEVICE PARAMETERS succeeds
 // again. A CHS address would then go through the drive's own default
 // translation and name a different sector, so CHS reads and writes refuse.
-static bool chs_geometry_lost = false;
+//
+// Review of 0.6f3p8 (M-1): EVERY reset sets it, hardware or soft, whoever
+// sends it, and so does power-up, so the next CHS transfer sends 0x91 first
+// (chs_geometry_ok) and refuses if the drive will not take it. Before, only
+// SRST did: a CHS geometry set by Ctrl+G, followed by Debug R (RESET-) or an
+// Auto Detect that was left with Esc, was read through the drive's default
+// translation, wrong sectors with good status. The resets, and what marks
+// the geometry lost after each:
+//   power-up                      this initial value
+//   ide_reset_drive (Debug R,     RESET-, set right after the pulse
+//     auto-mount at boot)
+//   ide_probe_devices (Auto       RESET-, set right after the pulse
+//     Detect)
+//   ide_manual_chs (Ctrl+G)       RESET-, set right after the pulse; cleared
+//                                 only by the 0x91 it then sends
+//   soft_reset_restore (any       SRST, set there
+//     failed transfer, SAT
+//     abort, identity check)
+//   hw_reset_start (recovery,     RESET-, set there as well, though the SRST
+//     after an SRST that failed)  before it has always set it already
+// Only a 0x91 the drive accepts clears it (ide_set_geometry, ide_manual_chs).
+static bool chs_geometry_lost = true;
+
+// The geometry in use was set by Ctrl+G (ide_manual_chs), which never sends
+// IDENTIFY: set when its 0x91 is accepted, cleared by the next IDENTIFY that
+// answers (ide_identify: Auto Detect, auto-mount, the debug screen). While it
+// is set, the SAT policy refuses every pass-through command, IDENTIFY first
+// (review of 0.6f3p8, L-2), and F10 will not save the geometry with Auto
+// Mount on (L-1, menus.c). RAM only: the EEPROM layout is unchanged.
+static bool manual_chs_active = false;
+
+bool ide_manual_chs_active(void) { return manual_chs_active; }
 
 void ide_select_device(uint8_t base) { dev_base = base; }
 
@@ -421,6 +452,7 @@ void ide_reset_drive(void) {
     gpio_put(IDE_RESET, 0);
     sleep_ms(50);
     gpio_put(IDE_RESET, 1);
+    chs_geometry_lost = true;   // RESET- drops 0x91 (review of 0.6f3p8, M-1)
     sleep_ms(100);
     ide_write_control(0x00);
     ide_wait_until_ready(10000);
@@ -443,6 +475,7 @@ uint8_t ide_probe_devices(void) {
     gpio_put(IDE_RESET, 0);
     sleep_ms(50);
     gpio_put(IDE_RESET, 1);
+    chs_geometry_lost = true; // RESET- drops 0x91 (review of 0.6f3p8, M-1)
     sleep_ms(2000);           // generous POST delay (not status-based)
     ide_write_control(0x00);  // nIEN=0
 
@@ -574,6 +607,8 @@ static bool identify_once(uint16_t *buf) { return identify_run(buf) > 0; }
 
 bool ide_identify(uint16_t *buf) {
     bool ok = identify_once(buf);
+    // A drive that answered IDENTIFY is no longer one set up without it.
+    if (ok) manual_chs_active = false;
 #if ATABOY_SAT
     // Keep what this drive says it supports, for the SAT policy. A failed
     // IDENTIFY forgets it: whatever answered before may not be this drive.
@@ -821,12 +856,14 @@ static int after_reset_wait(uint32_t budget_ms) {
 // drive comes out of reset with. Runs on core 0 inside a USB callback, so it
 // busy-waits; the 52 ms it takes is part of the fixed margin over the host
 // command's time (ide.h). The CHS geometry is already marked lost by the
-// soft reset that came first.
+// soft reset that came first; it is marked here too, so that no reset path
+// depends on another having run before it (review of 0.6f3p8, M-1).
 static void hw_reset_start(void) {
     iordy_hold();
     gpio_put(IDE_RESET, 0);
     busy_wait_us_32(IDE_HW_RESET_LOW_US);
     gpio_put(IDE_RESET, 1);
+    chs_geometry_lost = true;
     busy_wait_us_32(2000);                  // as after SRST: 2 ms before status is valid
     ide_write_control(0x00);                // nIEN=0, as the probe does
     rec.stage = REC_HW;
@@ -946,6 +983,10 @@ static void soft_reset_restore(void) {
 // take it; the caller must then refuse the transfer.
 static bool chs_geometry_ok(void) {
     if (config.use_lba_mode || !chs_geometry_lost) return true;
+    // No geometry at all (Auto Detect cleared it, or a Ctrl+G failed): there
+    // is nothing to send, and a CHS address could not even be worked out.
+    // usb.c refuses before this with nothing mounted; this does not rely on it.
+    if (config.heads == 0 || config.spt == 0) return false;
     return ide_set_geometry(config.heads, config.spt);
 }
 
@@ -1053,6 +1094,7 @@ int ide_manual_chs(uint8_t heads, uint8_t spt, uint8_t *status) {
         record_failure(IDE_FAIL_MANUAL_CHS, 0x91, st, 0, 0, 0);
         return IDE_MCHS_REFUSED;
     }
+    manual_chs_active = true;       // no pass-through to this drive (sat_policy.h)
     return IDE_MCHS_OK;
 }
 

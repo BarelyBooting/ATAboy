@@ -72,6 +72,7 @@ void ide_last_failure(ide_fail_t *out) { *out = stub_fail; }
 // Manual CHS (Ctrl+G) runs against ide.c itself in test_manual_chs.cpp.
 bool ide_recovery_pending(void) { return false; }
 int ide_manual_chs(uint8_t, uint8_t, uint8_t *st) { bus_use(); *st = 0x50; return IDE_MCHS_OK; }
+bool ide_manual_chs_active(void) { return false; }
 
 static int failures = 0, checks = 0;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; \
