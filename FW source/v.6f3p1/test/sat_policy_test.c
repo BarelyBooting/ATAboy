@@ -456,7 +456,11 @@ int main(void) {
         // bufsize16 must match the image
         n_checks++;
         { sat_cbw_t out; if (sat_cbw_parse(img, 0, cdb, 1024, &out)) { n_fail++; printf("  FAIL cbw parse ignored length\n"); } }
-        // data-out CBW with a valid read CDB, end to end
+        // A CBW that DECLARES data-out, with a valid read CDB, must be refused.
+        // This checks the policy only. It does not prove the firmware refuses
+        // real data-out commands: on that path TinyUSB puts the host's payload
+        // in the buffer, not the CBW, and a payload can mimic a data-in CBW.
+        // See the note in sat.c (review finding M1).
         uint8_t out_img[31];
         memcpy(out_img, img, 31);
         out_img[12] = 0x00;

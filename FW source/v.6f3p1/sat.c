@@ -25,9 +25,15 @@ int32_t sat_scsi(uint8_t lun, uint8_t const cdb[16], void *buffer, uint16_t host
     // received the CBW into this same buffer and has not written to it since,
     // so the CBW is still here. sat_cbw_parse() accepts it only if it matches
     // this command exactly: signature, LUN, all 16 CB bytes, and length.
-    // On the data-out path the buffer holds the host's data instead, the parse
-    // fails and the policy refuses. If a later TinyUSB stops leaving the CBW
-    // here, every SAT command is refused; it fails closed, not open.
+    //
+    // Limit, found in review: on the DATA-OUT path the buffer holds the host's
+    // payload, and a host can put a copy of a valid CBW at the start of it. The
+    // parse then passes and an allowed READ runs; the host gets no data back.
+    // Nothing outside the read-only allowlist can run this way, and no data is
+    // ever sent to the drive, but the direction check is not a real guarantee.
+    // Fixing it properly needs TinyUSB to pass the CBW direction to the callback.
+    // If a later TinyUSB stops leaving the CBW here, every SAT command is
+    // refused; it fails closed, not open.
     sat_input_t in = {0};
     sat_cbw_t cbw;
     in.cdb = cdb;
@@ -60,6 +66,7 @@ int32_t sat_scsi(uint8_t lun, uint8_t const cdb[16], void *buffer, uint16_t host
         if (err & 0x40)      tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);   // UNC: unrecovered read error
         else if (err & 0x10) tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x14, 0x01);   // IDNF: record not found
         else if (err & 0x04) tud_msc_set_sense(lun, SCSI_SENSE_ABORTED_COMMAND, 0x00, 0x00); // ABRT: command aborted
+        else if (err == 0)   tud_msc_set_sense(lun, SCSI_SENSE_HARDWARE_ERROR, 0x44, 0x00); // DF with no error bits: device fault
         else                 tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);   // anything else
         return -1;
     default:    // IDE_SAT_TIMEOUT, IDE_SAT_BAD_END

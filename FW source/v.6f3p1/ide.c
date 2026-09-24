@@ -276,6 +276,12 @@ void ide_drain_sector(void) {
 int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
     if (count == 0) return -1;
     if (!ide_wait_until_ready(5000)) return -1;
+#if ATABOY_SAT
+    // If the drive is still offering data from an earlier command, issuing a
+    // new one breaks the ATA protocol, and some drives would then hand that
+    // stale block back as this read's result. Fail this read and reset instead.
+    if (ide_read_reg(7) & 0x08) goto read_err;
+#endif
 
     bool use_lba48 = config.use_lba_mode && (config.lba_sectors > 0x0FFFFFFF);
 
@@ -509,6 +515,21 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba) {
 #define SAT_CMD_TIMEOUT_MS    10000   // data phase, from issue to the last block
 #define SAT_END_TIMEOUT_MS    1000    // after the last block, for BSY and DRQ to drop
 
+// Abort whatever the drive is still doing for a SAT command we gave up on.
+// Without this, a drive that finishes a slow read after our timeout raises
+// DRQ with that sector's data, and the next command on the bus (a READ(10)
+// from the host, say) can end up handed the stranded block as its own
+// result. A soft reset ends the command. There is no error state worth
+// keeping at this point: the command timed out or ended badly.
+static void sat_abort(void) {
+    ide_write_control(0x04);
+    busy_wait_us_32(10);
+    ide_write_control(0x00);
+    ide_wait_until_ready(2000);
+    if (!config.use_lba_mode)
+        ide_set_geometry(config.heads, config.spt);   // SRST clears the CHS setup
+}
+
 int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, uint8_t *ata_error) {
     *ata_error = 0;
     if (tf->sectors == 0 || tf->sectors > SAT_MAX_SECTORS) return IDE_SAT_NOT_ISSUED;
@@ -539,15 +560,17 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, uint8_t *ata_error) {
         for (;;) {
             uint8_t st = ide_read_reg(7);                       // also clears INTRQ
             if (!(st & 0x80)) {                                 // other bits only valid with BSY=0
-                if (st & 0x01) {
+                if (st & 0x21) {                                // ERR, or DF (device fault)
                     *ata_error = ide_read_reg(1);               // Error register: read has no side effects
                     if (st & 0x08) ide_drain_sector();          // don't leave DRQ stranded
                     return IDE_SAT_ATA_ERROR;
                 }
                 if (st & 0x08) break;                           // DRQ: a block is ready
             }
-            if (to_ms_since_boot(get_absolute_time()) - start >= SAT_CMD_TIMEOUT_MS)
+            if (to_ms_since_boot(get_absolute_time()) - start >= SAT_CMD_TIMEOUT_MS) {
+                sat_abort();
                 return IDE_SAT_TIMEOUT;
+            }
             busy_wait_us_32(10);
         }
 
@@ -569,11 +592,13 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, uint8_t *ata_error) {
     for (;;) {
         uint8_t st = ide_read_reg(7);
         if (!(st & 0x80)) {
-            if (st & 0x01) { *ata_error = ide_read_reg(1); return IDE_SAT_ATA_ERROR; }
+            if (st & 0x21) { *ata_error = ide_read_reg(1); return IDE_SAT_ATA_ERROR; }
             if (!(st & 0x08)) return IDE_SAT_OK;
         }
-        if (to_ms_since_boot(get_absolute_time()) - end_start >= SAT_END_TIMEOUT_MS)
+        if (to_ms_since_boot(get_absolute_time()) - end_start >= SAT_END_TIMEOUT_MS) {
+            sat_abort();
             return (st & 0x80) ? IDE_SAT_TIMEOUT : IDE_SAT_BAD_END;
+        }
         busy_wait_us_32(10);
     }
 }
