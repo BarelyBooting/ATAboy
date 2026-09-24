@@ -8,7 +8,10 @@ src=${1:-"$here/../../FW source/v.6f3p1"}
 out=${OUT:-"$here/build"}
 mkdir -p "$out"
 # Use the same ATABOY_* compile definitions as the firmware build (CMakeLists.txt).
-defs=$(grep -o 'ATABOY_[A-Z_]*=[0-9]*' "$src/CMakeLists.txt" | sed 's/^/-D/' | tr '\n' ' ')
+# Only target_compile_definitions lines count: a comment mentions -DATABOY_SAT=0.
+# SAT=0 in the environment tests the build with the SAT option turned off.
+defs=$(grep 'target_compile_definitions' "$src/CMakeLists.txt" | grep -o 'ATABOY_[A-Z_]*=[0-9]*' | sed 's/^/-D/' | tr '\n' ' ')
+if [ "${SAT:-1}" = 0 ]; then defs=$(echo "$defs" | sed 's/-DATABOY_SAT=1//'); fi
 echo "firmware defines: $defs"
 ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function $defs \
     -I "$here/mock" -I "$here" -I "$src" \

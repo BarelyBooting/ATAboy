@@ -11,6 +11,10 @@
 
 #include "ide.c"
 #include "usb.c"
+#if ATABOY_SAT
+#include "sat_policy.c"
+#include "sat.c"
+#endif
 
 #include <cstdio>
 #include <vector>
@@ -192,6 +196,21 @@ static void test_err_drq_stuck() {
     HostRead g = host_read10(7000, 4);
     CHECK(g.ok && matches_medium(g, 7000), "usable afterwards");
     CHECK(sim.violations == 0, "violations %d", sim.violations);
+
+    // The reset must happen inside the failing call, not be left to the next
+    // command. With ATABOY_SAT the next read's stale DRQ guard would reset
+    // too, which hides a missing reset from the checks above and overwrites
+    // the record of the real failure.
+    setup("ERR with DRQ that stays set, one call", LBA);
+    sim.bad[7002] = {BAD_ERR_DRQ_MORE, 0};
+    uint8_t buf[4 * 512];
+    uint32_t done = 0;
+    int32_t r = ide_read_sectors_partial(7000, 4, buf, &done);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(r < 0 && done == 2, "r %d done %u", r, done);
+    CHECK(sim.srst >= 1, "the failing call itself must reset");
+    CHECK(f.kind == IDE_FAIL_ERR && f.reset && f.drained, "kind %u reset %d drained %d", f.kind, f.reset, f.drained);
+    CHECK(!(sim.read_status(mock_now_ns + 1000000000ull) & 0x08), "DRQ still set after the call");
 }
 
 // Status bits other than BSY are undefined while BSY=1. This drive shows ERR
@@ -310,6 +329,34 @@ static void test_not_ready() {
     CHECK(f.kind == IDE_FAIL_NOT_READY, "kind %u", f.kind);
 }
 
+// SAT only: a drive still offering data from an earlier command (a SAT
+// command that ended after the bridge gave up on it). The next READ must not
+// be issued over it: fail, record STALE_DRQ, reset, and never hand the stale
+// block to the host.
+static void test_stale_drq(Mode m) {
+#if ATABOY_SAT
+    setup(m == LBA ? "stale DRQ before a read, LBA" : "stale DRQ before a read, CHS", m);
+    for (int i = 0; i < 256; i++) sim.xfer[i] = 0xDEAD;
+    sim.widx = 0; sim.phase = SimDrive::DRQ_IN; sim.status = 0x58; sim.left = 1;
+    int ip0 = sim.init_params;
+    HostRead h = host_read10(300, 4);
+    CHECK(!h.ok && h.data.empty(), "ok %d size %zu", h.ok, h.data.size());
+    CHECK(!contains_flawed(h), "stale block delivered");
+    CHECK(h.key == SCSI_SENSE_MEDIUM_ERROR && h.asc == 0x11, "sense %u/%02x", h.key, h.asc);
+    CHECK(sim.srst >= 1, "stale DRQ must be cleared with a reset");
+    if (m == CHS) CHECK(sim.init_params > ip0, "CHS geometry must be restored after SRST");
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(f.kind == IDE_FAIL_STALE_DRQ && f.reset && f.done == 0, "kind %u reset %d done %u", f.kind, f.reset, f.done);
+    CHECK((f.status & 0x08) != 0, "status %02x", f.status);
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+    HostRead g = host_read10(300, 4);
+    CHECK(g.ok && matches_medium(g, 300), "usable afterwards");
+#else
+    (void)m;
+    std::printf("NOT RUN: stale DRQ test (ATABOY_SAT=0: the guard is not built)\n");
+#endif
+}
+
 int main() {
     test_clean_reads(LBA);
     test_clean_reads(CHS);
@@ -330,6 +377,8 @@ int main() {
     test_two_bad();
     test_writes();
     test_not_ready();
+    test_stale_drq(LBA);
+    test_stale_drq(CHS);
     std::printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;
 }

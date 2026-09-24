@@ -52,5 +52,10 @@ static inline bool gpio_get(unsigned pin) { return pin == 28 ? mock_intrq() : fa
 enum {
     SCSI_SENSE_NONE = 0x00, SCSI_SENSE_NOT_READY = 0x02, SCSI_SENSE_MEDIUM_ERROR = 0x03,
     SCSI_SENSE_ILLEGAL_REQUEST = 0x05, SCSI_SENSE_UNIT_ATTENTION = 0x06,
+    SCSI_SENSE_HARDWARE_ERROR = 0x04, SCSI_SENSE_ABORTED_COMMAND = 0x0B,   // used by sat.c
 };
+// sat.c is C11; the host tests build it as C++.
+#ifdef __cplusplus
+#define _Static_assert static_assert
+#endif
 bool tud_msc_set_sense(uint8_t lun, uint8_t key, uint8_t asc, uint8_t ascq);

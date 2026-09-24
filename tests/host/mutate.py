@@ -62,6 +62,23 @@ MUTANTS = [
      '        ide_pio_read(256, wbuf + s * 256);\n'
      '        sio_hw->gpio_set = (1 << IDE_CS0); bus_idle();\n'
      '        last_fail.drained = true; s++;'),
+    # --- ide.c: stale DRQ before a read (built with ATABOY_SAT) ---
+    ('no stale DRQ guard: command issued over stranded data', 'ide.c',
+     '    if (st & 0x08) {\n        record_failure(IDE_FAIL_STALE_DRQ',
+     '    if (0) {\n        record_failure(IDE_FAIL_STALE_DRQ'),
+    ('stale DRQ recorded but not reset', 'ide.c',
+     '        record_failure(IDE_FAIL_STALE_DRQ, 0, st, lba, 0, count);\n        soft_reset_restore();',
+     '        record_failure(IDE_FAIL_STALE_DRQ, 0, st, lba, 0, count);'),
+    ('stale DRQ recorded as a drive ERR', 'ide.c',
+     'record_failure(IDE_FAIL_STALE_DRQ,', 'record_failure(IDE_FAIL_ERR,'),
+    # The pre-merge SAT branch did `goto read_err` here. C++ rejects that goto
+    # (it jumps over declarations), so the mutant spells out what read_err does.
+    ('stale DRQ sent down the ERR path (the pre-merge SAT form)', 'ide.c',
+     '    if (st & 0x08) {\n        record_failure(IDE_FAIL_STALE_DRQ, 0, st, lba, 0, count);\n'
+     '        soft_reset_restore();\n        return -1;\n    }',
+     '    if (st & 0x08) {\n        record_failure(IDE_FAIL_ERR, 0, st, lba, 0, count);\n'
+     '        ide_drain_sector(); last_fail.drained = true;\n'
+     '        if (!idle_after_error(2000)) soft_reset_restore();\n        return -1;\n    }'),
 ]
 
 
