@@ -147,6 +147,15 @@ int32_t sat_scsi(uint8_t lun, uint8_t const cdb[16], void *buffer, uint16_t host
     }
     in.mounted  = is_mounted;
     in.lba_mode = config.use_lba_mode;
+    // What the drive's own IDENTIFY says it supports. The policy refuses
+    // SMART, READ NATIVE MAX and READ SECTORS EXT unless it shows them, and
+    // refuses them all when no IDENTIFY was captured (review finding H1).
+    ide_id_words_t id;
+    ide_id_words(&id);
+    in.id_captured = id.valid;
+    in.id_w82 = id.w82;
+    in.id_w83 = id.w83;
+    in.id_w84 = id.w84;
 
     sat_taskfile_t tf;
     sat_verdict_t v = sat_policy_check(&in, &tf);

@@ -2,9 +2,9 @@
 // the PIO stand-ins below. It models only what the firmware relies on:
 // BSY/DRDY/DRQ/ERR timing, PIO data in and out, soft reset, INITIALIZE
 // DEVICE PARAMETERS, and a few ways a sector can fail. For the SAT path it
-// also answers READ VERIFY (0x40), SMART (0xB0: D0, D1, D5, DA), READ NATIVE
-// MAX ADDRESS (0xF8) and its EXT form (0x27), and reads back the HOB bytes
-// when Device Control has HOB set.
+// also answers IDENTIFY DEVICE (0xEC), READ VERIFY (0x40), SMART (0xB0: D0,
+// D1, D5, DA), READ NATIVE MAX ADDRESS (0xF8) and its EXT form (0x27), and
+// reads back the HOB bytes when Device Control has HOB set.
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -57,6 +57,12 @@ struct SimDrive {
     uint8_t  hang_cmd = 0;                  // this command byte never finishes (0 = none)
     bool     nondata_drq = false;           // a non-data command wrongly ends with DRQ
     uint64_t t_nondata = 1000000;           // non-data command that touches no sector
+    // IDENTIFY DEVICE (0xEC). Words 82..84 are what the firmware keeps; the
+    // defaults say what this drive answers: SMART (82.0), HPA (82.10),
+    // 48-bit (83.10), SMART error logging (84.0), and the 01b signature in
+    // bits 15:14 of words 83 and 84. identify_ok = false: IDENTIFY aborts.
+    uint16_t id_w82 = 0x4401, id_w83 = 0x4400, id_w84 = 0x4001;
+    bool     identify_ok = true;
 
     // registers
     uint8_t reg[8] = {0};
@@ -165,7 +171,25 @@ struct SimDrive {
         return 0xF0000000u | ((uint32_t)feature << 16) | ((uint32_t)log << 8) | i;
     }
 
+    void fill_identify() {
+        for (int i = 0; i < 256; i++) xfer[i] = 0;
+        xfer[0] = 0x0040;                                   // fixed disk
+        xfer[1] = (uint16_t)(nsect / (native_heads * native_spt));
+        xfer[3] = native_heads; xfer[6] = native_spt;
+        const char *model = "SIMULATED ATA DRIVE";
+        for (int i = 0; i < 20; i++) {
+            char a = model[0] ? *model++ : ' ';
+            char b = model[0] ? *model++ : ' ';
+            xfer[27 + i] = (uint16_t)(((uint8_t)a << 8) | (uint8_t)b);
+        }
+        xfer[49] = 0x0200;                                  // LBA
+        xfer[60] = (uint16_t)nsect; xfer[61] = (uint16_t)(nsect >> 16);
+        xfer[82] = id_w82; xfer[83] = id_w83; xfer[84] = id_w84;
+        xfer[100] = (uint16_t)nsect; xfer[101] = (uint16_t)(nsect >> 16);
+    }
+
     void resolve_sector() {
+        if (cmd == 0xEC) { fill_identify(); widx = 0; phase = DRQ_IN; status = 0x58; return; }
         if (cmd == 0xB0) {                  // SMART data: always readable
             for (int i = 0; i < 256; i++) xfer[i] = byte_at(cur, 2 * i) | (byte_at(cur, 2 * i + 1) << 8);
             widx = 0; phase = DRQ_IN; status = 0x58;
@@ -260,6 +284,11 @@ struct SimDrive {
             break;
         case 0x10:
             phase = IDLE; status = 0x80; ready_at = now + 1000;
+            break;
+        case 0xEC:
+            if (!identify_ok) { abort_cmd(); break; }
+            left = 1; cur = 0;
+            phase = BUSY_IN; status = 0x80; ready_at = now + t_sector;
             break;
         case 0x40: verify(now); break;
         case 0xB0: smart(now); break;

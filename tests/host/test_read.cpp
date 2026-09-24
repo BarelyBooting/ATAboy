@@ -97,11 +97,14 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     if (m == CHS && medium_sectors) config.cyls = (uint16_t)(medium_sectors / 170);
     ide_select_device(0xA0);
     ide_hw_init();
+    uint16_t id[256];
+    ide_identify(id);                               // as detection does: the SAT gate needs it
     if (m == CHS) ide_set_geometry(config.heads, config.spt);
     is_mounted = true;
     media_changed_waiting = false;
     last_key = last_asc = last_ascq = 0;           // no sense pending in TinyUSB
     sim.srst = 0; sim.init_params = 0; sim.violations = 0; sim.attempts.clear();
+    sim.data_reads = 0;                             // the IDENTIFY above is not the test's
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -911,6 +914,114 @@ static void test_sat_sense_delivery() {
     request_sense(32);
 }
 
+// The optional SAT commands run only when the drive's own IDENTIFY, captured
+// by the firmware, says the drive has them (review finding H1). The drive
+// below answers every one of them; whenever its IDENTIFY does not show one,
+// the firmware must refuse it (5/24/00) without sending anything.
+struct SatRow { const char *name; std::vector<uint8_t> cdb; uint32_t xfer; bool in; unsigned bit; };
+enum { G_SMART = 1, G_LOG = 2, G_NMAX = 4, G_NMAX_EXT = 8, G_READ_EXT = 16, G_ALL = 31 };
+
+static std::vector<SatRow> gated_rows() {
+    return {
+        { "SMART READ DATA",       pt12(4, 0x0E, 0xD0, 1, 0xC24F00, 0xA0, 0xB0), 512, true, G_SMART },
+        { "SMART READ THRESHOLDS", pt16(4, false, 0x0E, 0xD1, 1, 0xC24F00, 0x00, 0xB0), 512, true, G_SMART },
+        { "SMART RETURN STATUS",   smart_status12(), 0, false, G_SMART },
+        { "SMART READ LOG",        pt12(4, 0x0E, 0xD5, 1, 0xC24F01, 0xA0, 0xB0), 512, true, G_LOG },
+        { "READ NATIVE MAX",       native_max12(), 0, false, G_NMAX },
+        { "READ NATIVE MAX EXT",   native_max_ext16(), 0, false, G_NMAX_EXT },
+        { "READ SECTORS EXT",      pt16(4, true, 0x0E, 0, 2, 100, 0x40, 0x24), 1024, true, G_READ_EXT },
+    };
+}
+
+// Run every gated row; those in `allowed` must reach the drive (once), the
+// rest must be refused with 5/24/00 and reach nothing. The rows that are not
+// gated must work throughout.
+static void check_gate(const char *when, unsigned allowed, bool ungated = true) {
+    for (auto &r : gated_rows()) {
+        int cmds = sim.commands;
+        SatResult s = sat_cmd(r.cdb, r.xfer, r.in);
+        if (allowed & r.bit)
+            CHECK(sim.commands == cmds + 1, "%s: %s was not sent (r %d)", when, r.name, s.r);
+        else
+            CHECK(!s.ok() && sim.commands == cmds && s.sense.size() == 18 && sense_is(s.sense, 0x05, 0x24, 0x00),
+                  "%s: %s must be refused before the drive: r %d commands %d sense %zu", when, r.name, s.r,
+                  sim.commands - cmds, s.sense.size());
+    }
+    if (!ungated) return;
+    SatResult a = sat_cmd(pt12(4, 0x0E, 0, 1, 0, 0xA0, 0xEC), 512, true);
+    SatResult b = sat_cmd(pt12(4, 0x0E, 0, 2, 100, 0xE0, 0x20), 1024, true);
+    SatResult v = sat_cmd(verify12(0x00, 4, 100), 0, false);
+    CHECK(a.r == 512 && b.r == 1024 && v.r == 0, "%s: ungated rows: identify %d read %d verify %d", when, a.r, b.r, v.r);
+    if (a.r == 512) {
+        uint16_t w83 = (uint16_t)(a.data[166] | (a.data[167] << 8));
+        CHECK(w83 == sim.id_w83, "%s: pass-through IDENTIFY word 83 %04x", when, w83);
+    }
+}
+
+static void identify_with(uint16_t w82, uint16_t w83, uint16_t w84) {
+    sim.id_w82 = w82; sim.id_w83 = w83; sim.id_w84 = w84;
+    uint16_t id[256];
+    CHECK(ide_identify(id), "IDENTIFY %04x %04x %04x", w82, w83, w84);
+}
+
+static void test_sat_identify_gate() {
+    setup("SAT rows gated on the drive's IDENTIFY", LBA);
+    check_gate("full IDENTIFY", G_ALL);
+
+    // One feature missing at a time.
+    identify_with(0x4400, 0x4400, 0x4001);  check_gate("no SMART (82.0)", G_NMAX | G_NMAX_EXT | G_READ_EXT);
+    identify_with(0x4401, 0x4400, 0x4000);  check_gate("no SMART error log (84.0)", G_ALL & ~G_LOG);
+    identify_with(0x4001, 0x4400, 0x4001);  check_gate("no HPA (82.10)", G_SMART | G_LOG | G_READ_EXT);
+    identify_with(0x4401, 0x4000, 0x4001);  check_gate("no 48-bit (83.10)", G_SMART | G_LOG | G_NMAX);
+    // Words 82..84 not valid: nothing gated may run, whatever the bits say.
+    identify_with(0x0401 | 0x0001, 0x0400, 0x0001);   check_gate("pre-ATA-4, no signature (CFS1275A-like)", 0);
+    identify_with(0x4401, 0xC400, 0x4001);  check_gate("word 83 signature 11b", 0);
+    identify_with(0x4401, 0x4400, 0x8001);  check_gate("word 84 signature 10b", 0);
+    identify_with(0xFFFF, 0x4400, 0x4001);  check_gate("word 82 FFFFh", 0);
+    identify_with(0x0000, 0x4400, 0x4001);  check_gate("word 82 0000h", 0);
+    identify_with(0xFFFF, 0xFFFF, 0xFFFF);  check_gate("floating bus", 0);
+    identify_with(0x4401, 0x4400, 0x4001);  check_gate("full again", G_ALL);
+
+    // No IDENTIFY to trust: fail closed.
+    sim.identify_ok = false;
+    uint16_t id[256];
+    CHECK(!ide_identify(id), "IDENTIFY should have failed");
+    sim.identify_ok = true;
+    // (check_gate also sends a pass-through IDENTIFY, which works now and
+    // must not count: only the firmware's own IDENTIFY sets the words.)
+    check_gate("after a failed IDENTIFY (forced manual geometry)", 0);
+    identify_with(0x4401, 0x4400, 0x4001);  check_gate("IDENTIFY answers again", G_ALL);
+
+    ide_probe_devices();                    // a new detection, before its IDENTIFY
+    check_gate("after a probe, before IDENTIFY", 0);
+    identify_with(0x4401, 0x4400, 0x4001);  check_gate("probe, then IDENTIFY", G_ALL);
+
+    ide_select_device(0xB0);                // another device than the one identified
+    check_gate("another device selected", 0, false);   // nothing on device 1 to read from
+    ide_select_device(0xA0);
+    check_gate("the identified device again", G_ALL);
+
+    id_words.valid = false;                 // as at power-up: nothing captured yet
+    check_gate("no IDENTIFY since power-up (auto-mount from saved config)", 0);
+    identify_with(0x4401, 0x4400, 0x4001);
+
+    // CHS mount: the gated rows that name no user sector still follow IDENTIFY.
+    setup("SAT rows gated on the drive's IDENTIFY, CHS", CHS);
+    for (auto &r : gated_rows()) {
+        if (r.bit == G_READ_EXT) continue;          // refused in CHS mode anyway
+        int cmds = sim.commands;
+        sat_cmd(r.cdb, r.xfer, r.in);
+        CHECK(sim.commands == cmds + 1, "CHS, full IDENTIFY: %s not sent", r.name);
+    }
+    identify_with(0x0001, 0x0000, 0x0000);
+    for (auto &r : gated_rows()) {
+        int cmds = sim.commands;
+        SatResult s = sat_cmd(r.cdb, r.xfer, r.in);
+        CHECK(sim.commands == cmds && sense_is(s.sense, 0x05, 0x24, 0x00), "CHS, pre-ATA-4: %s reached the drive", r.name);
+    }
+    CHECK(sim.violations == 0 && sim.srst == 0, "violations %d srst %d", sim.violations, sim.srst);
+}
+
 // Mutating and out-of-list commands are refused and reach nothing.
 static void test_sat_refusals_touch_nothing() {
     setup("SAT refusals touch nothing", LBA);
@@ -997,6 +1108,7 @@ int main() {
     test_sat_read_error_registers();
     test_sat_sense_delivery();
     test_sat_refusals_touch_nothing();
+    test_sat_identify_gate();
 #else
     test_no_sat();
 #endif

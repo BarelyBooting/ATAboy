@@ -16,6 +16,26 @@ static bool chs_geometry_lost = false;
 
 void ide_select_device(uint8_t base) { dev_base = base; }
 
+#if ATABOY_SAT
+// IDENTIFY words 82..84 kept for the SAT policy (ide.h, ide_id_words). Written
+// only by ide_identify() and ide_probe_devices(), which run on core 1 while
+// nothing is mounted; read by sat.c on core 0, which only issues anything
+// while a drive is mounted. The policy checks "mounted" before it looks at
+// these, so a read that races a detection is refused anyway.
+static struct {
+    bool     valid;
+    uint8_t  dev_base;          // the device they came from
+    uint16_t w82, w83, w84;
+} id_words;
+
+void ide_id_words(ide_id_words_t *out) {
+    out->valid = id_words.valid && id_words.dev_base == dev_base;
+    out->w82 = id_words.w82;
+    out->w83 = id_words.w83;
+    out->w84 = id_words.w84;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 //  Bus helpers — address, transceiver, and chip-select (all SIO-managed)
 // ---------------------------------------------------------------------------
@@ -175,6 +195,9 @@ void ide_reset_drive(void) {
 }
 
 uint8_t ide_probe_devices(void) {
+#if ATABOY_SAT
+    id_words.valid = false;     // a new detection: nothing is known until IDENTIFY answers
+#endif
     ide_set_iordy(false);
 
     // Single hardware reset — both devices see it
@@ -245,7 +268,7 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
 //  IDENTIFY DEVICE (0xEC)
 // ---------------------------------------------------------------------------
 
-bool ide_identify(uint16_t *buf) {
+static bool identify_once(uint16_t *buf) {
     if (!ide_wait_until_ready(1000)) return false;
     if (ide_read_reg(7) & 0x08) ide_drain_sector();   // drain stranded DRQ before command
     ide_write_reg(6, dev_base);
@@ -274,6 +297,22 @@ ready:
     sio_hw->gpio_set = (1 << IDE_CS0);
     bus_idle();
     return true;
+}
+
+bool ide_identify(uint16_t *buf) {
+    bool ok = identify_once(buf);
+#if ATABOY_SAT
+    // Keep what this drive says it supports, for the SAT policy. A failed
+    // IDENTIFY forgets it: whatever answered before may not be this drive.
+    id_words.valid = ok;
+    if (ok) {
+        id_words.dev_base = dev_base;
+        id_words.w82 = buf[82];
+        id_words.w83 = buf[83];
+        id_words.w84 = buf[84];
+    }
+#endif
+    return ok;
 }
 
 // ---------------------------------------------------------------------------

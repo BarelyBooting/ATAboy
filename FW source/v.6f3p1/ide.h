@@ -118,6 +118,20 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
 // Issue one non-data command built by sat_policy_check() and wait for it to
 // end. Never touches the data register. No soft reset on an ATA error.
 int ide_sat_nondata(const sat_taskfile_t *tf, ide_sat_regs_t *regs);
+
+// The drive's own IDENTIFY DEVICE words 82, 83 and 84 (command sets and
+// features supported), from the last ide_identify() on the selected device.
+// valid is false when there is nothing to trust: no IDENTIFY since power-up,
+// the last one failed, a probe (ide_probe_devices) has run since, or another
+// device is selected now. Only the firmware's own IDENTIFY (detection,
+// auto-mount, the debug screen) sets them; a host's pass-through IDENTIFY
+// does not. sat.c hands them to the policy, which gates the optional
+// commands on them (sat_policy.h, "Drive capability").
+typedef struct {
+    bool     valid;
+    uint16_t w82, w83, w84;
+} ide_id_words_t;
+void ide_id_words(ide_id_words_t *out);
 #endif
 
 #endif

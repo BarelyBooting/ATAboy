@@ -156,8 +156,8 @@ $mutants = @(
        Find = 'if (img[0] != 0x55 || img[1] != 0x53 || img[2] != 0x42 || img[3] != 0x43) return false;'
        Repl = '' }
     @{ Name = 'leave the device byte in the task file on refusal'
-       Find = "    bool user_data = false;     // carries a user-data address: LBA mode only`n    switch (cmd) {"
-       Repl = "    bool user_data = false;     // carries a user-data address: LBA mode only`n    tf->device = dev;`n    switch (cmd) {" }
+       Find = "    unsigned need = 0;          // CAP_* the drive's IDENTIFY must show`n    switch (cmd) {"
+       Repl = "    unsigned need = 0;          // CAP_* the drive's IDENTIFY must show`n    tf->device = dev;`n    switch (cmd) {" }
 
     # ---- stage 2: non-data protocol, READ VERIFY, SMART, READ NATIVE MAX ----
     @{ Name = 'ignore HOB FEATURES and HOB COUNT'
@@ -245,11 +245,11 @@ $mutants = @(
        Find = "    case ATA_READ_NATIVE_MAX_EXT:`n"
        Repl = "    case ATA_READ_NATIVE_MAX_EXT:`n    case 0x37:`n" }
     @{ Name = 'READ NATIVE MAX: accept CK_COND=0'
-       Find = "        want_proto = SAT_PROTO_NON_DATA;`n        need_ck = true;`n        if (ext) return"
-       Repl = "        want_proto = SAT_PROTO_NON_DATA;`n        if (ext) return" }
+       Find = "        want_proto = SAT_PROTO_NON_DATA;`n        need_ck = true;`n        need = CAP_HPA;"
+       Repl = "        want_proto = SAT_PROTO_NON_DATA;`n        need = CAP_HPA;" }
     @{ Name = 'READ NATIVE MAX: accept EXTEND=1'
-       Find = "        need_ck = true;`n        if (ext) return refuse"
-       Repl = "        need_ck = true;`n        if (0) return refuse" }
+       Find = "        need = CAP_HPA;         // native max`n        if (ext) return refuse"
+       Repl = "        need = CAP_HPA;         // native max`n        if (0) return refuse" }
     @{ Name = 'READ NATIVE MAX: accept LBA bit clear'
        Find = 'if ((dev & 0x4F) != 0x40) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);  // native max: '
        Repl = 'if ((dev & 0x0F) != 0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);  // native max: ' }
@@ -277,6 +277,71 @@ $mutants = @(
     @{ Name = 'task file: every command marked PIO data-in'
        Find = '    tf->protocol = want_proto;'
        Repl = '    tf->protocol = SAT_PROTO_PIO_IN;' }
+
+    # ---- drive capability from IDENTIFY words 82..84 (review finding H1) ----
+    @{ Name = 'IDENTIFY gate: no captured IDENTIFY needed'
+       Find = '    if (!in->id_captured) return 0;'
+       Repl = '' }
+    @{ Name = 'IDENTIFY gate: word 83 signature not checked'
+       Find = '    if ((in->id_w83 & 0xC000u) != 0x4000u) return 0;'
+       Repl = '' }
+    @{ Name = 'IDENTIFY gate: word 84 signature not checked'
+       Find = '    if ((in->id_w84 & 0xC000u) != 0x4000u) return 0;'
+       Repl = '' }
+    @{ Name = 'IDENTIFY gate: word 83 signature 11b accepted (bit 14 only)'
+       Find = '(in->id_w83 & 0xC000u) != 0x4000u'
+       Repl = '(in->id_w83 & 0x4000u) != 0x4000u' }
+    @{ Name = 'IDENTIFY gate: word 84 signature 11b accepted (bit 14 only)'
+       Find = '(in->id_w84 & 0xC000u) != 0x4000u'
+       Repl = '(in->id_w84 & 0x4000u) != 0x4000u' }
+    @{ Name = 'IDENTIFY gate: word 82 of FFFFh taken as valid'
+       Find = 'in->id_w82 == 0x0000u || in->id_w82 == 0xFFFFu'
+       Repl = 'in->id_w82 == 0x0000u' }
+    @{ Name = 'IDENTIFY gate: word 82 of 0000h taken as valid'
+       Find = 'in->id_w82 == 0x0000u || in->id_w82 == 0xFFFFu'
+       Repl = 'in->id_w82 == 0xFFFFu' }
+    @{ Name = 'IDENTIFY gate: SMART read from word 82 bit 1'
+       Find = 'if (in->id_w82 & (1u << 0))  caps |= CAP_SMART;'
+       Repl = 'if (in->id_w82 & (1u << 1))  caps |= CAP_SMART;' }
+    @{ Name = 'IDENTIFY gate: SMART READ LOG on the GPL bit (84.5) instead'
+       Find = 'if (in->id_w84 & (1u << 0))  caps |= CAP_SMART_LOG;'
+       Repl = 'if (in->id_w84 & (1u << 5))  caps |= CAP_SMART_LOG;' }
+    @{ Name = 'IDENTIFY gate: HPA read from word 83'
+       Find = 'if (in->id_w82 & (1u << 10)) caps |= CAP_HPA;'
+       Repl = 'if (in->id_w83 & (1u << 10)) caps |= CAP_HPA;' }
+    @{ Name = 'IDENTIFY gate: 48-bit read from word 82'
+       Find = 'if (in->id_w83 & (1u << 10)) caps |= CAP_LBA48;'
+       Repl = 'if (in->id_w82 & (1u << 10)) caps |= CAP_LBA48;' }
+    @{ Name = 'SMART rows not gated'
+       Find = 'need = CAP_SMART;       // smart'
+       Repl = 'need = 0;       // smart' }
+    @{ Name = 'SMART READ LOG: error logging bit not needed'
+       Find = 'need = CAP_SMART | CAP_SMART_LOG;   // smart read log'
+       Repl = 'need = CAP_SMART;   // smart read log' }
+    @{ Name = 'SMART READ LOG: SMART bit not needed'
+       Find = 'need = CAP_SMART | CAP_SMART_LOG;   // smart read log'
+       Repl = 'need = CAP_SMART_LOG;   // smart read log' }
+    @{ Name = 'READ NATIVE MAX not gated'
+       Find = 'need = CAP_HPA;         // native max'
+       Repl = 'need = 0;         // native max' }
+    @{ Name = 'READ NATIVE MAX EXT: 48-bit bit not needed'
+       Find = 'need = CAP_HPA | CAP_LBA48;     // native max ext'
+       Repl = 'need = CAP_HPA;     // native max ext' }
+    @{ Name = 'READ NATIVE MAX EXT: HPA bit not needed'
+       Find = 'need = CAP_HPA | CAP_LBA48;     // native max ext'
+       Repl = 'need = CAP_LBA48;     // native max ext' }
+    @{ Name = 'READ SECTORS EXT not gated'
+       Find = 'need = CAP_LBA48;       // read ext'
+       Repl = 'need = 0;       // read ext' }
+    @{ Name = 'capability check skipped'
+       Find = 'if ((drive_caps(in) & need) != need) return'
+       Repl = 'if (0) return' }
+    @{ Name = 'capability check: any one needed bit is enough'
+       Find = 'if ((drive_caps(in) & need) != need) return'
+       Repl = 'if (need && !(drive_caps(in) & need)) return' }
+    @{ Name = 'capability checked before the mounted check (NOT READY lost)'
+       Find = "    if (!in->mounted) return refuse(SAT_SK_NOT_READY, SAT_ASC_NOT_READY);"
+       Repl = "    if ((drive_caps(in) & need) != need) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);`n    if (!in->mounted) return refuse(SAT_SK_NOT_READY, SAT_ASC_NOT_READY);" }
 )
 
 $orig = [IO.File]::ReadAllText($policy).Replace("`r`n", "`n")

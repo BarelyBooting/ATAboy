@@ -24,6 +24,12 @@
 //     0x27 (16-byte form, EXTEND=1); these three need CK_COND=1.
 //   SMART needs 4F/C2 in LBA mid/high. Reads and verifies need LBA mode;
 //   IDENTIFY, SMART and READ NATIVE MAX are allowed in CHS mode too.
+//   The drive's captured IDENTIFY (words 82..84, valid only with 01b in bits
+//   15:14 of words 83 and 84 and word 82 not 0000h/FFFFh) must show: SMART
+//   82.0 (READ LOG also 84.0), READ NATIVE MAX 82.10, READ NATIVE MAX EXT
+//   82.10 and 83.10, READ SECTORS EXT 83.10. IDENTIFY, READ SECTORS and
+//   READ VERIFY need nothing. Sections 0 to 10 run with a drive that shows
+//   everything; section 11 sweeps every combination of those bits.
 
 #include "sat_policy.h"
 #include <stdio.h>
@@ -36,12 +42,20 @@
 static long n_checks, n_fail, n_allow, n_refuse;
 static const char *section = "";
 
+// The drive's IDENTIFY words 82..84 as the firmware would pass them in.
+typedef struct { bool captured; uint16_t w82, w83, w84; } idcaps_t;
+// A drive that shows every feature the policy asks about: SMART and NOP (82),
+// HPA (82.10), 48-bit (83.10), SMART error logging (84.0), valid signatures.
+static const idcaps_t FULL_CAPS = { true, 0x4401, 0x4400, 0x4001 };
+static idcaps_t caps;          // what check() passes in; FULL_CAPS unless a section says otherwise
+
 static void fail(const char *what, const uint8_t *cdb, int len, bool dir_in, uint32_t xfer,
                  bool mounted, bool lba_mode) {
     n_fail++;
     if (n_fail > 40) return;
-    printf("  FAIL [%s] %s: len=%d dir_in=%d xfer=%u mounted=%d lba=%d cdb=",
-           section, what, len, dir_in, (unsigned)xfer, mounted, lba_mode);
+    printf("  FAIL [%s] %s: len=%d dir_in=%d xfer=%u mounted=%d lba=%d id=%d/%04X/%04X/%04X cdb=",
+           section, what, len, dir_in, (unsigned)xfer, mounted, lba_mode,
+           caps.captured, caps.w82, caps.w83, caps.w84);
     for (int i = 0; i < 16; i++) printf("%02X%s", cdb[i], i == 15 ? "\n" : " ");
 }
 
@@ -115,9 +129,37 @@ typedef struct {
     uint8_t  tdev;      // device bits the task file must carry
 } expect_t;
 
+// The IDENTIFY side of the expectation, written as (word, bit) pairs per row
+// rather than the policy's capability mask.
+static unsigned id_word(const idcaps_t *k, int word) {
+    return word == 82 ? k->w82 : word == 83 ? k->w83 : k->w84;
+}
+static bool id_words_valid(const idcaps_t *k) {
+    if (!k->captured) return false;
+    if ((id_word(k, 83) >> 14) != 1u || (id_word(k, 84) >> 14) != 1u) return false;
+    if (id_word(k, 82) == 0u || id_word(k, 82) == 0xFFFFu) return false;
+    return true;
+}
+static bool id_shows(const idcaps_t *k, uint8_t cmd, uint8_t feat) {
+    int req[2][2];
+    int n = 0;
+    if (cmd == 0x24) { req[n][0] = 83; req[n][1] = 10; n++; }
+    if (cmd == 0xB0) {
+        req[n][0] = 82; req[n][1] = 0; n++;
+        if (feat == 0xD5) { req[n][0] = 84; req[n][1] = 0; n++; }
+    }
+    if (cmd == 0xF8) { req[n][0] = 82; req[n][1] = 10; n++; }
+    if (cmd == 0x27) { req[n][0] = 82; req[n][1] = 10; n++; req[n][0] = 83; req[n][1] = 10; n++; }
+    if (n == 0) return true;                    // IDENTIFY, READ SECTORS, READ VERIFY
+    if (!id_words_valid(k)) return false;
+    for (int i = 0; i < n; i++)
+        if (!((id_word(k, req[i][0]) >> req[i][1]) & 1u)) return false;
+    return true;
+}
+
 // Would a correct policy allow this?
-static bool expect_allow(const uint8_t *c, int len, bool dir_in, uint32_t xfer,
-                         bool mounted, bool lba_mode, expect_t *e_out) {
+static bool expect_allow_caps(const uint8_t *c, int len, bool dir_in, uint32_t xfer,
+                              bool mounted, bool lba_mode, const idcaps_t *k, expect_t *e_out) {
     bool is16;
     if (c[0] == 0xA1 && len == 12) is16 = false;
     else if (c[0] == 0x85 && len == 16) is16 = true;
@@ -199,8 +241,19 @@ static bool expect_allow(const uint8_t *c, int len, bool dir_in, uint32_t xfer,
     else if (!dir_in || xfer != e.count * 512u) return false;
     if (!mounted) return false;
     if (user_data && !lba_mode) return false;
+    if (!id_shows(k, cmd, feat)) return false;
     if (e_out) *e_out = e;
     return true;
+}
+
+static bool expect_allow(const uint8_t *c, int len, bool dir_in, uint32_t xfer,
+                         bool mounted, bool lba_mode, expect_t *e_out) {
+    return expect_allow_caps(c, len, dir_in, xfer, mounted, lba_mode, &caps, e_out);
+}
+
+static void set_caps(sat_input_t *in, const idcaps_t *k) {
+    in->id_captured = k->captured;
+    in->id_w82 = k->w82; in->id_w83 = k->w83; in->id_w84 = k->w84;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +264,8 @@ static bool check(const uint8_t cdb_in[16], int len, bool dir_in, uint32_t xfer,
                   bool mounted, bool lba_mode) {
     uint8_t cdb[16];
     memcpy(cdb, cdb_in, 16);
-    sat_input_t in = { cdb, (uint8_t)len, dir_in, xfer, mounted, lba_mode };
+    sat_input_t in = { cdb, (uint8_t)len, dir_in, xfer, mounted, lba_mode, false, 0, 0, 0 };
+    set_caps(&in, &caps);
     sat_taskfile_t tf;
     memset(&tf, 0xAA, sizeof(tf));
     sat_verdict_t v = sat_policy_check(&in, &tf);
@@ -277,8 +331,9 @@ static bool check(const uint8_t cdb_in[16], int len, bool dir_in, uint32_t xfer,
             (v.sense_key == 0x02 && v.asc == 0x04 && v.ascq == 0);
         if (!ok_sense) fail("refusal sense is not 5/20, 5/21, 5/24 or 2/04", cdb, len, dir_in, xfer, mounted, lba_mode);
         // NOT READY exactly when nothing is mounted and the CDB itself is
-        // valid. (With nothing mounted, the LBA-mode setting means nothing.)
-        bool only_unmounted = !mounted && expect_allow(cdb, len, dir_in, xfer, true, true, NULL);
+        // valid. (With nothing mounted, the LBA-mode setting and the drive's
+        // IDENTIFY mean nothing: NOT READY comes first.)
+        bool only_unmounted = !mounted && expect_allow_caps(cdb, len, dir_in, xfer, true, true, &FULL_CAPS, NULL);
         if (only_unmounted != (v.sense_key == 0x02))
             fail(only_unmounted ? "unmounted: expected NOT READY" : "NOT READY for a CDB that is invalid anyway",
                  cdb, len, dir_in, xfer, mounted, lba_mode);
@@ -377,6 +432,7 @@ static void build_seeds(void) {
 
 int main(void) {
     build_seeds();
+    caps = FULL_CAPS;
 
     // Every seed must itself be allowed, or the sweeps around it prove nothing.
     section = "0 seeds";
@@ -646,7 +702,8 @@ int main(void) {
         sat_taskfile_t tf;
         sat_verdict_t v = sat_policy_check(NULL, &tf);
         n_checks++; if (v.allow) { n_fail++; printf("  FAIL NULL input allowed\n"); }
-        sat_input_t in = { NULL, 12, true, 512, true, true };
+        sat_input_t in = { NULL, 12, true, 512, true, true, false, 0, 0, 0 };
+        set_caps(&in, &FULL_CAPS);
         v = sat_policy_check(&in, &tf);
         n_checks++; if (v.allow) { n_fail++; printf("  FAIL NULL cdb allowed\n"); }
         in.cdb = seeds[0].cdb;
@@ -684,7 +741,8 @@ int main(void) {
                 if (out.xfer_len != len || out.dir_in != (m[12] == 0x80) || out.cb_len != m[14])
                     fail("cbw parse fields wrong", cdb, pos, 0, val, 0, 0);
                 // and through the policy: only the untouched image (or a changed tag) may be allowed
-                sat_input_t in = { cdb, out.cb_len, out.dir_in, out.xfer_len, true, true };
+                sat_input_t in = { cdb, out.cb_len, out.dir_in, out.xfer_len, true, true, false, 0, 0, 0 };
+                set_caps(&in, &FULL_CAPS);
                 sat_taskfile_t tf;
                 bool allowed = sat_policy_check(&in, &tf).allow;
                 bool exp_allow = (pos < 0) || (pos >= 4 && pos <= 7) || m[pos] == img[pos];
@@ -708,7 +766,8 @@ int main(void) {
         sat_cbw_t o;
         n_checks++;
         if (!sat_cbw_parse(out_img, 0, cdb, 512, &o) || o.dir_in) { n_fail++; printf("  FAIL data-out CBW parse\n"); }
-        sat_input_t in = { cdb, o.cb_len, o.dir_in, o.xfer_len, true, true };
+        sat_input_t in = { cdb, o.cb_len, o.dir_in, o.xfer_len, true, true, false, 0, 0, 0 };
+        set_caps(&in, &FULL_CAPS);
         sat_taskfile_t tf;
         n_checks++;
         if (sat_policy_check(&in, &tf).allow) { n_fail++; printf("  FAIL data-out CBW allowed\n"); }
@@ -727,7 +786,8 @@ int main(void) {
                     mimic[10] = (uint8_t)hi;           // try 0x0001xxxx as well
                     sat_cbw_t mo;
                     if (!sat_cbw_parse(mimic, 0, v, (uint16_t)real, &mo)) continue;
-                    sat_input_t mi = { v, mo.cb_len, mo.dir_in, mo.xfer_len, true, true };
+                    sat_input_t mi = { v, mo.cb_len, mo.dir_in, mo.xfer_len, true, true, false, 0, 0, 0 };
+                    set_caps(&mi, &FULL_CAPS);
                     n_checks++;
                     if (sat_policy_check(&mi, &tf).allow) { n_fail++; printf("  FAIL non-data row allowed through a data-out mimic, len %u\n", real); }
                 }
@@ -739,6 +799,68 @@ int main(void) {
             sat_cbw_parse(img, 0, cdb, 512, NULL)) { n_fail++; printf("  FAIL cbw parse NULL\n"); }
     }
     printf("[10] CBW parse: %ld cases\n", n_checks - c0);
+
+    // 11. The drive's IDENTIFY. Every seed (so every row) against every
+    //     combination of: IDENTIFY captured or not; bits 15:14 of word 83 and
+    //     of word 84 (00, 01, 10, 11); the four feature bits the policy reads
+    //     (82.0, 82.10, 83.10, 84.0); and the other bits of the three words
+    //     all clear or all set (so a check on the wrong bit shows up); in LBA
+    //     and CHS mode, and unmounted (NOT READY must still come first). Word 82 is kept non-zero by bit 14 (NOP) when its
+    //     other bits are clear. Then word 82 = 0000h and FFFFh with valid
+    //     83/84, which must count as "not reported".
+    section = "11 identify";
+    a0 = n_allow; c0 = n_checks;
+    for (int i = 0; i < n_seeds; i++)
+        for (unsigned combo = 0; combo < 1024u; combo++) {
+            idcaps_t k;
+            bool other = (combo & 1u) != 0;
+            k.captured = (combo & 2u) != 0;
+            unsigned s83 = (combo >> 2) & 3u, s84 = (combo >> 4) & 3u;
+            bool b82_0 = ((combo >> 6) & 1u) != 0, b82_10 = ((combo >> 7) & 1u) != 0;
+            bool b83_10 = ((combo >> 8) & 1u) != 0, b84_0 = ((combo >> 9) & 1u) != 0;
+            k.w82 = (uint16_t)((b82_0 ? 0x0001u : 0u) | (b82_10 ? 0x0400u : 0u) | (other ? 0xFBFEu : 0x4000u));
+            k.w83 = (uint16_t)((s83 << 14) | (b83_10 ? 0x0400u : 0u) | (other ? 0x3BFFu : 0u));
+            k.w84 = (uint16_t)((s84 << 14) | (b84_0 ? 0x0001u : 0u) | (other ? 0x3FFEu : 0u));
+            caps = k;
+            check(seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, true, true);
+            check(seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, true, false);
+            check(seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, false, true);
+        }
+    for (int i = 0; i < n_seeds; i++) {
+        static const uint16_t w82s[] = { 0x0000, 0xFFFF };
+        for (unsigned j = 0; j < 2; j++) {
+            caps = FULL_CAPS; caps.w82 = w82s[j];
+            check(seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, true, true);
+        }
+    }
+    printf("[11] IDENTIFY words 82..84: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
+
+    // 11b. The same rule stated directly: with no IDENTIFY captured, or one
+    //      from a drive older than ATA-4 (words 83/84 without the 01b
+    //      signature, even with every feature bit set), a seed is allowed
+    //      exactly when it is IDENTIFY, READ SECTORS or READ VERIFY.
+    section = "11b ungated";
+    a0 = n_allow; c0 = n_checks;
+    {
+        static const idcaps_t none[] = {
+            { false, 0x4401, 0x4400, 0x4001 },     // good words, but not captured for this drive
+            { true,  0x0401, 0x0400, 0x0001 },     // pre-ATA-4: no signature
+            { true,  0xFFFF, 0xFFFF, 0xFFFF },     // floating bus
+            { true,  0x0000, 0x0000, 0x0000 },
+        };
+        for (unsigned j = 0; j < sizeof(none) / sizeof(none[0]); j++) {
+            caps = none[j];
+            for (int i = 0; i < n_seeds; i++) {
+                uint8_t cmd = seeds[i].len == 16 ? seeds[i].cdb[14] : seeds[i].cdb[9];
+                bool want = cmd == 0xEC || cmd == 0x20 || cmd == 0x21 || cmd == 0x40;
+                if (check(seeds[i].cdb, seeds[i].len, seeds[i].dir_in, seeds[i].xfer, true, true) != want) {
+                    n_fail++; printf("  FAIL ungated rule, IDENTIFY case %u, command %02X\n", j, cmd);
+                }
+            }
+        }
+    }
+    printf("[11b] no usable IDENTIFY, direct: %ld cases, %ld allowed\n", n_checks - c0, n_allow - a0);
+    caps = FULL_CAPS;
 
     printf("\n%ld assertions, %ld allowed, %ld refused, %ld failures\n", n_checks, n_allow, n_refuse, n_fail);
     if (n_fail) { printf("SAT POLICY TEST: FAIL\n"); return 1; }

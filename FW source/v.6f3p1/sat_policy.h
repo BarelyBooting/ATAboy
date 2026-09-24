@@ -7,18 +7,18 @@
 // shapes below, byte for byte; everything else is refused before any ATA
 // register is written.
 //
-//   ATA command                  CDB form             PROTO  count   other registers
-//   0xEC IDENTIFY DEVICE         A1 or 85             4      1       all 0
-//   0x20 READ SECTORS            A1 or 85             4      1..8    LBA28
-//   0x21 READ SECTORS (NR)       A1 or 85             4      1..8    LBA28
-//   0x24 READ SECTORS EXT        85, EXTEND=1         4      1..8    LBA48
-//   0x40 READ VERIFY SECTORS     A1 or 85             3      0..255  LBA28 (count 0 = 256)
-//   0xB0 SMART READ DATA         A1 or 85, FEAT D0    4      1       LBA low 0, mid/high 4F/C2
-//   0xB0 SMART READ THRESHOLDS   A1 or 85, FEAT D1    4      1       LBA low 0, mid/high 4F/C2
-//   0xB0 SMART READ LOG          A1 or 85, FEAT D5    4      1..8    LBA low = log address, 4F/C2
-//   0xB0 SMART RETURN STATUS     A1 or 85, FEAT DA    3 CK   0       LBA low 0, mid/high 4F/C2
-//   0xF8 READ NATIVE MAX ADDRESS A1 or 85             3 CK   0       all 0
-//   0x27 READ NATIVE MAX EXT     85, EXTEND=1         3 CK   0       all 0
+//   ATA command                  CDB form             PROTO  count   other registers               IDENTIFY must show
+//   0xEC IDENTIFY DEVICE         A1 or 85             4      1       all 0                         -
+//   0x20 READ SECTORS            A1 or 85             4      1..8    LBA28                         -
+//   0x21 READ SECTORS (NR)       A1 or 85             4      1..8    LBA28                         -
+//   0x24 READ SECTORS EXT        85, EXTEND=1         4      1..8    LBA48                         83.10
+//   0x40 READ VERIFY SECTORS     A1 or 85             3      0..255  LBA28 (count 0 = 256)         -
+//   0xB0 SMART READ DATA         A1 or 85, FEAT D0    4      1       LBA low 0, mid/high 4F/C2     82.0
+//   0xB0 SMART READ THRESHOLDS   A1 or 85, FEAT D1    4      1       LBA low 0, mid/high 4F/C2     82.0
+//   0xB0 SMART READ LOG          A1 or 85, FEAT D5    4      1..8    LBA low = log address, 4F/C2  82.0 and 84.0
+//   0xB0 SMART RETURN STATUS     A1 or 85, FEAT DA    3 CK   0       LBA low 0, mid/high 4F/C2     82.0
+//   0xF8 READ NATIVE MAX ADDRESS A1 or 85             3 CK   0       all 0                         82.10
+//   0x27 READ NATIVE MAX EXT     85, EXTEND=1         3 CK   0       all 0                         82.10 and 83.10
 //
 // "A1 or 85" means the 16-byte form with EXTEND=0. "CK" means CK_COND must be
 // 1: those commands exist to return registers, and CK_COND is how SAT hands
@@ -58,6 +58,36 @@
 // some other sector and report success. IDENTIFY, SMART and READ NATIVE MAX
 // carry no user-data address, so they are allowed in CHS mode too.
 //
+// Drive capability (added 2026-09-23, review finding H1). SMART, READ NATIVE
+// MAX and the 48-bit commands are optional in ATA, and on drives older than
+// ATA-4 their opcodes may mean something else or nothing at all. Worse, a
+// drive can implement SMART in a way that writes: the Conner CFS1275A saves
+// its attribute values to non-volatile memory on every SMART READ DATA (D0).
+// So those rows run only when the drive's own IDENTIFY DEVICE data, captured
+// by the firmware during detection (ide.c), says the drive supports them:
+//   - words 82..84 count only when bits 15:14 of word 83 AND of word 84 are
+//     01b (their validity signature), and word 82 is neither 0000h nor FFFFh
+//     (both mean "not reported"; an 83 or 84 of 0000h or FFFFh already fails
+//     the signature);
+//   - SMART rows: word 82 bit 0 (SMART feature set supported);
+//   - SMART READ LOG additionally: word 84 bit 0 (SMART error logging
+//     supported, ATA/ATAPI-5 and -6). The error log is read with SMART READ
+//     LOG, so a drive that sets this bit implements the command. Word 84 bit 5
+//     (General Purpose Logging) is not accepted instead: it covers READ LOG
+//     EXT (2Fh), a different command;
+//   - READ NATIVE MAX ADDRESS: word 82 bit 10 (Host Protected Area feature set);
+//   - READ NATIVE MAX EXT: word 82 bit 10 and word 83 bit 10 (48-bit Address
+//     feature set);
+//   - READ SECTORS EXT: word 83 bit 10. Not a safety matter like SMART, but a
+//     drive without 48-bit support would get an opcode it does not know.
+// IDENTIFY, READ SECTORS and READ VERIFY are mandatory ATA commands and are
+// not gated. When no IDENTIFY has been captured for the selected device since
+// the last detection (id_captured false: nothing detected yet, a forced
+// manual geometry after IDENTIFY failed, or a device change), every gated row
+// is refused, 5/24/00 like every other refusal: the bridge will not send that
+// CDB to this drive. The check comes after the mounted and LBA-mode checks,
+// so an unmounted drive still reports NOT READY.
+//
 // SAT reads are NOT clipped to the configured geometry (unlike READ(10)).
 // They address the drive, and the drive's own IDNF is what stops a read past
 // its end; that failure is passed on, and nothing on the SAT path zero-fills
@@ -94,6 +124,11 @@ typedef struct {
     uint32_t xfer_len;        // dCBWDataTransferLength
     bool     mounted;         // core 0 owns the IDE bus (is_mounted)
     bool     lba_mode;        // the drive was set up in LBA mode
+    // The drive's own IDENTIFY DEVICE words 82, 83 and 84 (command sets and
+    // features supported), as the firmware captured them. Meaningless unless
+    // id_captured.
+    bool     id_captured;
+    uint16_t id_w82, id_w83, id_w84;
 } sat_input_t;
 
 // The ATA task file to issue for an allowed CDB. `device` never carries the

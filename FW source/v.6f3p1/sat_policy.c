@@ -32,6 +32,30 @@
 #define SAT_BYTE2_CK_COND        0x20
 #define SAT_BYTE2_NO_DATA_PHASE  0x0C
 
+// What the drive's IDENTIFY says it supports (sat_policy.h, "Drive
+// capability"). A row lists the capabilities it needs; any missing is a
+// refusal.
+#define CAP_SMART      0x01u    // word 82 bit 0: SMART feature set
+#define CAP_SMART_LOG  0x02u    // word 84 bit 0: SMART error logging (SMART READ LOG)
+#define CAP_HPA        0x04u    // word 82 bit 10: Host Protected Area feature set
+#define CAP_LBA48      0x08u    // word 83 bit 10: 48-bit Address feature set
+
+// Nothing counts without a captured IDENTIFY whose words 82..84 are valid:
+// the 01b signature in bits 15:14 of words 83 and 84, and a word 82 that is
+// not 0000h or FFFFh. (83 and 84 of 0000h or FFFFh fail the signature.)
+static unsigned drive_caps(const sat_input_t *in) {
+    if (!in->id_captured) return 0;
+    if ((in->id_w83 & 0xC000u) != 0x4000u) return 0;
+    if ((in->id_w84 & 0xC000u) != 0x4000u) return 0;
+    if (in->id_w82 == 0x0000u || in->id_w82 == 0xFFFFu) return 0;
+    unsigned caps = 0;
+    if (in->id_w82 & (1u << 0))  caps |= CAP_SMART;
+    if (in->id_w84 & (1u << 0))  caps |= CAP_SMART_LOG;
+    if (in->id_w82 & (1u << 10)) caps |= CAP_HPA;
+    if (in->id_w83 & (1u << 10)) caps |= CAP_LBA48;
+    return caps;
+}
+
 static sat_verdict_t refuse(uint8_t sk, uint8_t asc) {
     sat_verdict_t v = { false, sk, asc, 0x00 };
     return v;
@@ -98,6 +122,7 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
     uint8_t sectors = 0;        // PIO data-in blocks
     bool need_ck = false;       // the row exists to return registers
     bool user_data = false;     // carries a user-data address: LBA mode only
+    unsigned need = 0;          // CAP_* the drive's IDENTIFY must show
     switch (cmd) {
     case ATA_IDENTIFY:
         want_proto = SAT_PROTO_PIO_IN;
@@ -128,6 +153,7 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
     case ATA_READ_SECTORS_EXT:
         want_proto = SAT_PROTO_PIO_IN;
         user_data = true;
+        need = CAP_LBA48;       // read ext: a pre-48-bit drive does not know 0x24
         if (!is16 || !ext) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
         if (feat != 0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
         if ((dev & 0x4F) != 0x40) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);  // LBA=1, low nibble reserved
@@ -165,6 +191,7 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
         if (lba3 | lba4 | lba5) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
         if (lba1 != SMART_LBA_MID || lba2 != SMART_LBA_HIGH) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
         if (dev & 0x0F) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);   // smart: low nibble reserved
+        need = CAP_SMART;       // smart: the drive says it has SMART
         switch (feat) {
         case SMART_READ_DATA:
         case SMART_READ_THRESHOLDS:
@@ -176,6 +203,7 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
         case SMART_READ_LOG:
             // Any log address (LBA low); reading a log changes nothing.
             want_proto = SAT_PROTO_PIO_IN;
+            need = CAP_SMART | CAP_SMART_LOG;   // smart read log
             if (count == 0 || count > SAT_MAX_SECTORS) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
             sectors = count;
             break;
@@ -197,6 +225,7 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
         // MAX is refused here, so the query cannot become half of a change.
         want_proto = SAT_PROTO_NON_DATA;
         need_ck = true;
+        need = CAP_HPA;         // native max
         if (ext) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
         if (feat != 0 || count != 0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
         if (lba0 | lba1 | lba2 | lba3 | lba4 | lba5) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
@@ -207,6 +236,7 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
     case ATA_READ_NATIVE_MAX_EXT:
         want_proto = SAT_PROTO_NON_DATA;
         need_ck = true;
+        need = CAP_HPA | CAP_LBA48;     // native max ext
         if (!is16 || !ext) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);  // native max ext: 16-byte, EXTEND=1
         if (feat != 0 || count != 0) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
         if (lba0 | lba1 | lba2 | lba3 | lba4 | lba5) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
@@ -240,6 +270,9 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
     // IDENTIFY, SMART and READ NATIVE MAX name no user sector and are allowed
     // in CHS mode as well.
     if (user_data && !in->lba_mode) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
+    // The drive's own IDENTIFY must show every optional feature the row uses
+    // (sat_policy.h, "Drive capability"). No captured IDENTIFY: refused.
+    if ((drive_caps(in) & need) != need) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
 
     // Allowed. The task file is written only now, so a refusal never leaves
     // anything in it but zeros.

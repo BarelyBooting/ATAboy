@@ -8,6 +8,7 @@ property. A mutant whose text is not found, or that does not compile, is
 reported as such and makes the run fail, so it is never counted as killed.
 
     python tests/host/mutate.py            (CXX picks the compiler, default g++)
+    python tests/host/mutate.py WORD ...   only the mutants whose name contains a WORD
 """
 import os, shutil, subprocess, sys, tempfile
 
@@ -156,6 +157,24 @@ MUTANTS = [
     ('READ(10) leaves a pending SAT descriptor in place', 'usb.c',
      '    (void)lun;\n#if ATABOY_SAT\n    sat_sense_forget();     // this command may set sense of its own\n#endif\n    if (!is_mounted) return -1;',
      '    (void)lun;\n    if (!is_mounted) return -1;'),
+    # --- H1: the SAT policy gets the drive's own IDENTIFY words 82..84 ---
+    # (the policy's own gates are mutated in test/run-sat-policy-tests.ps1)
+    ('IDENTIFY words never marked valid', 'ide.c',
+     '    id_words.valid = ok;\n', ''),
+    ('a failed IDENTIFY keeps the last drive\'s words', 'ide.c',
+     '    id_words.valid = ok;\n    if (ok) {', '    if (ok) {\n        id_words.valid = true;'),
+    ('IDENTIFY words kept across a new probe', 'ide.c',
+     '    id_words.valid = false;     // a new detection', '    // a new detection'),
+    ('IDENTIFY words not tied to the device they came from', 'ide.c',
+     'out->valid = id_words.valid && id_words.dev_base == dev_base;', 'out->valid = id_words.valid;'),
+    ('word 83 kept as word 82', 'ide.c',
+     'id_words.w82 = buf[82];', 'id_words.w82 = buf[83];'),
+    ('word 83 kept as word 84', 'ide.c',
+     'id_words.w84 = buf[84];', 'id_words.w84 = buf[83];'),
+    ('SAT: policy told an IDENTIFY was captured when none was', 'sat.c',
+     '    in.id_captured = id.valid;', '    in.id_captured = true;'),
+    ('SAT: word 84 not passed to the policy', 'sat.c',
+     '    in.id_w84 = id.w84;', '    in.id_w84 = 0x4001;'),
 ]
 
 
@@ -173,7 +192,9 @@ def main():
     if base.returncode != 0:
         print('the unmutated sources must pass first'); return 2
     bad_setup, survived, killed = [], [], []
-    for name, fname, old, new in MUTANTS:
+    words = sys.argv[1:]
+    chosen = [m for m in MUTANTS if not words or any(w in m[0] for w in words)]
+    for name, fname, old, new in chosen:
         tmp = tempfile.mkdtemp(prefix='ataboy-mut-')
         src = os.path.join(tmp, 'src')
         shutil.copytree(SRC, src)
@@ -204,7 +225,8 @@ def main():
             survived.append(name)
             print(f'SURVIVED     {name}  ({summary})')
         shutil.rmtree(tmp, ignore_errors=True)
-    print(f'\n{len(killed)} killed, {len(survived)} survived, {len(bad_setup)} not run, of {len(MUTANTS)}')
+    print(f'\n{len(killed)} killed, {len(survived)} survived, {len(bad_setup)} not run, of {len(chosen)}'
+          + (f' (filtered from {len(MUTANTS)})' if words else ''))
     for n, why in bad_setup:
         print(f'  not run: {n}: {why}')
     return 0 if not survived and not bad_setup else 1
