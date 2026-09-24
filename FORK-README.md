@@ -40,7 +40,9 @@ Added in 0.6f3p6 (built and host-tested, not yet run on hardware):
 
 14. **ATA PASS-THROUGH can ask the drive about itself.** Item 6's list now also has SMART READ DATA, READ THRESHOLDS and READ LOG (PIO data-in, as before), and three non-data commands: READ VERIFY SECTORS, SMART RETURN STATUS, and READ NATIVE MAX ADDRESS in its 28-bit and 48-bit forms. The last one shows whether a drive has a Host Protected Area, which matters when imaging, since such a drive reports fewer sectors than it has. SET MAX ADDRESS, which would change that, stays refused, as do DCO, the security commands and every write. With CK_COND set, or when the drive reports an error, the host gets the drive's registers back as an ATA Status Return descriptor in descriptor-format sense, so it can read the answer, or the LBA where a read or verify failed. That sense is 22 bytes; a host that asks for less gets it cut short. SMART and READ NATIVE MAX also work in CHS mode, since they don't name a sector. Reads and verify are still LBA mode only. Built and host-tested, not yet tried on hardware.
 
-The fork's build calls itself `0.6f3p6-palimpsest` and shows `v0.6f3p6 (fork)` in the setup screen (0.6f3p1 before items 6 to 14), so it can't be mistaken for a stock v0.6f3.
+15. **Firmware updates without the BOOTSEL button.** On the main menu, with no drive mounted, press **B** and answer **Y** to "Enter firmware update mode (Y/N)?". The ATAboy reboots into the RP2350's own bootloader, the same mode holding BOOTSEL gives, so a new UF2 can be copied over or loaded with picotool. The button still works as before and is the way back if a build won't start. B does nothing while a drive is mounted.
+
+The fork's build calls itself `0.6f3p6-palimpsest` and shows `v0.6f3p6 (fork)` in the setup screen (0.6f3p1 before items 6 to 15), so it can't be mistaken for a stock v0.6f3.
 
 ## Builds
 

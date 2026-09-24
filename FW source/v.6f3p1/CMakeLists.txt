@@ -57,6 +57,7 @@ pico_enable_stdio_usb(ATAboy 0)
 # Link libraries
 target_link_libraries(ATAboy
         pico_stdlib
+        pico_bootrom
         pico_multicore
         hardware_flash
         hardware_sync

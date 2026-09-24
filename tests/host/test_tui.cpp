@@ -18,6 +18,7 @@ static inline bool time_reached(absolute_time_t t) { return get_absolute_time() 
 #include "menus.c"
 
 uint64_t mock_now_ns = 0;
+int mock_usb_boot_requests = 0;
 uint32_t mock_gpio_out = 0;
 MockSio mock_sio;
 bool mock_intrq(void) { return false; }
@@ -101,8 +102,10 @@ int main(int argc, char **argv) {
     reset_state();
     strcpy(hdd_model_raw, "WDC AC280"); cur_cyls = 980; cur_heads = 10; cur_spt = 17;
     current_screen = SCREEN_MOUNTED;
+    is_mounted = true;              // as the firmware has it on this screen
     draw_bios_frame(); update_main_menu(); draw_confirm_box("Drive mounted!  Press 'U' to Unmount");
     save(dir, "mounted");
+    is_mounted = false;
 
     reset_state();
     current_screen = SCREEN_DEBUG;

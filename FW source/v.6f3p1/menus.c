@@ -9,6 +9,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include "pico/stdlib.h"
+#include "pico/bootrom.h"
 #include "ide.h"
 #include "config.h"
 #include "pico/util/queue.h"
@@ -343,7 +344,9 @@ static void update_main_menu(void) {
 
     cdc_printf("\033[19;3H ESC: Quit to Main Menu                         "
                BOX_ARRU " " BOX_ARRD " " BOX_ARRR " " BOX_ARRL ": Select Item");
-    cdc_puts("\033[20;3H F10: Save Current Setup to EEPROM               Enter: Select");
+    // B (firmware update) only works with nothing mounted, so only offer it then.
+    cdc_puts(is_mounted ? "\033[20;3H F10: Save Current Setup to EEPROM               Enter: Select"
+                        : "\033[20;3H F10: Save Current Setup to EEPROM   B: Firmware Update   Enter: Select");
 
     draw_hdd_status();
 }
@@ -866,6 +869,7 @@ void core1_entry(void) {
                 else if (confirm_type == 1) draw_confirm_box("Save Current Setup to EEPROM (Y/N)?");
                 else if (confirm_type == 3) draw_confirm_box("Are you sure you want to mount the drive (Y/N)?");
                 else if (confirm_type == 4) draw_confirm_box("Are you sure you want to unmount (Y/N)?");
+                else if (confirm_type == 5) draw_confirm_box("Enter firmware update mode (Y/N)?");
                 trigger_overlay = false;
             }
         } else if (current_screen == SCREEN_MOUNTED) {
@@ -970,6 +974,18 @@ void core1_entry(void) {
                 else if (confirm_type == 1) { sync_to_config(); config_save(); current_screen = confirm_return_screen; }
                 else if (confirm_type == 3) { is_mounted = true; media_changed_waiting = true; current_screen = SCREEN_MOUNTED; }
                 else if (confirm_type == 4) { is_mounted = false; media_changed_waiting = true; current_screen = SCREEN_MAIN; }
+                else if (confirm_type == 5) {
+                    // Reboot into the RP2350 ROM bootloader (USB drive + picotool),
+                    // so new firmware can be loaded without holding BOOTSEL. Only
+                    // reachable from the main menu with nothing mounted; checked
+                    // again here in case that changed while the prompt was up.
+                    if (!is_mounted) {
+                        cdc_puts("\033[2J\033[1;1H" RESET "Rebooting into firmware update mode...\r\n");
+                        sleep_ms(300);                  // let core 0 send it before the reset
+                        reset_usb_boot(0, 0);           // does not return
+                    }
+                    current_screen = SCREEN_MAIN;
+                }
                 needs_full_redraw = true;
             } else if (k == 'n' || k == 'N' || k == KEY_ESC) {
                 current_screen = (confirm_type == 1) ? confirm_return_screen :
@@ -980,6 +996,11 @@ void core1_entry(void) {
         }
 
         if (k == KEY_F10) { confirm_return_screen = current_screen; current_screen = SCREEN_CONFIRM; confirm_type = 1; trigger_overlay = true; needs_full_redraw = true; continue; }
+        // B on the main menu, nothing mounted: ask before rebooting into the
+        // ROM bootloader for a firmware update.
+        if (current_screen == SCREEN_MAIN && !is_mounted && (k == 'b' || k == 'B')) {
+            current_screen = SCREEN_CONFIRM; confirm_type = 5; trigger_overlay = true; needs_full_redraw = true; continue;
+        }
 
         if (current_screen == SCREEN_MAIN) {
             if (k == KEY_UP) {
