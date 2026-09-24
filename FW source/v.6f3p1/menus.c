@@ -865,6 +865,9 @@ void core1_entry(void) {
         int k = get_input();
         if (k == -1) { tight_loop_contents(); continue; }
 
+        // Ctrl+L: redraw the whole screen, e.g. after a terminal resize (issue #9)
+        if (k == 12) { needs_full_redraw = true; continue; }
+
         if (show_detect_result) {
             if (k == KEY_ENTER || k == KEY_ESC) {
                 show_detect_result = false; hdd_status_text[0] = '\0'; hdd_model_raw[0] = '\0';
