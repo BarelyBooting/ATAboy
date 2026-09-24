@@ -5,6 +5,14 @@
 // also answers IDENTIFY DEVICE (0xEC), READ VERIFY (0x40), SMART (0xB0: D0,
 // D1, D5, DA), READ NATIVE MAX ADDRESS (0xF8) and its EXT form (0x27), and
 // reads back the HOB bytes when Device Control has HOB set.
+//
+// Timing and signals the SAT start-of-command rule depends on: a drive can
+// take longer than ATA's 400 ns to raise BSY (t_bsy_delay), and it drives
+// INTRQ (active high, only while selected and nIEN is 0) when a command ends
+// or a data block is ready; reading Status (not Alternate Status), writing
+// the command register, or SRST releases it. INTRQ can also be not wired or
+// stuck high. A drive can ignore a command outright (ignore_cmd: no BSY, no
+// INTRQ, status unchanged) or end one with DF (device fault) set.
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -57,6 +65,20 @@ struct SimDrive {
     uint8_t  hang_cmd = 0;                  // this command byte never finishes (0 = none)
     bool     nondata_drq = false;           // a non-data command wrongly ends with DRQ
     uint64_t t_nondata = 1000000;           // non-data command that touches no sector
+    // BSY rises this long after the 400 ns ATA allows (0 = at 400 ns). Until
+    // then status reads as it did before the command.
+    uint64_t t_bsy_delay = 0;
+    uint8_t  ignore_cmd = 0;                // this command byte is ignored: no BSY, no INTRQ (0 = none)
+    // Device fault: this command ends with DF (status 70h) and ERR clear,
+    // error register 0; for a PIO data-in command after its last block, or,
+    // with df_before_data, instead of the first block. 0 = none.
+    uint8_t  df_cmd = 0;
+    bool     df_before_data = false;
+    // INTRQ. intrq is the drive's interrupt pending; the line is high when
+    // it is, the drive is selected and nIEN (Device Control bit 1) is 0.
+    bool     intrq = false;
+    bool     intrq_wired = true;            // false: the line always reads low
+    bool     intrq_stuck = false;           // true: the line always reads high
     // IDENTIFY DEVICE (0xEC). Words 82..84 are what the firmware keeps; the
     // defaults say what this drive answers: SMART (82.0), HPA (82.10),
     // 48-bit (83.10), SMART error logging (84.0), and the 01b signature in
@@ -85,6 +107,10 @@ struct SimDrive {
     uint8_t  status_before_srst = 0x50;
     uint64_t srst_released_at = 0;
     uint8_t  nd_status = 0x50;              // status a non-data command ends with
+    // A non-data command's output registers appear when it ends, not when it
+    // starts: until then the task file reads as the host wrote it.
+    uint8_t  cmd_reg[8] = {0}, cmd_hob[8] = {0};    // as written, at the command
+    uint8_t  nd_reg[8] = {0}, nd_hob[8] = {0}, nd_error = 0;
 
     // bookkeeping for the tests
     int srst = 0, init_params = 0, violations = 0, commands = 0;
@@ -141,19 +167,23 @@ struct SimDrive {
             }
             return;
         }
-        if (phase == BUSY_IN && now >= ready_at) resolve_sector();
+        if (phase == BUSY_IN && now >= ready_at) { resolve_sector(); if (phase != HUNG) intrq = true; }
         if (phase == BUSY_ND && now >= ready_at) {
+            for (int i = 0; i < 8; i++) { reg[i] = nd_reg[i]; hob[i] = nd_hob[i]; }
+            error = nd_error;
             if (nondata_drq && !(nd_status & 0x01)) {
                 for (int i = 0; i < 256; i++) xfer[i] = 0xDEAD;
                 widx = 0; left = 1; phase = DRQ_IN; status = 0x58;
             } else { phase = IDLE; status = nd_status; }
+            intrq = true;
         }
-        if (phase == BUSY_OUT && now >= ready_at) { phase = DRQ_OUT; widx = 0; status = 0x58; }
+        if (phase == BUSY_OUT && now >= ready_at) { phase = DRQ_OUT; widx = 0; status = 0x58; }   // no INTRQ for the first block out
         if (phase == BUSY_COMMIT && now >= ready_at) {
             if (left == 0) { phase = IDLE; status = 0x50; }
             else { phase = DRQ_OUT; widx = 0; status = 0x58; }
+            intrq = true;
         }
-        if (phase == IDLE && (status & 0x80) && now >= ready_at) status = 0x50;
+        if (phase == IDLE && (status & 0x80) && now >= ready_at) { status = 0x50; intrq = true; }
     }
 
     void fail_here(uint8_t err, bool offer) {
@@ -189,6 +219,7 @@ struct SimDrive {
     }
 
     void resolve_sector() {
+        if (df_cmd && cmd == df_cmd && df_before_data) { error = 0; phase = IDLE; status = 0x70; return; }
         if (cmd == 0xEC) { fill_identify(); widx = 0; phase = DRQ_IN; status = 0x58; return; }
         if (cmd == 0xB0) {                  // SMART data: always readable
             for (int i = 0; i < 256; i++) xfer[i] = byte_at(cur, 2 * i) | (byte_at(cur, 2 * i + 1) << 8);
@@ -222,16 +253,27 @@ struct SimDrive {
 
     bool selected() const { return ((reg[6] >> 4) & 1) == (slave ? 1 : 0); }
 
-    uint8_t read_status(uint64_t now) {
+    // alt: Alternate Status (control block), which does not release INTRQ.
+    uint8_t read_status(uint64_t now, bool alt = false) {
         if (!selected()) return 0xFF;              // no such device: the ATAboy bus floats high (ide.c probe filter)
+        if (!alt) intrq = false;                   // reading Status releases INTRQ
         if (phase == IN_RESET && !(devctl & 0x04) && now < srst_released_at + 2000000)
             return status_before_srst & ~0x80;     // stale during the 2 ms window
         // ATA: status is not valid for 400 ns after a command is written;
-        // this drive keeps showing the pre-command status in that window.
-        if (commands > 0 && now < cmd_at + 400) return status_at_cmd;
+        // this drive keeps showing the pre-command status in that window,
+        // and for t_bsy_delay more if it is slow to raise BSY.
+        if (commands > 0 && now < cmd_at + 400 + t_bsy_delay) return status_at_cmd;
         tick(now);
+        if (!alt) intrq = false;                   // ...including one raised by that tick
         if ((status & 0x80) && garbage_while_busy) return 0x81;
         return status;
+    }
+
+    bool intrq_line(uint64_t now) {
+        if (!intrq_wired) return false;
+        if (intrq_stuck) return true;
+        tick(now);
+        return intrq && selected() && !(devctl & 0x02);
     }
 
     uint16_t read_reg(int r, uint64_t now) {
@@ -264,7 +306,10 @@ struct SimDrive {
         commands++; cmd_count[c]++;
         if (status & 0x88) violations++;       // command written while BSY or DRQ
         status_at_cmd = status; cmd_at = now;
+        intrq = false;                         // writing the command register releases INTRQ
+        if (ignore_cmd && c == ignore_cmd) return;   // no BSY, no INTRQ, registers and status as they were
         cmd = c; error = 0;
+        for (int i = 0; i < 8; i++) { cmd_reg[i] = reg[i]; cmd_hob[i] = hob[i]; }
         if (hang_cmd && c == hang_cmd) { phase = HUNG; status = 0x80; return; }
         switch (c) {
         case 0x20: case 0x21: case 0x24:
@@ -278,7 +323,7 @@ struct SimDrive {
             phase = BUSY_OUT; status = 0x80; ready_at = now + 1000;
             break;
         case 0x91:
-            if (reject_idp) { phase = IDLE; status = 0x51; error = 0x04; break; }
+            if (reject_idp) { phase = IDLE; status = 0x51; error = 0x04; intrq = true; break; }
             heads = (reg[6] & 0x0F) + 1; spt = reg[2]; geo_valid = true; init_params++;
             phase = IDLE; status = 0x80; ready_at = now + 1000;
             break;
@@ -294,13 +339,16 @@ struct SimDrive {
         case 0xB0: smart(now); break;
         case 0xF8: case 0x27: native_max_cmd(c, now); break;
         default:
-            phase = IDLE; status = 0x51; error = 0x04;   // ABRT
+            phase = IDLE; status = 0x51; error = 0x04; intrq = true;   // ABRT
         }
     }
 
-    void abort_cmd() { phase = IDLE; status = 0x51; error = 0x04; }   // ABRT, at once
+    void abort_cmd() { phase = IDLE; status = 0x51; error = 0x04; intrq = true; }   // ABRT, at once
 
     void end_nondata(uint64_t now, uint64_t t, uint8_t st) {
+        if (df_cmd && cmd == df_cmd) { st = 0x70; error = 0; }     // DF, ERR clear
+        for (int i = 0; i < 8; i++) { nd_reg[i] = reg[i]; nd_hob[i] = hob[i]; reg[i] = cmd_reg[i]; hob[i] = cmd_hob[i]; }
+        nd_error = error; error = 0;
         phase = BUSY_ND; status = 0x80; nd_status = st; ready_at = now + t;
     }
 
@@ -373,6 +421,7 @@ struct SimDrive {
         tick(now);
         if (v & 0x80) hob_selects++;
         if (v & 0x04) {
+            intrq = false;
             if (!(devctl & 0x04)) { srst++; status_before_srst = status; }
             phase = IN_RESET; status = 0x80;
             reg[6] &= ~0x10;                       // SRST selects device 0
@@ -394,7 +443,7 @@ struct SimDrive {
                     if (more_after_drain) { phase = ERR_DRQ; widx = 0; }
                 } else {
                     cur++; left--;
-                    if (left == 0) { phase = IDLE; status = 0x50; }
+                    if (left == 0) { phase = IDLE; status = (df_cmd && cmd == df_cmd) ? 0x70 : 0x50; }
                     else { phase = BUSY_IN; status = 0x80; ready_at = now + sector_delay(cur); }
                 }
             }
@@ -433,7 +482,7 @@ void ide_pio_read(uint32_t count, uint16_t *buf) {
     bool cs1; int r = bus_reg(cs1);
     for (uint32_t i = 0; i < count; i++) {
         if (r < 0) { buf[i] = 0xFFFF; continue; }
-        if (cs1) buf[i] = (r == 6) ? sim.read_status(mock_now_ns) : 0xFF;  // alt status
+        if (cs1) buf[i] = (r == 6) ? sim.read_status(mock_now_ns, true) : 0xFF;  // alt status
         else if (r == 0) buf[i] = sim.read_data(mock_now_ns);
         else buf[i] = sim.read_reg(r, mock_now_ns);
     }
@@ -447,4 +496,4 @@ void ide_pio_write(uint32_t count, const uint16_t *buf) {
         else sim.write_reg(r, (uint8_t)buf[i], mock_now_ns);
     }
 }
-bool mock_intrq(void) { return false; }
+bool mock_intrq(void) { return sim.intrq_line(mock_now_ns); }

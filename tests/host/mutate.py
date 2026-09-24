@@ -128,9 +128,9 @@ MUTANTS = [
      'return (st & 0x21) ? IDE_SAT_ATA_ERROR : IDE_SAT_OK;',
      'return IDE_SAT_OK;'),
     ('SAT non-data: registers read while BSY', 'ide.c',
-     '        if (!(st & 0x80)) {                                     // other bits only valid with BSY=0\n'
+     '        if (!(st & 0x80) && w.started) {                        // other bits only valid with BSY=0\n'
      '            sat_read_outputs(tf, st, regs);',
-     '        if (1) {\n'
+     '        if (w.started) {\n'
      '            sat_read_outputs(tf, st, regs);'),
     ('SAT: HOB bytes never read for a 48-bit command', 'ide.c',
      'if (tf->ext && !aborted) {', 'if (0) {'),
@@ -175,6 +175,55 @@ MUTANTS = [
      '    in.id_captured = id.valid;', '    in.id_captured = true;'),
     ('SAT: word 84 not passed to the policy', 'sat.c',
      '    in.id_w84 = id.w84;', '    in.id_w84 = 0x4001;'),
+    # --- M1: a SAT command counts as ended only once it has visibly started ---
+    ('SAT non-data: BSY clear taken as the end before the command started (M1 as found)', 'ide.c',
+     '        if (!(st & 0x80) && w.started) {', '        if (!(st & 0x80)) {'),
+    ('SAT PIO: a stale ERR taken as this command\'s', 'ide.c',
+     '                if (w.started && (st & 0x21)) {', '                if (st & 0x21) {'),
+    ('SAT: INTRQ never taken as evidence', 'ide.c',
+     '    bool irq = w->irq_usable && gpio_get(IDE_INTRQ);   // before the status read releases it\n',
+     '    bool irq = false;\n'),
+    ('SAT: INTRQ sampled after the status read has released it', 'ide.c',
+     '    bool irq = w->irq_usable && gpio_get(IDE_INTRQ);   // before the status read releases it\n'
+     '    uint8_t st = ide_read_reg(7);\n',
+     '    uint8_t st = ide_read_reg(7);\n'
+     '    bool irq = w->irq_usable && gpio_get(IDE_INTRQ);\n'),
+    ('SAT: INTRQ believed although it was high before the command', 'ide.c',
+     '    w->irq_usable = !gpio_get(IDE_INTRQ);', '    w->irq_usable = true;'),
+    ('SAT: BSY seen does not count as started', 'ide.c',
+     '    if ((st & 0x80) || irq) w->started = true;', '    if (irq) w->started = true;'),
+    ('SAT PIO: DRQ does not count as started', 'ide.c',
+     '                if (st & 0x08) w.started = true;                // DRQ is this command\'s (sat_can_issue)\n', ''),
+    # --- M2: DF (device fault) is an error on every SAT path ---
+    ('SAT non-data: DF ignored, only ERR ends in error (review M2)', 'ide.c',
+     'return (st & 0x21) ? IDE_SAT_ATA_ERROR : IDE_SAT_OK;', 'return (st & 0x01) ? IDE_SAT_ATA_ERROR : IDE_SAT_OK;'),
+    ('SAT PIO: DF ignored at the end check (review M2)', 'ide.c',
+     'if (st & 0x21) { sat_read_outputs(tf, st, regs); return IDE_SAT_ATA_ERROR; }',
+     'if (st & 0x01) { sat_read_outputs(tf, st, regs); return IDE_SAT_ATA_ERROR; }'),
+    ('SAT PIO: DF ignored while waiting for data', 'ide.c',
+     '                if (w.started && (st & 0x21)) {', '                if (w.started && (st & 0x01)) {'),
+    ('SAT: DF reported as a medium error (review M2)', 'sat.c',
+     'else if (err == 0)   sense_with_regs(lun, SCSI_SENSE_HARDWARE_ERROR, 0x44, 0x00, &regs);',
+     'else if (err == 0)   sense_with_regs(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00, &regs);'),
+    # --- other properties from the 0.6f3p6 review's mutant list ---
+    ('SAT PIO: registers read after the drain', 'ide.c',
+     '                    sat_read_outputs(tf, st, regs);             // before the drain changes anything\n'
+     '                    if (st & 0x08) ide_drain_sector();          // don\'t leave DRQ stranded',
+     '                    if (st & 0x08) ide_drain_sector();          // don\'t leave DRQ stranded\n'
+     '                    sat_read_outputs(tf, ide_read_reg(7), regs);'),
+    ('sat_scsi does not forget a pending descriptor', 'sat.c',
+     '    sat_sense_forget();\n\n    // tud_msc_scsi_cb()', '\n    // tud_msc_scsi_cb()'),
+    ('SAT descriptor served more than once', 'sat.c',
+     '    pending.valid = false;          // one delivery', '    // one delivery'),
+    ('SAT descriptor ownership ignores ASC/ASCQ', 'sat.c',
+     '(b[2] & 0x0F) == pending.key &&\n                b[12] == pending.asc && b[13] == pending.ascq;',
+     '(b[2] & 0x0F) == pending.key;'),
+    ('WRITE(10) leaves a pending SAT descriptor in place', 'usb.c',
+     '    sat_sense_forget();     // this command may set sense of its own\n#endif\n'
+     '    if (!is_mounted || config.drive_write_protected) return -1;',
+     '#endif\n    if (!is_mounted || config.drive_write_protected) return -1;'),
+    ('SAT: HOB bytes read with HOB clear', 'ide.c',
+     '        ide_write_control(0x80);\n        r->hob_count', '        ide_write_control(0x00);\n        r->hob_count'),
 ]
 
 

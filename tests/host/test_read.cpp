@@ -863,6 +863,9 @@ static void test_sat_read_error_registers() {
     s = sat_cmd(pt12(4, 0x0E, 0, 4, (bad28 - 1) & 0xFFFFFF, 0xE0, 0x20), 4 * 512, true);
     CHECK(is_desc(s.sense) && desc_lba28(s.sense) == bad28 && s.sense[10] == 0, "28-bit failing LBA %x",
           is_desc(s.sense) ? desc_lba28(s.sense) : 0u);
+    // STATUS is what ended the command (ERR with the flawed block on offer),
+    // read before the drain, not what the drive shows after it.
+    CHECK(is_desc(s.sense) && s.sense[21] == 0x59, "status %02x, want 59", is_desc(s.sense) ? s.sense[21] : 0);
     CHECK(sim.srst == 0 && sim.violations == 0, "srst %d violations %d", sim.srst, sim.violations);
     sim.bad.clear();
     s = sat_cmd(pt12(4, 0x0E, 0, 2, 100, 0xE0, 0x20), 1024, true);
@@ -912,6 +915,42 @@ static void test_sat_sense_delivery() {
     SatResult t = sat_cmd(smart_status12(), 0, false, 32, false);
     CHECK(!t.called && sim.commands == cmds, "callback ran with sense pending");
     request_sense(32);
+
+    // The descriptor belongs to one command and one REQUEST SENSE. Below,
+    // the test sets TinyUSB's sense directly, standing in for any other path
+    // that sets the same or a similar sense later; the SAT registers must
+    // never be paired with it.
+    // Delivered once, even if the same key/ASC/ASCQ comes back.
+    s = sat_cmd(smart_status12(), 0, false);            // 01/00/1D, delivered
+    CHECK(is_desc(s.sense), "CK_COND descriptor");
+    tud_msc_set_sense(0, 0x01, 0x00, 0x1D);
+    rs = request_sense(32);
+    CHECK(rs.size() == 18 && rs[0] == 0xF0, "descriptor served twice: size %zu", rs.size());
+    // Same sense key, other ASC: not ours.
+    sim.bad[4100] = {BAD_ERR, 0};
+    s = sat_cmd(verify12(0x00, 1, 4100), 0, false, 32, false);   // 03/11/00 with registers, pending
+    tud_msc_set_sense(0, 0x03, 0x0C, 0x00);
+    rs = request_sense(32);
+    CHECK(rs.size() == 18 && rs[0] == 0xF0 && rs[12] == 0x0C, "same key, other ASC: size %zu", rs.size());
+    // TinyUSB dropped its sense without a REQUEST SENSE (a bulk-only reset,
+    // say), then another SAT command ran and ended without sense: the old
+    // descriptor must be gone by then.
+    s = sat_cmd(verify12(0x00, 1, 4100), 0, false, 32, false);   // pending again
+    last_key = last_asc = last_ascq = 0;
+    SatResult id = sat_cmd(pt12(4, 0x0E, 0, 1, 0, 0xA0, 0xEC), 512, true);
+    CHECK(id.r == 512, "IDENTIFY: r %d", id.r);
+    tud_msc_set_sense(0, 0x03, 0x11, 0x00);
+    rs = request_sense(32);
+    CHECK(rs.size() == 18 && rs[0] == 0xF0, "descriptor outlived the next SAT command: size %zu", rs.size());
+    // A WRITE(10) in between drops it, as READ(10) does.
+    config.drive_write_protected = false;
+    s = sat_cmd(verify12(0x20, 1, 10), 0, false, 32, false);     // 01/00/1D, pending
+    std::vector<uint8_t> wb(512, 0x5A);
+    r = tud_msc_write10_cb(0, 30, 0, wb.data(), 512);
+    CHECK(r == 512, "WRITE(10) ok: r %d", r);
+    rs = request_sense(32);
+    CHECK(rs.size() == 18 && rs[0] == 0xF0, "stale descriptor after WRITE(10): size %zu", rs.size());
+    sim.bad.clear();
 }
 
 // The optional SAT commands run only when the drive's own IDENTIFY, captured
@@ -1022,6 +1061,168 @@ static void test_sat_identify_gate() {
     CHECK(sim.violations == 0 && sim.srst == 0, "violations %d srst %d", sim.violations, sim.srst);
 }
 
+// ---- review finding M1: the SAT path must see the command start ----------
+//
+// Until a drive raises BSY, status reads as it did before the command. ATA
+// allows 400 ns; this drive takes 5.4 us. The answers must be the drive's,
+// never the registers the host just wrote read back (SMART "passed", native
+// max 0, verify good), and a stale ERR must not end the next command. With
+// INTRQ wired and without it (then only BSY tells).
+static bool sat_data_is_medium(const SatResult &s, uint32_t lba) {
+    for (size_t i = 0; i < s.data.size(); i++)
+        if (s.data[i] != sim.byte_at(lba + (uint32_t)(i / 512), (int)(i % 512))) return false;
+    return !s.data.empty();
+}
+
+static void test_sat_slow_bsy() {
+    for (int wired = 1; wired >= 0; wired--) {
+        std::string n = std::string("SAT, drive 5 us late raising BSY, INTRQ ") + (wired ? "wired" : "not wired");
+        setup(n.c_str(), LBA);
+        sim.intrq_wired = wired != 0;
+        sim.t_bsy_delay = 5000;
+        sim.nsect = 156250000; sim.native_max = 156301488;
+        sim.smart_exceeded = true;                  // the host writes 4F/C2; the drive answers F4/2C
+        // Each command below starts from an idle drive (settle()), so one that
+        // was wrongly taken as finished cannot hide the next one's result.
+        auto settle = [] { mock_now_ns += 5000000; };
+        SatResult s = sat_cmd(smart_status12(), 0, false);
+        CHECK(is_desc(s.sense) && sense_is(s.sense, 0x01, 0x00, 0x1D) && s.sense[17] == 0xF4 && s.sense[19] == 0x2C,
+              "SMART RETURN STATUS: %02x/%02x (4F/C2 is what the host wrote)",
+              is_desc(s.sense) ? s.sense[17] : 0, is_desc(s.sense) ? s.sense[19] : 0);
+        settle();
+        s = sat_cmd(native_max12(), 0, false);
+        CHECK(is_desc(s.sense) && desc_lba28(s.sense) == 156301487u, "READ NATIVE MAX: %u",
+              is_desc(s.sense) ? desc_lba28(s.sense) : 0u);
+        settle();
+        s = sat_cmd(native_max_ext16(), 0, false);
+        CHECK(is_desc(s.sense) && desc_lba48(s.sense) == 156301487ull, "READ NATIVE MAX EXT: %llu",
+              is_desc(s.sense) ? (unsigned long long)desc_lba48(s.sense) : 0ull);
+        sim.bad[5000] = {BAD_ERR, 0};
+        settle();
+        s = sat_cmd(verify12(0x00, 8, 4996), 0, false);
+        CHECK(!s.ok() && is_desc(s.sense) && sense_is(s.sense, 0x03, 0x11, 0x00) && desc_lba28(s.sense) == 5000,
+              "verify over a bad sector: r %d", s.r);
+        // The drive still shows ERR from that verify. Neither path may take
+        // it as the next command's ending.
+        mock_now_ns += 700000000;                   // the failed verify has ended (600 ms bad sector)
+        s = sat_cmd(pt12(4, 0x0E, 0, 2, 100, 0xE0, 0x20), 1024, true);
+        CHECK(s.r == 1024 && sat_data_is_medium(s, 100), "PIO read after an ERR: r %d", s.r);
+        s = sat_cmd(verify12(0x00, 8, 4996), 0, false);
+        CHECK(!s.ok(), "verify fails again");
+        mock_now_ns += 700000000;
+        s = sat_cmd(verify12(0x00, 4, 100), 0, false);
+        CHECK(s.r == 0 && s.sense.empty(), "good verify after an ERR: r %d sense %zu", s.r, s.sense.size());
+        CHECK(sim.srst == 0 && sim.violations == 0 && sim.data_reads == 512, "srst %d violations %d data reads %d",
+              sim.srst, sim.violations, sim.data_reads);
+    }
+}
+
+// A drive that never starts the command (no BSY, no INTRQ, status as it was)
+// must end in an abort with SRST, never in success; also with INTRQ stuck
+// high, and on the PIO path with a stale ERR showing.
+static void test_sat_never_starts() {
+    setup("SAT, drive ignores the command", LBA);
+    const uint8_t ignored[] = { 0xB0, 0xF8, 0x40 };
+    const std::vector<uint8_t> cdbs[] = { smart_status12(), native_max12(), verify12(0x00, 1, 100) };
+    for (int stuck = 0; stuck < 2; stuck++) {
+        sim.intrq_stuck = stuck != 0;
+        for (int i = 0; i < 3; i++) {
+            sim.ignore_cmd = ignored[i];
+            int srst0 = sim.srst;
+            uint64_t t0 = mock_now_ns;
+            SatResult s = sat_cmd(cdbs[i], 0, false);
+            uint64_t ms = (mock_now_ns - t0) / 1000000;
+            CHECK(!s.ok() && s.sense.size() == 18 && sense_is(s.sense, 0x0B, 0x00, 0x00) && sim.srst > srst0,
+                  "INTRQ %s, %02X ignored: r %d sense %zu srst %d", stuck ? "stuck high" : "normal", ignored[i], s.r,
+                  s.sense.size(), sim.srst - srst0);
+            CHECK(ms >= 10000 && ms < 12000, "%02X: gave up after %llu ms", ignored[i], (unsigned long long)ms);
+        }
+    }
+    sim.intrq_stuck = false;
+    // PIO: a stale ERR, then a read the drive ignores
+    sim.ignore_cmd = 0;
+    sim.bad[5000] = {BAD_ERR, 0};
+    sat_cmd(verify12(0x00, 1, 5000), 0, false);
+    sim.ignore_cmd = 0x20;
+    int srst0 = sim.srst;
+    SatResult s = sat_cmd(pt12(4, 0x0E, 0, 1, 100, 0xE0, 0x20), 512, true);
+    CHECK(!s.ok() && s.sense.size() == 18 && sense_is(s.sense, 0x0B, 0x00, 0x00) && sim.srst > srst0,
+          "PIO, ignored after an ERR: r %d sense %zu (a descriptor here is the stale ERR)", s.r, s.sense.size());
+    sim.ignore_cmd = 0;
+    sim.bad.clear();
+    HostRead h = host_read10(1000, 8);
+    CHECK(h.ok && matches_medium(h, 1000), "usable after the aborts");
+    CHECK(sim.violations == 0 && sim.data_reads == 8 * 256, "violations %d data reads %d", sim.violations, sim.data_reads);
+}
+
+// A drive so quick the command is over before the first poll: BSY is never
+// seen, but INTRQ says it ended, so the answer is taken. Without INTRQ the
+// same command cannot be told from one never started: aborted, not GOOD.
+static void test_sat_fast_command() {
+    setup("SAT, command over before the first poll", LBA);
+    sim.t_nondata = 0; sim.t_sector = 0;
+    sim.smart_exceeded = true;
+    SatResult s = sat_cmd(smart_status12(), 0, false);
+    CHECK(is_desc(s.sense) && sense_is(s.sense, 0x01, 0x00, 0x1D) && s.sense[17] == 0xF4 && s.sense[19] == 0x2C,
+          "fast SMART RETURN STATUS: size %zu", s.sense.size());
+    sim.nsect = 156250000; sim.native_max = 156301488;
+    s = sat_cmd(native_max12(), 0, false);
+    CHECK(is_desc(s.sense) && desc_lba28(s.sense) == 156301487u, "fast READ NATIVE MAX");
+    s = sat_cmd(pt12(4, 0x0E, 0, 4, 100, 0xE0, 0x20), 2048, true);
+    CHECK(s.r == 2048 && sat_data_is_medium(s, 100), "fast PIO read: r %d", s.r);
+    CHECK(sim.srst == 0, "srst %d", sim.srst);
+    // A bad sector that fails at once with its data on offer (ERR+DRQ), no
+    // BSY seen and no INTRQ: the DRQ shows the command started, so the ERR
+    // is this command's, and the flawed block is never passed on as data.
+    sim.intrq_wired = false; sim.t_bad = 0;
+    sim.bad[3000] = {BAD_ERR_DRQ, 0};
+    s = sat_cmd(pt12(4, 0x0E, 0, 2, 3000, 0xE0, 0x20), 1024, true);
+    CHECK(!s.ok() && s.data.empty() && is_desc(s.sense) && sense_is(s.sense, 0x03, 0x11, 0x00),
+          "instant ERR+DRQ: r %d sense %zu", s.r, s.sense.size());
+    if (is_desc(s.sense)) CHECK(desc_lba28(s.sense) == 3000 && s.sense[21] == 0x59, "LBA %u status %02x",
+                                desc_lba28(s.sense), s.sense[21]);
+    sim.bad.clear();
+    int srst0 = sim.srst;
+    s = sat_cmd(smart_status12(), 0, false);
+    CHECK(!s.ok() && s.sense.size() == 18 && sense_is(s.sense, 0x0B, 0x00, 0x00) && sim.srst > srst0,
+          "fast, INTRQ not wired: must abort, r %d sense %zu", s.r, s.sense.size());
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+}
+
+// ---- review finding M2: DF (device fault) ---------------------------------
+// A command that ends with DF set and ERR clear is a failure: HARDWARE ERROR
+// 4/44/00 with the drive's registers, on the non-data path and on the PIO
+// path both after the data and instead of it.
+static void test_sat_device_fault() {
+    setup("SAT, device fault (DF)", LBA);
+    sim.df_cmd = 0xB0;
+    SatResult s = sat_cmd(smart_status12(), 0, false);
+    CHECK(!s.ok() && is_desc(s.sense) && sense_is(s.sense, 0x04, 0x44, 0x00), "SMART RETURN STATUS with DF: r %d", s.r);
+    if (is_desc(s.sense)) CHECK(s.sense[21] == 0x70 && s.sense[11] == 0x00, "status %02x error %02x", s.sense[21], s.sense[11]);
+    sim.df_cmd = 0x40;
+    s = sat_cmd(verify12(0x00, 4, 100), 0, false);
+    CHECK(!s.ok() && is_desc(s.sense) && sense_is(s.sense, 0x04, 0x44, 0x00), "READ VERIFY with DF: r %d", s.r);
+    sim.df_cmd = 0xB0;                                   // after the one block of SMART READ DATA
+    s = sat_cmd(pt12(4, 0x0E, 0xD0, 1, 0xC24F00, 0xA0, 0xB0), 512, true);
+    CHECK(!s.ok() && s.data.empty() && is_desc(s.sense) && sense_is(s.sense, 0x04, 0x44, 0x00),
+          "SMART READ DATA ending with DF: r %d", s.r);
+    sim.df_cmd = 0x20;                                   // after the last of 3 blocks
+    s = sat_cmd(pt12(4, 0x0E, 0, 3, 100, 0xE0, 0x20), 3 * 512, true);
+    CHECK(!s.ok() && s.data.empty() && is_desc(s.sense) && sense_is(s.sense, 0x04, 0x44, 0x00),
+          "READ SECTORS ending with DF: r %d", s.r);
+    sim.df_before_data = true;                           // instead of the first block
+    uint64_t t0 = mock_now_ns;
+    s = sat_cmd(pt12(4, 0x0E, 0, 3, 100, 0xE0, 0x20), 3 * 512, true);
+    CHECK(!s.ok() && s.data.empty() && is_desc(s.sense) && sense_is(s.sense, 0x04, 0x44, 0x00),
+          "READ SECTORS with DF before data: r %d", s.r);
+    CHECK(mock_now_ns - t0 < 1000000000ull, "DF before data waited %llu ms (taken as a timeout)",
+          (unsigned long long)((mock_now_ns - t0) / 1000000));
+    sim.df_cmd = 0; sim.df_before_data = false;
+    CHECK(sim.srst == 0 && sim.violations == 0, "srst %d violations %d", sim.srst, sim.violations);
+    s = sat_cmd(pt12(4, 0x0E, 0, 3, 100, 0xE0, 0x20), 3 * 512, true);
+    CHECK(s.r == 3 * 512 && sat_data_is_medium(s, 100), "read after DF: r %d", s.r);
+}
+
 // Mutating and out-of-list commands are refused and reach nothing.
 static void test_sat_refusals_touch_nothing() {
     setup("SAT refusals touch nothing", LBA);
@@ -1109,6 +1310,10 @@ int main() {
     test_sat_sense_delivery();
     test_sat_refusals_touch_nothing();
     test_sat_identify_gate();
+    test_sat_slow_bsy();
+    test_sat_never_starts();
+    test_sat_fast_command();
+    test_sat_device_fault();
 #else
     test_no_sat();
 #endif

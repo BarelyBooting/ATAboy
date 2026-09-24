@@ -126,6 +126,14 @@ void ide_set_iordy(bool enabled) {
 // ATA: the host must wait at least 400 ns after writing the command register
 // before reading status. Until then the drive may not have raised BSY yet, so
 // status can still show the end of the previous command, including its ERR.
+//
+// The READ(10) and WRITE(10) paths, INITIALIZE DEVICE PARAMETERS (0x91),
+// RECALIBRATE and IDENTIFY all assume the drive has raised BSY by the time
+// this 1 us is up: their first status read takes BSY clear as "finished"
+// (the reads and writes then still need DRQ, which a stale status does not
+// have, but a stale ERR would end them early). A drive slower than that to
+// raise BSY breaks the assumption. Those paths are hardware-validated and
+// left as they are; the SAT path does not rely on it (sat_watch_t below).
 static void wait_after_command(void) {
     busy_wait_us_32(1);
 }
@@ -744,6 +752,49 @@ static bool sat_can_issue(void) {
     return true;
 }
 
+// Has the drive visibly started the SAT command we just wrote? (Review
+// finding M1.) Before it raises BSY, which ATA allows it 400 ns for and a slow
+// drive can take longer over, status still reads as it did before the
+// command: DRDY with BSY clear, and ERR if the last command failed. Taking
+// that as the end would hand the host the registers it just wrote as the
+// drive's answer (READ VERIFY "good", SMART "passed", READ NATIVE MAX 0), and
+// a command the drive never started would never be aborted. So on the SAT
+// path a status with BSY clear is believed only once the command is known to
+// have started:
+//  - BSY was seen set on some poll since the command was written; or
+//  - INTRQ was high when sampled just before a status read. Reading Status
+//    releases INTRQ, so it is sampled first. Writing the command register
+//    released any earlier one, and a drive raises it only when the command
+//    ends or a block is ready, so it cannot be left over from before. It is
+//    believed only if it read low just before the command went out: a line
+//    stuck high tells us nothing (and one never wired stays low, leaving BSY).
+//  - (PIO data-in) DRQ: sat_can_issue() refused to start over a stale one.
+// If neither shows before the timeout, the command is aborted with SRST and
+// reported as a timeout, never as success.
+// nIEN is 0 throughout (ide_hw_init, and every Device Control write in this
+// file keeps it 0), so the selected drive drives INTRQ. The features menu's
+// INTRQ switch only decides whether the READ(10) path uses INTRQ to cut its
+// polling short; here INTRQ is read either way, as evidence, and it never
+// shortens a wait.
+typedef struct {
+    bool irq_usable;    // INTRQ read low just before the command was written
+    bool started;       // BSY or INTRQ (or DRQ) seen since
+} sat_watch_t;
+
+// Call after sat_can_issue() (whose status reads released INTRQ) and right
+// before sat_write_taskfile().
+static void sat_watch_arm(sat_watch_t *w) {
+    w->irq_usable = !gpio_get(IDE_INTRQ);
+    w->started = false;
+}
+
+static uint8_t sat_poll(sat_watch_t *w) {
+    bool irq = w->irq_usable && gpio_get(IDE_INTRQ);   // before the status read releases it
+    uint8_t st = ide_read_reg(7);
+    if ((st & 0x80) || irq) w->started = true;
+    return st;
+}
+
 static void sat_write_taskfile(const sat_taskfile_t *tf) {
     if (tf->ext) {
         // 48-bit: previous (HOB) value first, then current, per register
@@ -794,6 +845,8 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
     if (tf->sectors == 0 || tf->sectors > SAT_MAX_SECTORS) return IDE_SAT_NOT_ISSUED;
     if (!sat_can_issue()) return IDE_SAT_NOT_ISSUED;
 
+    sat_watch_t w;
+    sat_watch_arm(&w);
     sat_write_taskfile(tf);
 
     uint16_t *wbuf = (uint16_t *)buf;
@@ -801,9 +854,12 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
 
     for (uint32_t s = 0; s < tf->sectors; s++) {
         for (;;) {
-            uint8_t st = ide_read_reg(7);                       // also clears INTRQ
+            uint8_t st = sat_poll(&w);                          // also clears INTRQ
             if (!(st & 0x80)) {                                 // other bits only valid with BSY=0
-                if (st & 0x21) {                                // ERR, or DF (device fault)
+                if (st & 0x08) w.started = true;                // DRQ is this command's (sat_can_issue)
+                // ERR / DF before the command has started are the last
+                // command's, not this one's (sat_watch_t): keep waiting.
+                if (w.started && (st & 0x21)) {                 // ERR, or DF (device fault)
                     sat_read_outputs(tf, st, regs);             // before the drain changes anything
                     if (st & 0x08) ide_drain_sector();          // don't leave DRQ stranded
                     return IDE_SAT_ATA_ERROR;
@@ -855,12 +911,16 @@ int ide_sat_nondata(const sat_taskfile_t *tf, ide_sat_regs_t *regs) {
     if (tf->protocol != SAT_PROTO_NON_DATA || tf->sectors != 0) return IDE_SAT_NOT_ISSUED;
     if (!sat_can_issue()) return IDE_SAT_NOT_ISSUED;
 
+    sat_watch_t w;
+    sat_watch_arm(&w);
     sat_write_taskfile(tf);
 
     uint32_t start = to_ms_since_boot(get_absolute_time());
     for (;;) {
-        uint8_t st = ide_read_reg(7);                           // also clears INTRQ
-        if (!(st & 0x80)) {                                     // other bits only valid with BSY=0
+        uint8_t st = sat_poll(&w);                              // also clears INTRQ
+        // BSY clear ends the command only once it has started (sat_watch_t);
+        // before that it is the status from before the command.
+        if (!(st & 0x80) && w.started) {                        // other bits only valid with BSY=0
             sat_read_outputs(tf, st, regs);
             if (st & 0x08) {                                    // DRQ on a non-data command
                 sat_abort();
