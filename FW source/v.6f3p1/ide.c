@@ -97,6 +97,13 @@ void ide_set_iordy(bool enabled) {
     gpio_set_inover(IDE_IORDY, enabled ? GPIO_OVERRIDE_NORMAL : GPIO_OVERRIDE_HIGH);
 }
 
+// ATA: the host must wait at least 400 ns after writing the command register
+// before reading status. Until then the drive may not have raised BSY yet, so
+// status can still show the end of the previous command, including its ERR.
+static void wait_after_command(void) {
+    busy_wait_us_32(1);
+}
+
 // ---------------------------------------------------------------------------
 //  Init / Reset / Polling
 // ---------------------------------------------------------------------------
@@ -154,6 +161,7 @@ void ide_reset_drive(void) {
     // Recalibrate — seek heads to track 0 (required by some pre-ATA drives)
     ide_write_reg(6, dev_base);
     ide_write_reg(7, 0x10);
+    wait_after_command();
     ide_wait_until_ready(10000);
 
     // Restore IORDY to config setting — drive is ready for normal operation
@@ -194,6 +202,7 @@ uint8_t ide_probe_devices(void) {
         // Recalibrate (required by some pre-ATA drives)
         ide_write_reg(6, addrs[i]);
         ide_write_reg(7, 0x10);
+        wait_after_command();
         ide_wait_until_ready(10000);
 
         ide_set_iordy(config.iordy_enabled);
@@ -218,6 +227,7 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
     ide_write_reg(2, spt);
     ide_write_reg(7, 0x91);
+    wait_after_command();
     return ide_wait_until_ready(1000);
 }
 
@@ -236,8 +246,9 @@ bool ide_identify(uint16_t *buf) {
     for (uint32_t t = 0; t < 100000; t++) {
         if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
         uint8_t st = ide_read_reg(7);
+        if (st & 0x80) { busy_wait_us_32(50); continue; }  // BSY: other bits not valid yet
         if (st & 0x01) { if (st & 0x08) ide_drain_sector(); return false; }  // ERR — drain stranded DRQ
-        if (!(st & 0x80) && (st & 0x08)) goto ready;     // BSY=0, DRQ=1
+        if (st & 0x08) goto ready;                       // BSY=0, DRQ=1
         busy_wait_us_32(50);
     }
     return false;
@@ -311,6 +322,7 @@ int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
     }
 
     ide_write_reg(7, use_lba48 ? 0x24 : 0x20);            // READ SECTORS EXT / READ SECTORS
+    wait_after_command();
 
     uint16_t *wbuf = (uint16_t *)buf;
 
@@ -319,8 +331,11 @@ int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
         for (uint32_t t = 0; t < 100000; t++) {
             if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
             uint8_t st = ide_read_reg(7);
+            // While BSY is set the other status bits are not valid (ATA), so a
+            // leftover ERR must not end a command the drive is still working on.
+            if (st & 0x80) { busy_wait_us_32(10); continue; }
             if (st & 0x01) goto read_err;
-            if (!(st & 0x80) && (st & 0x08)) goto drq_read;
+            if (st & 0x08) goto drq_read;
             busy_wait_us_32(10);
         }
         goto read_err;
@@ -387,6 +402,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     }
 
     ide_write_reg(7, use_lba48 ? 0x34 : 0x30);            // WRITE SECTORS EXT / WRITE SECTORS
+    wait_after_command();
 
     const uint16_t *wbuf = (const uint16_t *)buf;
 
@@ -399,8 +415,9 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
         for (uint32_t t = 0; t < 100000; t++) {
             if (s > 0 && config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);
             uint8_t st = ide_read_reg(7);
+            if (st & 0x80) { busy_wait_us_32(10); continue; }   // BSY: other bits not valid
             if (st & 0x01) { write_ok = false; break; }
-            if (!(st & 0x80) && (st & 0x08)) { got_drq = true; break; }
+            if (st & 0x08) { got_drq = true; break; }
             busy_wait_us_32(10);
         }
         if (!write_ok || !got_drq) { write_ok = false; break; }
@@ -420,9 +437,9 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
         for (uint32_t t = 0; t < 100000; t++) {
             if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);
             uint8_t st = ide_read_reg(7);
+            if (st & 0x80) { busy_wait_us_32(10); continue; }   // BSY: other bits not valid
             if (st & 0x01) { write_ok = false; break; }
-            if (!(st & 0x80)) return (int32_t)(count * 512);
-            busy_wait_us_32(10);
+            return (int32_t)(count * 512);
         }
     }
 
@@ -475,6 +492,7 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba) {
         ide_write_reg(6, dev_base);                            // head 0, CHS
     }
     ide_write_reg(7, use_lba48 ? 0x24 : 0x20);                // READ SECTORS EXT / READ SECTORS
+    wait_after_command();
 
     // Wait for BSY to clear
     for (uint32_t t = 0; t < 10000; t++) {
