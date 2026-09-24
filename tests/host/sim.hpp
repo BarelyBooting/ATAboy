@@ -21,6 +21,14 @@
 // its power-on diagnostics, t_hw_reset long. A drive can stay busy for ever
 // after a soft reset (srst_wedges) and come back only from a hardware reset,
 // or not even then (hw_reset_wedges).
+//
+// Review 0.6f3p7 (M-1 and the LOW items): a drive in its power-on diagnostics
+// after RESET- holds IORDY low, and a PIO cycle with IORDY believed would
+// then never end on the real board (iordy_stalls counts them). A drive can
+// come out of RESET- with interrupts disabled (hw_reset_nien), take a while
+// over RECALIBRATE (t_recal), or answer IDENTIFY with ERR and a block of
+// data (identify_err_drq). The shortest RESET- pulse and the time of the last
+// SRST are kept for the tests.
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -87,6 +95,13 @@ struct SimDrive {
     uint64_t reset_low_at = 0;
     bool     wedged_before_reset = false;
     int      short_resets = 0;
+    uint64_t min_reset_low = ~0ull;         // shortest RESET- pulse seen (ns)
+    bool     hw_post = false;               // in reset from RESET-: IORDY held low
+    int      iordy_stalls = 0;              // PIO cycles with IORDY believed meanwhile
+    bool     hw_reset_nien = false;         // comes out of RESET- with nIEN set
+    uint64_t t_recal = 1000;                // RECALIBRATE (0x10) busy time
+    bool     identify_err_drq = false;      // IDENTIFY ends at once with ERR and a block
+    uint64_t srst_at = 0;                   // when SRST was last set
     // IDENTIFY takes this much longer than a sector (drive busy).
     uint64_t t_identify_extra = 0;
 
@@ -214,7 +229,7 @@ struct SimDrive {
     void tick(uint64_t now) {
         if (phase == IN_RESET) {
             if (!(devctl & 0x04) && !reset_low && !wedged && now >= ready_at) {
-                phase = IDLE; status = 0x50; error = 0x01;
+                phase = IDLE; status = 0x50; error = 0x01; hw_post = false;
                 geo_valid = false;              // SRST drops INITIALIZE DEVICE PARAMETERS
             }
             return;
@@ -279,6 +294,11 @@ struct SimDrive {
 
     void resolve_sector() {
         if (df_cmd && cmd == df_cmd && df_before_data) { error = 0; phase = IDLE; status = 0x70; return; }
+        if (cmd == 0xEC && identify_err_drq) {           // ABRT, with a block on offer
+            for (int i = 0; i < 256; i++) xfer[i] = 0xDEAD;
+            error = 0x04; widx = 0; phase = ERR_DRQ; status = 0x59; more_after_drain = false;
+            return;
+        }
         if (cmd == 0xEC) { fill_identify(); widx = 0; phase = DRQ_IN; status = 0x58; return; }
         if (cmd == 0xB0) {                  // SMART data: always readable
             for (int i = 0; i < 256; i++) xfer[i] = byte_at(cur, 2 * i) | (byte_at(cur, 2 * i + 1) << 8);
@@ -397,7 +417,7 @@ struct SimDrive {
             phase = IDLE; status = 0x80; ready_at = now + 1000;
             break;
         case 0x10:
-            phase = IDLE; status = 0x80; ready_at = now + 1000;
+            phase = IDLE; status = 0x80; ready_at = now + t_recal;
             break;
         case 0xEC:
             if (!identify_ok) { abort_cmd(); break; }
@@ -491,7 +511,7 @@ struct SimDrive {
         if (v & 0x80) hob_selects++;
         if (v & 0x04) {
             intrq = false;
-            if (!(devctl & 0x04)) { srst++; status_before_srst = status; }
+            if (!(devctl & 0x04)) { srst++; status_before_srst = status; srst_at = now; }
             phase = IN_RESET; status = 0x80;
             if (srst_wedges) wedged = true;
             reg[6] &= ~0x10;                       // SRST selects device 0
@@ -513,7 +533,8 @@ struct SimDrive {
             if (reset_low) return;
             reset_low = true; hw_resets++;
             reset_low_at = now; wedged_before_reset = wedged;
-            intrq = false; devctl = 0;
+            intrq = false; devctl = hw_reset_nien ? 0x02 : 0;
+            hw_post = true;
             phase = IN_RESET; status = 0x80; error = 0x01;
             for (int i = 0; i < 8; i++) { reg[i] = 0; hob[i] = 0; }
             geo_valid = false;
@@ -522,6 +543,7 @@ struct SimDrive {
         }
         if (!reset_low) return;                // already high: nothing happens
         reset_low = false;
+        if (now - reset_low_at < min_reset_low) min_reset_low = now - reset_low_at;
         if (now - reset_low_at < 25000) {      // too short to count
             short_resets++;
             wedged = wedged_before_reset;
@@ -581,7 +603,14 @@ inline int bus_reg(bool &cs1) {
     return (mock_gpio_out >> 20) & 7;
 }
 void ide_pio_init(void) {}
+// A cycle with IORDY believed while the drive holds it low in its power-on
+// diagnostics would never end on the board (the PIO program's wait has no
+// timeout). Counted, and the cycle goes on, so a test can report it.
+inline void iordy_check() {
+    if (mock_iordy_inover == GPIO_OVERRIDE_NORMAL && sim.hw_post && sim.phase == SimDrive::IN_RESET) sim.iordy_stalls++;
+}
 void ide_pio_read(uint32_t count, uint16_t *buf) {
+    iordy_check();
     bool cs1; int r = bus_reg(cs1);
     for (uint32_t i = 0; i < count; i++) {
         if (r < 0) { buf[i] = 0xFFFF; continue; }
@@ -591,6 +620,7 @@ void ide_pio_read(uint32_t count, uint16_t *buf) {
     }
 }
 void ide_pio_write(uint32_t count, const uint16_t *buf) {
+    iordy_check();
     bool cs1; int r = bus_reg(cs1);
     for (uint32_t i = 0; i < count; i++) {
         if (r < 0) continue;

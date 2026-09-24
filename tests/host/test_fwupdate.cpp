@@ -206,6 +206,7 @@ static void test_confirm() {
     CHECK(mock_now_ns - t0 >= 5000000000ull, "rebooted after %llu ms, while the command ran",
           (unsigned long long)((mock_now_ns - t0) / 1000000));
     CHECK(tty.find("Waiting for a USB command") != std::string::npos, "no waiting message");
+    CHECK(tty.find("Esc") == std::string::npos, "the waiting message promises Esc (review L-1)");
 
     t0 = mock_now_ns;                                   // never finishes: give up, do not reboot
     // (the Esc at 90 s ends a Y that would wait for ever, so the test ends too)
@@ -254,28 +255,43 @@ static void test_unmount_forgets_identify() {
 #endif
 }
 
-// ---- 6. review L-5: core 1 waits for a running USB command ---------------
+// ---- 6. review L-5 and L-1: core 1 and a running USB command ---------------
 // Auto Detect and every debug key that touches the bus wait for the USB side
-// to let go of it, up to IDE_BUS_WAIT_MS; Esc cancels; if it never lets go,
-// nothing is sent and the screen says so.
+// to let go of it, up to IDE_BUS_WAIT_MS. Review L-1: on the board the wait
+// can neither show a message nor see a key, since both travel through core
+// 0, which is inside the callback. So it is silent, it cannot be cancelled
+// (a key typed meanwhile is left for the menu, not taken by the wait), and
+// having waited, it does NOT do what was asked: it says a USB command was
+// running and nothing was sent. With nothing running, the key does its work.
+// (Here the mock queue delivers keys whenever they are due, which the board
+// would not; the checks below hold either way.)
 static void test_bus_wait() {
     const int dkeys[] = { 'i', 'I', 't', 'T', 'e', 'E', 's', 'S', 'r', 'R' };
+    CHECK(IDE_BUS_WAIT_MS >= IDE_HOST_BUDGET_MS + 1000, "the wait (%u ms) is shorter than a USB command may run",
+          (unsigned)IDE_BUS_WAIT_MS);
     // Each debug key, with a USB command running for another 5 s.
     for (int k : dkeys) {
         mock_now_ns += 1000000000ull;
         tty.clear(); bus_uses = 0; bus_uses_while_busy = 0;
         busy_until_ns = mock_now_ns + 5000000000ull;
         current_screen = SCREEN_DEBUG;
-        feed({ { now_us() + 5500000, 27 } });            // Esc ends the seek test
+        feed({ { now_us() + 2000000, 27 } });            // Esc typed during the wait
         uint64_t t0 = mock_now_ns;
         debug_key(k);
-        CHECK(bus_uses > 0 && bus_uses_while_busy == 0, "debug %c: %d bus uses, %d while busy", k, bus_uses, bus_uses_while_busy);
-        CHECK(mock_now_ns - t0 >= 5000000000ull, "debug %c: ran after %llu ms", k, (unsigned long long)((mock_now_ns - t0) / 1000000));
-        CHECK(tty.find("Waiting for a USB command") != std::string::npos, "debug %c: no waiting message", k);
+        uint64_t ms = (mock_now_ns - t0) / 1000000;
+        CHECK(bus_uses == 0, "debug %c: %d bus uses after waiting for the USB command", k, bus_uses);
+        CHECK(ms >= 5000 && ms < 5100, "debug %c: waited %llu ms for a command that ran 5 s", k, (unsigned long long)ms);
+        CHECK(tty.find("A USB command was running, nothing sent. Try again") != std::string::npos, "debug %c: no message", k);
+        CHECK(tty.find("Esc") == std::string::npos && tty.find("Waiting") == std::string::npos,
+              "debug %c: promises what the board cannot do", k);
+        CHECK(rxi == 0, "debug %c: the wait took a key", k);
+        // Pressed again, nothing running: it does its work.
+        feed({}); tty.clear(); bus_uses = 0;
+        debug_key(k);
+        CHECK(bus_uses > 0 && bus_uses_while_busy == 0, "debug %c again: %d bus uses", k, bus_uses);
     }
-    // Never lets go: nothing sent, and a message. (The Esc at 90 s only
-    // ends a wait that would otherwise never end.)
-    feed({ { now_us() + 90000000, 27 } });
+    // Never lets go: nothing sent, and a message.
+    feed({});
     tty.clear(); bus_uses = 0;
     busy_until_ns = mock_now_ns + 1000000000000ull;
     uint64_t t0 = mock_now_ns;
@@ -284,33 +300,31 @@ static void test_bus_wait() {
     CHECK(bus_uses == 0 && ms >= IDE_BUS_WAIT_MS && ms < IDE_BUS_WAIT_MS + 1000, "busy for ever: %d bus uses after %llu ms",
           bus_uses, (unsigned long long)ms);
     CHECK(tty.find("USB still busy") != std::string::npos, "busy for ever: no message");
-    // Esc while waiting cancels, nothing sent.
-    tty.clear(); bus_uses = 0;
-    feed({ { now_us() + 2000000, 27 } });
-    t0 = mock_now_ns;
-    debug_key('r');
-    CHECK(bus_uses == 0 && mock_now_ns - t0 < 3000000000ull && tty.find("Cancelled") != std::string::npos,
-          "Esc: %d bus uses after %llu ms", bus_uses, (unsigned long long)((mock_now_ns - t0) / 1000000));
     // Other keys wait for nothing and send nothing.
     int br = busy_reads; bus_uses = 0;
     debug_key('x'); debug_key(KEY_ENTER);
     CHECK(bus_uses == 0 && busy_reads == br, "unknown debug keys: %d bus uses, %d busy reads", bus_uses, busy_reads - br);
-    // Auto Detect: waits, then probes.
+    // Auto Detect: waits, then does not probe; says so, and a key goes on.
     mock_now_ns += 1000000000ull;
     tty.clear(); bus_uses = 0; bus_uses_while_busy = 0;
     busy_until_ns = mock_now_ns + 5000000000ull;
     current_screen = SCREEN_MAIN; show_detect_result = false;
-    feed({});
+    feed({ { now_us() + 7000000, 'x' } });
     t0 = mock_now_ns;
     bool overlay = run_auto_detect();
-    CHECK(bus_uses > 0 && bus_uses_while_busy == 0 && mock_now_ns - t0 >= 5000000000ull,
-          "auto detect: %d bus uses, %d while busy", bus_uses, bus_uses_while_busy);
-    CHECK(overlay && show_detect_result, "auto detect result box: overlay %d shown %d", overlay, show_detect_result);
+    CHECK(bus_uses == 0 && !overlay && !show_detect_result && mock_now_ns - t0 >= 5000000000ull,
+          "auto detect after a wait: %d bus uses, overlay %d", bus_uses, overlay);
+    CHECK(tty.find("A USB command was running, nothing sent. Press a key") != std::string::npos, "auto detect: no message");
+    // Pressed again, nothing running: it probes, and shows the result.
+    feed({}); tty.clear(); bus_uses = 0;
+    overlay = run_auto_detect();
+    CHECK(bus_uses > 0 && bus_uses_while_busy == 0 && overlay && show_detect_result,
+          "auto detect, nothing running: %d bus uses, overlay %d shown %d", bus_uses, overlay, show_detect_result);
     show_detect_result = false;
     // Auto Detect, never lets go: no probe, a message, and a key to go on.
     tty.clear(); bus_uses = 0;
     busy_until_ns = mock_now_ns + 1000000000000ull;
-    feed({ { now_us() + 61000000, 'x' } });
+    feed({ { now_us() + (IDE_BUS_WAIT_MS + 1000) * 1000ull, 'x' } });
     overlay = run_auto_detect();
     CHECK(bus_uses == 0 && !overlay && !show_detect_result && tty.find("USB still busy") != std::string::npos,
           "auto detect, busy for ever: %d bus uses, overlay %d", bus_uses, overlay);
@@ -342,6 +356,22 @@ static void test_debug_errors_row() {
             CHECK(nx == ' ' || nx == '\033', "row runs on after \"%s\": %d", c.tail, nx);
         }
         CHECK(want.size() <= 68, "row is %zu columns", want.size());
+        CHECK(tty.find("Reset still running") == std::string::npos, "pending shown for a finished reset");
+    }
+    // Review M-1: the drive was not back when the USB command's time ran out.
+    memset(&stub_fail, 0, sizeof stub_fail);
+    stub_fail.kind = IDE_FAIL_TIMEOUT; stub_fail.command = 0x20; stub_fail.reset = true; stub_fail.pending = true;
+    tty.clear();
+    run_debug_errors();
+    CHECK(tty.find("Reset still running: the next USB command waits for it") != std::string::npos, "pending not shown");
+    // The kinds added in 0.6f3p7: no time left, and a SAT command that ended badly.
+    struct { uint8_t kind; const char *word; } kinds[] = { { IDE_FAIL_NO_TIME, "cmd 20 no time at" },
+                                                           { IDE_FAIL_BAD_END, "cmd 20 bad end at" } };
+    for (auto &k : kinds) {
+        stub_fail.kind = k.kind; stub_fail.pending = false;
+        tty.clear();
+        run_debug_errors();
+        CHECK(tty.find(k.word) != std::string::npos, "kind %u: \"%s\" not shown", k.kind, k.word);
     }
     memset(&stub_fail, 0, sizeof stub_fail);
 }

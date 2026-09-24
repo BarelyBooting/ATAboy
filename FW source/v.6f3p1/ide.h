@@ -55,14 +55,41 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf);
 int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
                                  uint32_t *done);
 
+// ---------------------------------------------------------------------------
+//  Time for one USB host command (0.6f3p7, review M-1)
+// ---------------------------------------------------------------------------
+// Everything the firmware does for one host SCSI command (READ(10),
+// WRITE(10), ATA PASS-THROUGH) inside its MSC callbacks on core 0 fits in
+// IDE_HOST_BUDGET_MS, counted from the first callback of the command: the
+// ATA command or commands, the issue #13 call again at the failing sector,
+// draining, and any reset. Waits for the drive to do the host's work stop
+// IDE_RECOVERY_RESERVE_MS before the end, so a reset can still be started
+// and given some time inside the same host command. A reset the drive has
+// not come back from when the time is up is carried on by the next host
+// command, before anything else is sent to the drive. Reasoning in ide.c.
+#define IDE_HOST_BUDGET_MS        20000
+#define IDE_RECOVERY_RESERVE_MS   5000
+
+// usb.c: a new host command starts (its time starts now) ...
+void    ide_host_cmd_begin(void);
+// ... core 0 enters one of its callbacks (waits are cut to what is left) ...
+void    ide_host_cmd_enter(void);
+// ... and leaves it. Outside a callback nothing is cut: core 1's detection,
+// debug and auto-mount waits keep their own limits.
+void    ide_host_cmd_leave(void);
+
 // What the drive reported for the last failed sector read or write, captured
-// before any recovery step (drain or soft reset) could change it.
+// before any recovery step (drain or soft reset) could change it. Since
+// 0.6f3p7 a SAT command the firmware had to abort with a reset is recorded
+// here too (review L-2), so Debug E shows every reset.
 #define IDE_FAIL_NONE       0
 #define IDE_FAIL_NOT_READY  1   // drive not ready before the command was sent
 #define IDE_FAIL_ERR        2   // drive finished the command with ERR set
-#define IDE_FAIL_TIMEOUT    3   // no DRQ / no completion within IDE_CMD_TIMEOUT_MS (ide.c)
+#define IDE_FAIL_TIMEOUT    3   // no DRQ / no completion in the time allowed (ide.c)
 #define IDE_FAIL_STALE_DRQ  4   // drive still offering data from an earlier command
 #define IDE_FAIL_NO_GEOMETRY 5  // CHS mode, and the drive would not take our geometry
+#define IDE_FAIL_NO_TIME    6   // the host command's time was used up; nothing sent
+#define IDE_FAIL_BAD_END    7   // SAT: the drive offered data it should not have; aborted
 typedef struct {
     uint8_t  kind;          // IDE_FAIL_*
     uint8_t  command;       // ATA command that failed
@@ -70,11 +97,17 @@ typedef struct {
     uint8_t  error;         // error register (meaningful when status has ERR)
     uint8_t  tf[5];         // registers 2..6: count, sector, cyl lo, cyl hi, dev/head
     bool     drained;       // drive offered data for the failed sector; discarded
+    // The reset flags cover the whole host command this record belongs to,
+    // not only this record's own recovery: the issue #13 call again at the
+    // failing sector can fail and write a new record after the first call
+    // needed a reset, and that must stay visible (review L-2).
     bool     reset;         // a soft reset was needed to get the drive back
     bool     hw_reset;      // ...and the drive did not come back from it, so a
                             // hardware reset (RESET-, both devices) was used too
     bool     reset_failed;  // ...and the drive did not come back ready, or in CHS
                             // mode did not take the geometry again
+    bool     pending;       // the drive was not back when the host command's time
+                            // ran out; the next host command carries on with it
     uint32_t lba;           // first sector not transferred
     uint32_t done;          // sectors transferred before the failure
     uint32_t count;         // sectors requested
@@ -101,6 +134,8 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba);
 #define IDE_SAT_ATA_ERROR   2   // the drive set ERR or DF; *regs holds what it reported
 #define IDE_SAT_TIMEOUT     3   // BSY or DRQ never came; the command was aborted (SRST)
 #define IDE_SAT_BAD_END     4   // the drive offered data it should not have; aborted (SRST)
+// NOT_ISSUED also covers a drive whose reset from an earlier command is still
+// being waited for (ide.c, recovery): nothing new is sent to it until it is back.
 
 // The drive's output registers after a SAT command, read before anything else
 // could change them. Filled on IDE_SAT_ATA_ERROR, and on IDE_SAT_OK from

@@ -30,10 +30,10 @@ static uint64_t total_sectors(void) {
 // WRITE(10), and ATA PASS-THROUGH through the SCSI callback. They run on
 // core 0 inside tud_task(). Unmounting (is_mounted = false, on core 1) stops
 // new commands from reaching the drive, but not one already running, which
-// since 0.6f3p7 can take 30 s (IDE_CMD_TIMEOUT_MS) and then a soft and a
-// hardware reset, each allowed 31 s and more (ide.c). Core 1 checks this
-// before it reboots into the ROM bootloader (menus.c, firmware update), and
-// before Auto Detect and the debug commands use the bus (review L-5).
+// can take up to the host command's whole budget (IDE_HOST_BUDGET_MS, 20 s,
+// ide.h) plus a small fixed margin. Core 1 checks this before it reboots
+// into the ROM bootloader (menus.c, firmware update), and before Auto Detect
+// and the debug commands use the bus (review L-5).
 //
 // Core 0 sets the flag and then reads is_mounted; core 1 clears is_mounted
 // and then reads the flag. A full barrier sits between the write and the
@@ -56,6 +56,66 @@ static void msc_busy_end(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);    // after the callback's last bus access
     msc_ide_busy = false;
 }
+
+// ---------------------------------------------------------------------------
+//  Where one host command ends and the next begins (review M-1)
+// ---------------------------------------------------------------------------
+// ide.c gives each host SCSI command one time budget, IDE_HOST_BUDGET_MS, so
+// it has to be told which callbacks belong to one command. What TinyUSB 0.18
+// (pico-sdk 2.2.0, src/class/msc/msc_device.c) does:
+//  - A READ(10) or WRITE(10) is handed over in chunks of at most
+//    CFG_TUD_MSC_EP_BUFSIZE bytes, one tud_msc_read10_cb or
+//    tud_msc_write10_cb call per chunk, each with lba = the CDB's LBA plus
+//    the bytes done so far / 512 (proc_read10_cmd, proc_write10_new_data).
+//    A negative return fails the command there (fail_scsi_op); nothing more
+//    is asked for it.
+//  - Any other command is one tud_msc_scsi_cb call (or none, for the ones
+//    TinyUSB answers itself).
+//  - When a command's CSW has gone out, passed or failed, TinyUSB calls
+//    tud_msc_read10_complete_cb, tud_msc_write10_complete_cb or
+//    tud_msc_scsi_complete_cb (mscd_xfer_cb, MSC_STAGE_STATUS_SENT). There is
+//    no callback when a command starts.
+// So a READ(10) or WRITE(10) callback carries on the command in progress
+// only if one is in progress (no complete callback since, and no negative
+// return), in the same direction, and it starts exactly where the bytes the
+// last callback returned ended. A real continuation always meets all three,
+// so it can never be taken for a new command and given a fresh budget.
+// The other way: a command that ends without its CSW, because the host reset
+// the device, has no complete callback. After a USB reset the host sends
+// SET_CONFIGURATION again, which TinyUSB reports as tud_mount_cb, and that
+// ends it here too. A bulk-only reset has no callback of any kind; the next
+// READ(10) or WRITE(10) is then still new unless it starts exactly where the
+// abandoned one stopped, in the same direction, in which case it inherits
+// what is left of that budget (perhaps nothing, so it fails at once and the
+// host's retry starts clean). A host only resets the device when it gave up
+// on a command first, which is what the budget is there to prevent.
+static struct {
+    bool     open;          // a READ(10) or WRITE(10) in progress
+    bool     write;         // ...which of the two
+    uint32_t next_lba;      // where its next callback starts
+} rw_cmd;
+
+static void host_cmd_enter(bool rw, bool write, uint32_t lba) {
+    if (!rw || !rw_cmd.open || rw_cmd.write != write || lba != rw_cmd.next_lba)
+        ide_host_cmd_begin();
+    rw_cmd.open = rw;
+    rw_cmd.write = write;
+    ide_host_cmd_enter();
+}
+
+static void host_cmd_leave(uint32_t lba, int32_t r) {
+    ide_host_cmd_leave();
+    if (r < 0) rw_cmd.open = false;             // TinyUSB fails the command here
+    else rw_cmd.next_lba = lba + (uint32_t)r / 512;
+}
+
+void tud_msc_read10_complete_cb(uint8_t lun) { (void)lun; rw_cmd.open = false; }
+void tud_msc_write10_complete_cb(uint8_t lun) { (void)lun; rw_cmd.open = false; }
+void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
+    (void)lun; (void)scsi_cmd;
+    rw_cmd.open = false;
+}
+void tud_mount_cb(void) { rw_cmd.open = false; }
 
 // ---------------------------------------------------------------------------
 //  MSC Required Callbacks
@@ -152,6 +212,9 @@ static int32_t read10(uint8_t lun, uint32_t lba, uint32_t offset,
             // those back and nothing else. TinyUSB then calls again starting at
             // the failing sector, which is read again on its own and fails
             // there if it is still bad. A failed sector is never filled in.
+            // That call is part of the same host command and shares its time
+            // (review M-1): with too little left, it fails without sending
+            // anything, and the host still has the good sectors.
             uint32_t done = (bufsize - remaining) + (got < aligned ? got : 0) * 512;
             if (done > 0) return (int32_t)done;
             tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);
@@ -197,7 +260,9 @@ static int32_t read10(uint8_t lun, uint32_t lba, uint32_t offset,
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                           void *buffer, uint32_t bufsize) {
     msc_busy_begin();
+    host_cmd_enter(true, false, lba);
     int32_t r = read10(lun, lba, offset, buffer, bufsize);
+    host_cmd_leave(lba, r);
     msc_busy_end();
     return r;
 }
@@ -280,7 +345,9 @@ static int32_t write10(uint8_t lun, uint32_t lba, uint32_t offset,
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                            uint8_t *buffer, uint32_t bufsize) {
     msc_busy_begin();
+    host_cmd_enter(true, true, lba);
     int32_t r = write10(lun, lba, offset, buffer, bufsize);
+    host_cmd_leave(lba, r);
     msc_busy_end();
     return r;
 }
@@ -361,7 +428,9 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
     case 0x85:  // ATA PASS-THROUGH (16)
     {
         msc_busy_begin();
+        host_cmd_enter(false, false, 0);        // one callback, one command
         int32_t r = sat_scsi(lun, scsi_cmd, buffer, host_bufsize);
+        host_cmd_leave(0, r);
         msc_busy_end();
         return r;
     }

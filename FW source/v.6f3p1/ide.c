@@ -145,6 +145,26 @@ void ide_set_iordy(bool enabled) {
     gpio_set_inover(IDE_IORDY, enabled ? GPIO_OVERRIDE_NORMAL : GPIO_OVERRIDE_HIGH);
 }
 
+// IORDY held high (ignored) from a hardware reset until the drive is known to
+// be back. A drive holds IORDY low through its power-on diagnostics, and the
+// PIO program waits on IORDY with no timeout: a register read with IORDY
+// believed, while a drive that never came back holds it low, would never
+// finish, and core 0 would hang inside the callback for good (review L-3).
+// So the configured setting comes back only when the drive has shown ready
+// (ide_wait_until_ready), whenever that is.
+static bool iordy_held = false;
+
+static void iordy_hold(void) {
+    iordy_held = true;
+    ide_set_iordy(false);
+}
+
+static void iordy_release(void) {
+    if (!iordy_held) return;
+    iordy_held = false;
+    ide_set_iordy(config.iordy_enabled);
+}
+
 // ATA: the host must wait at least 400 ns after writing the command register
 // before reading status. Until then the drive may not have raised BSY yet, so
 // status can still show the end of the previous command, including its ERR.
@@ -173,28 +193,54 @@ static void wait_after_command(void) {
 // reset. The sector did hold the new data. Every wait on a sector command
 // is now measured against the clock.
 //
-// IDE_CMD_TIMEOUT_MS runs from writing a READ or WRITE SECTORS command until
-// its last block has moved and the drive has dropped BSY. One limit for the
-// whole command, not a guess per poll or per sector, because the USB host
-// times whole commands too.
-//  - ATA puts no limit on a read or a write. A drive may retry, recalibrate
-//    or flush internally for as long as it likes; ATA's only fixed number is
-//    the 31 s a drive may take to come back after a reset.
+// How long a host waits. ATA puts no limit on a read or a write: a drive may
+// retry, recalibrate or flush internally for as long as it likes, and ATA's
+// only fixed number is the 31 s a drive may take to come back after a reset.
+// The host does put a limit on the whole SCSI command:
 //  - Linux gives a disk command 30 s (SD_TIMEOUT in drivers/scsi/sd.h), then
-//    aborts it, which for usb-storage means resetting the USB device.
+//    aborts it, which for usb-storage means a bulk-only reset or a USB port
+//    reset of the whole device.
+//  - The palimpsest tools send READ(10) and ATA PASS-THROUGH with their own
+//    30 s pass-through timeout (tools/ataboy-read10.ps1,
+//    tools/ataboy-donor-write.ps1).
 //  - Windows' disk class driver uses Services\Disk\TimeOutValue, or 10 s if
 //    that is not set (Microsoft, "Registry Entries for SCSI Miniport
-//    Drivers"). Many installs set it higher; the development PC has 65 s. A
-//    pass-through caller sets its own (the palimpsest tools use 3 to 60 s).
-//  - While a callback is blocked here, TinyUSB NAKs the bulk endpoint, so
-//    the host simply waits until its own timeout. Giving up earlier gains
-//    the host nothing; it only means resetting a drive that was still busy.
-// So the firmware waits as long as a host will plausibly wait, and no longer:
-// 30 s, the Linux figure and three times the Windows default. Past that the
-// host has already failed the command, and core 0 is stuck in the callback
-// (no console, no USB) for as long as the wait goes on. A drive still busy
-// after 30 s on one command is soft-reset, as before.
-#define IDE_CMD_TIMEOUT_MS      30000
+//    Drivers"). Many installs set it higher; the development PC has 65 s.
+//
+// The first 0.6f3p7 draft waited 30 s per ATA command here and said that
+// giving up earlier gains the host nothing. Review M-1 found that wrong: it
+// loses the host everything. While a callback blocks here TinyUSB NAKs the
+// bulk endpoint and the host's clock runs; the host's clock also started
+// before ours (the CBW and any earlier chunks), and the issue #13 call again
+// at the failing sector, and each reset, used to get time of its own on top
+// (one 8-sector READ(10) with a hang at the fourth sector: 60 s and two soft
+// resets, where 0.6f3p6 took 2 s). When the host gives up it resets the
+// device while core 0 is still in the callback, so the good prefix that
+// issue #13 exists to return is lost. The reviewer's reading of TinyUSB 0.18
+// (dcd_rp2040.c, usbd.c; not measured) is that the bus reset also clears the
+// endpoint state under the callback, which could leave USB wedged.
+//
+// So since the review, ONE budget covers everything done for one host
+// command: IDE_HOST_BUDGET_MS (20 s, ide.h), counted from the first callback
+// of the command (usb.c finds the command boundaries). That is 10 s under the
+// 30 s floor of Linux and our tools, which leaves the USB transfer (at 12
+// Mbit/s the largest READ(10) Linux sends, 120 KiB, takes about 0.1 s) and
+// the host's own slack well inside. Windows' 10 s default cannot be met by a
+// drive that legitimately retries for longer; FORK-README asks Windows users
+// to set TimeOutValue to 30 or more.
+// Inside the budget, waits for the drive to do the host's work end
+// IDE_RECOVERY_RESERVE_MS (5 s) before the budget does, so a drive that hangs
+// can still be soft-reset, and usually brought back, inside the same host
+// command. Recovery may use everything that is left; a drive not back by then
+// is carried on with by the next host command (recovery, below).
+// IDE_CMD_TIMEOUT_MS runs from writing a READ or WRITE SECTORS command until
+// its last block has moved and the drive has dropped BSY. One limit for the
+// whole command, not a guess per poll or per sector, as the host times whole
+// commands too. It is what a command sent at the start of a host command gets
+// (20 s less the 5 s reserve), and what the functions get when called outside
+// a host command (the host tests call them directly). A drive still busy when
+// its time is up is soft-reset, as before.
+#define IDE_CMD_TIMEOUT_MS      (IDE_HOST_BUDGET_MS - IDE_RECOVERY_RESERVE_MS)
 // IDENTIFY DEVICE answers from the drive's own memory. 10 s is the SAT
 // path's command limit; it used to be 100000 polls 50 us apart (5 s plus).
 #define IDE_IDENTIFY_TIMEOUT_MS 10000
@@ -204,7 +250,51 @@ static void wait_after_command(void) {
 #define IDE_SEEK_TIMEOUT_MS     1000
 
 static uint32_t ms_now(void) { return to_ms_since_boot(get_absolute_time()); }
+// The one deadline test. At exactly limit_ms the time is up (a boundary test
+// in tests/host holds it there).
 static bool ms_passed(uint32_t start, uint32_t limit_ms) { return ms_now() - start >= limit_ms; }
+
+// The host command in progress (ide.h, ide_host_cmd_*). Written and read only
+// on core 0, inside MSC callbacks: `on` is false everywhere else, so core 1's
+// waits (detection, the debug keys, auto-mount) are never cut short by it.
+static struct {
+    bool     on;            // core 0 is inside a callback of this command
+    uint32_t start;         // when the command's first callback began (ms)
+    uint8_t  resets;        // soft resets started during the command
+    uint8_t  hw_resets;     // hardware resets during the command
+    bool     recorded;      // the command has written a failure record
+} host;
+
+void ide_host_cmd_begin(void) {
+    host.start = ms_now();
+    host.resets = 0;
+    host.hw_resets = 0;
+    host.recorded = false;
+}
+void ide_host_cmd_enter(void) { host.on = true; }
+void ide_host_cmd_leave(void) { host.on = false; }
+
+// What is left of the host command's time; no limit outside one.
+static uint32_t host_left_ms(void) {
+    if (!host.on) return UINT32_MAX;
+    uint32_t used = ms_now() - host.start;
+    return used >= IDE_HOST_BUDGET_MS ? 0 : IDE_HOST_BUDGET_MS - used;
+}
+
+// A wait for the drive to do the host's work: want_ms, or less, so that the
+// recovery reserve is still there when it ends.
+static uint32_t work_ms(uint32_t want_ms) {
+    uint32_t left = host_left_ms();
+    if (left == UINT32_MAX) return want_ms;
+    left = left > IDE_RECOVERY_RESERVE_MS ? left - IDE_RECOVERY_RESERVE_MS : 0;
+    return want_ms < left ? want_ms : left;
+}
+
+// A wait that is part of recovery: want_ms, or what is left of the command.
+static uint32_t recovery_ms(uint32_t want_ms) {
+    uint32_t left = host_left_ms();
+    return want_ms < left ? want_ms : left;
+}
 
 // Has the drive visibly started the command we just wrote? (Review
 // finding M1, on the SAT path, where this began; IDENTIFY uses it too since
@@ -294,9 +384,13 @@ void ide_hw_init(void) {
     ide_set_iordy(config.iordy_enabled);
 }
 
+static void recovery_forget(void);
+
 void ide_reset_drive(void) {
-    // Force IORDY HIGH during reset — drive holds it LOW during POST
-    ide_set_iordy(false);
+    recovery_forget();          // this reset supersedes any recovery still waiting
+    // Force IORDY HIGH during reset: the drive holds it LOW during POST. It
+    // comes back to the configured setting once the drive shows ready.
+    iordy_hold();
 
     gpio_put(IDE_RESET, 0);
     sleep_ms(50);
@@ -310,16 +404,14 @@ void ide_reset_drive(void) {
     ide_write_reg(7, 0x10);
     wait_after_command();
     ide_wait_until_ready(10000);
-
-    // Restore IORDY to config setting — drive is ready for normal operation
-    ide_set_iordy(config.iordy_enabled);
 }
 
 uint8_t ide_probe_devices(void) {
 #if ATABOY_SAT
     id_words.valid = false;     // a new detection: nothing is known until IDENTIFY answers
 #endif
-    ide_set_iordy(false);
+    recovery_forget();          // the probe's own reset supersedes any recovery still waiting
+    iordy_hold();
 
     // Single hardware reset — both devices see it
     gpio_put(IDE_RESET, 0);
@@ -355,22 +447,30 @@ uint8_t ide_probe_devices(void) {
         wait_after_command();
         ide_wait_until_ready(10000);
 
-        ide_set_iordy(config.iordy_enabled);
+        iordy_release();          // BSY has cleared: the drive is past its POST
         return addrs[i];
     }
 
-    ide_set_iordy(config.iordy_enabled);
+    // No device found. IORDY stays ignored until a drive shows ready (review
+    // L-3): one still in its POST would hold it low and hang the next access.
     return 0;  // no device found
 }
 
+// Status is read at least once, even with no time to wait (a host command
+// near the end of its time still sees a drive that is ready). A drive that
+// shows ready is past any power-on diagnostics, so IORDY is believed again
+// from here on (iordy_release).
 bool ide_wait_until_ready(uint32_t timeout_ms) {
     uint32_t start = to_ms_since_boot(get_absolute_time());
-    while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
+    for (;;) {
         uint8_t st = ide_read_reg(7);
-        if (!(st & 0x80) && (st & 0x40)) return true;   // BSY=0, DRDY=1
+        if (!(st & 0x80) && (st & 0x40)) {              // BSY=0, DRDY=1
+            iordy_release();
+            return true;
+        }
+        if (to_ms_since_boot(get_absolute_time()) - start >= timeout_ms) return false;
         busy_wait_us_32(10);
     }
-    return false;
 }
 
 bool ide_set_geometry(uint8_t heads, uint8_t spt) {
@@ -380,7 +480,8 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     wait_after_command();
     // Only a clean completion counts. With ABRT the drive keeps its own
     // default translation, which is not the geometry we address it with.
-    bool ok = ide_wait_until_ready(1000) && !(ide_read_reg(7) & 0x01);
+    // Inside a host command the wait is cut to what is left of its time.
+    bool ok = ide_wait_until_ready(recovery_ms(1000)) && !(ide_read_reg(7) & 0x01);
     chs_geometry_lost = !ok;
     return ok;
 }
@@ -389,8 +490,11 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
 //  IDENTIFY DEVICE (0xEC)
 // ---------------------------------------------------------------------------
 
-static bool identify_once(uint16_t *buf) {
-    if (!ide_wait_until_ready(1000)) return false;
+// IDENTIFY, once. 1: the 256 words are in buf. 0: the drive was not ready,
+// or ended the command with ERR. -1: IDENTIFY was sent and gave no data in
+// time; the drive may still be working on it.
+static int identify_run(uint16_t *buf) {
+    if (!ide_wait_until_ready(work_ms(1000))) return 0;
     if (ide_read_reg(7) & 0x08) ide_drain_sector();   // drain stranded DRQ before command
     ide_write_reg(6, dev_base);
     // Review L-3: ERR is believed only once this IDENTIFY has visibly
@@ -406,12 +510,17 @@ static bool identify_once(uint16_t *buf) {
     // Poll for DRQ. Status is read through sat_poll(), which samples INTRQ
     // first and releases it with the status read.
     uint32_t start = ms_now();
+    uint32_t limit = work_ms(IDE_IDENTIFY_TIMEOUT_MS);
     for (;;) {
-        if (ms_passed(start, IDE_IDENTIFY_TIMEOUT_MS)) return false;   // identify: no data in time
+        if (ms_passed(start, limit)) return -1;         // identify: no data in time
         uint8_t st = sat_poll(&w);
         if (st & 0x80) { busy_wait_us_32(50); continue; }  // BSY: other bits not valid yet
-        if (st & 0x08) w.started = true;                 // DRQ is ours: a stale one was drained above
-        if (w.started && (st & 0x01)) { if (st & 0x08) ide_drain_sector(); return false; }  // ERR: drain stranded DRQ
+        // DRQ is this IDENTIFY's: a stale one was drained above. It counts as
+        // the command having started, so ERR with DRQ (an abort that offers a
+        // block, from a drive that neither showed BSY nor has INTRQ wired) is
+        // an error, never 256 words of IDENTIFY (tests/host, review R4).
+        if (st & 0x08) w.started = true;
+        if (w.started && (st & 0x01)) { if (st & 0x08) ide_drain_sector(); return 0; }  // ERR: drain stranded DRQ
         if (st & 0x08) goto ready;                       // BSY=0, DRQ=1
         busy_wait_us_32(50);
     }
@@ -426,8 +535,10 @@ ready:
 
     sio_hw->gpio_set = (1 << IDE_CS0);
     bus_idle();
-    return true;
+    return 1;
 }
+
+static bool identify_once(uint16_t *buf) { return identify_run(buf) > 0; }
 
 bool ide_identify(uint16_t *buf) {
     bool ok = identify_once(buf);
@@ -471,11 +582,30 @@ bool ide_identify(uint16_t *buf) {
 // power-cycled inside that window is absent (status 0xFF) or still in its
 // power-on reset (BSY, for far longer than the window), so the command that
 // follows is refused or times out. No swap completes in a few microseconds.
+// Time (review M-1): it runs inside the host command's budget. A drive whose
+// reset from an earlier command is still being waited for gets nothing (-1,
+// words kept). The check only starts with time for all of it, its two ready
+// checks and a full IDENTIFY, so a drive is never judged by an IDENTIFY cut
+// short (-1 otherwise, words kept). An IDENTIFY that gives no data in its
+// 10 s is aborted with a reset and recorded, as the SAT path does with its
+// own commands, so the drive is not left working on it.
+#define IDE_IDCHECK_MS (IDE_IDENTIFY_TIMEOUT_MS + 2000)
+static bool recovery_gate(void);
+static void record_failure(uint8_t kind, uint8_t cmd, uint8_t st,
+                           uint32_t lba, uint32_t done, uint32_t count);
+static void soft_reset_restore(void);
+
 int ide_id_words_verify(void) {
     if (!id_words_held()) return 0;
+    if (!recovery_gate() || work_ms(IDE_IDCHECK_MS) < IDE_IDCHECK_MS) return -1;
     if (!ide_wait_until_ready(1000) || (ide_read_reg(7) & 0x08)) return -1;
     uint16_t buf[256];
-    bool same = identify_once(buf) && buf[82] == id_words.w82 &&
+    int got = identify_run(buf);
+    if (got < 0) {
+        record_failure(IDE_FAIL_TIMEOUT, 0xEC, ide_read_reg(7), 0, 0, 1);
+        soft_reset_restore();
+    }
+    bool same = got > 0 && buf[82] == id_words.w82 &&
                 buf[83] == id_words.w83 && buf[84] == id_words.w84;
     same = same && buf[85] == id_words.w85 && buf[87] == id_words.w87;
     for (int i = 0; same && i < 10; i++) same = buf[10 + i] == id_words.serial[i];
@@ -509,31 +639,95 @@ void ide_last_failure(ide_fail_t *out) { *out = last_fail; }
 
 // Keep what the drive reported for a failed command. Must run before any
 // drain or reset, since both change the registers.
+// The reset flags cover the whole host command (review L-2): the issue #13
+// call again at the failing sector writes a new record, and a reset the first
+// call needed must not vanish with the old one. Outside a host command (the
+// host tests call these functions directly) every call counts on its own.
 static void record_failure(uint8_t kind, uint8_t cmd, uint8_t st,
                            uint32_t lba, uint32_t done, uint32_t count) {
+    if (!host.on) { host.resets = 0; host.hw_resets = 0; }
     last_fail.kind    = kind;
     last_fail.command = cmd;
     last_fail.status  = st;
     last_fail.error   = ide_read_reg(1);
     for (int i = 0; i < 5; i++) last_fail.tf[i] = ide_read_reg(2 + i);
     last_fail.drained = false;
-    last_fail.reset   = false;
+    last_fail.reset   = host.resets > 0 || host.hw_resets > 0;
     last_fail.reset_failed = false;
-    last_fail.hw_reset = false;
+    last_fail.hw_reset = host.hw_resets > 0;
+    last_fail.pending = false;
     last_fail.lba     = lba;
     last_fail.done    = done;
     last_fail.count   = count;
+    host.recorded = true;
 }
 
 #define IDE_SRST_TIMEOUT_MS 31000   // ATA allows a device up to 31 s after SRST
 // RESET- low time. ATA asks for at least 25 us; the probe (ide_probe_devices)
 // and ide_reset_drive() hold it for 50 ms, and so does the escalation below.
+// The probe's 50 ms is the only pulse proven on the project's own drives, so
+// the escalation does not use a shorter one (a test holds it to that).
 #define IDE_HW_RESET_LOW_US 50000
+// RECALIBRATE after the hardware reset: how long it may take (as
+// ide_reset_drive allows), and how long a drive that has shown no sign of
+// starting it (no BSY seen, no INTRQ) must stay idle before it is taken as
+// done. ATA gives a drive 400 ns to raise BSY; the slowest drive the tests
+// model takes 5.4 us. 10 ms is far past both, and short enough that a fast
+// drive with no INTRQ wired costs nothing noticeable.
+#define IDE_RECAL_TIMEOUT_MS 10000
+#define IDE_RECAL_GRACE_MS   10
+
+// ---------------------------------------------------------------------------
+//  Recovery: a soft reset, then at most one hardware reset, across host commands
+// ---------------------------------------------------------------------------
+// A drive that is stuck, or did not end a command cleanly, is soft-reset
+// (SRST). ATA gives it 31 s to come back. If it has not, RESET- is pulsed
+// once, and no more: found on hardware 2026-09-24, a lone slave ST380011A
+// stayed busy through the soft reset and then read 0xFF until a re-detect
+// pulsed RESET-. After the hardware reset (31 s again) RECALIBRATE, then, in
+// CHS mode, the geometry. That is one recovery.
+//
+// Since review M-1 a recovery may take longer than the host command that
+// started it: each step waits only as long as the host command has left
+// (recovery_ms). If the drive is not back by then, the host is answered now
+// (the command fails, the record says the recovery is pending, and Debug E
+// shows it), and the next host command carries on where this one stopped,
+// before anything else, and within its own time (recovery_gate): the rest of
+// the 31 s after SRST, then the hardware reset if it is due, and so on.
+// Meanwhile nothing new is sent to the drive. A WRITE is never sent again by
+// the firmware: a host command that finds a recovery pending fails without
+// sending anything, and the host decides whether to retry.
+//
+// Stages. `since` is when the stage began; ATA's windows count from there.
+#define REC_NONE   0
+#define REC_SRST   1        // SRST sent; waiting for the drive (31 s)
+#define REC_HW     2        // RESET- pulsed; waiting for the drive (31 s)
+#define REC_RECAL  3        // RECALIBRATE sent after RESET-; waiting for it (10 s)
+static struct {
+    uint8_t     stage;
+    bool        selected;   // our device selected again since the reset
+    uint32_t    since;
+    sat_watch_t recal;      // REC_RECAL: has the RECALIBRATE visibly started?
+} rec;
+
+static uint32_t stage_left_ms(uint32_t window_ms) {
+    uint32_t used = ms_now() - rec.since;
+    return used >= window_ms ? 0 : window_ms - used;
+}
+
+// A probe or ide_reset_drive() (core 1, nothing mounted) pulses RESET- itself
+// and so ends any recovery in progress. The record keeps what happened, and
+// no longer says pending.
+static void recovery_forget(void) {
+    rec.stage = REC_NONE;
+    last_fail.pending = false;
+}
 
 // After a soft or hardware reset: wait on device 0 where ATA says to, select
-// our device again, and wait for it to be ready. True if it came back ready
-// within IDE_SRST_TIMEOUT_MS.
-static bool reselect_after_reset(void) {
+// our device again, and wait for it to be ready. At most budget_ms now, and
+// never past ATA's 31 s from the reset. 1: ready. 0: not yet, but the 31 s
+// are not over (the next host command carries on). -1: the 31 s are over.
+static int after_reset_wait(uint32_t budget_ms) {
     // A reset leaves device 0 selected, and device 0 holds BSY until device 1
     // has finished too, so the host waits on device 0 before it selects
     // anything. That goes for a slave as well: a slave can be in use with a
@@ -550,89 +744,155 @@ static bool reselect_after_reset(void) {
     // the wrong drive or poll a floating bus until the next detect.
     // (A master that times out needs no reselect: device 0 is ours, and
     // writing registers to a drive still in reset would break the protocol.
-    // A slave whose master never comes out of reset is selected anyway;
+    // A slave whose master never comes out of its 31 s is selected anyway;
     // there is nothing better to do for it.)
-    uint32_t start = to_ms_since_boot(get_absolute_time());
-    if (dev_base == 0xA0) {
-        while (ide_read_reg(7) & 0x80) {
-            if (to_ms_since_boot(get_absolute_time()) - start >= IDE_SRST_TIMEOUT_MS)
-                return false;
-            busy_wait_us_32(10);
+    uint32_t window = stage_left_ms(IDE_SRST_TIMEOUT_MS);
+    bool budget_ends_first = budget_ms < window;
+    uint32_t limit = budget_ends_first ? budget_ms : window;
+    uint32_t start = ms_now();
+    if (!rec.selected) {
+        if (dev_base == 0xA0) {
+            while (ide_read_reg(7) & 0x80) {
+                if (ms_passed(start, limit)) return budget_ends_first ? 0 : -1;
+                busy_wait_us_32(10);
+            }
+        } else {
+            uint8_t st;
+            while (((st = ide_read_reg(7)) & 0x80) && st != 0xFF) {
+                if (ms_passed(start, limit)) {
+                    if (budget_ends_first) return 0;
+                    break;                  // master stuck in reset: select the slave anyway
+                }
+                busy_wait_us_32(10);
+            }
         }
-    } else {
-        uint8_t st;
-        while (((st = ide_read_reg(7)) & 0x80) && st != 0xFF) {
-            if (to_ms_since_boot(get_absolute_time()) - start >= IDE_SRST_TIMEOUT_MS)
-                break;                      // master stuck in reset: select the slave anyway
-            busy_wait_us_32(10);
-        }
+        ide_write_reg(6, dev_base);
+        busy_wait_us_32(1);                 // 400 ns before status is valid
+        rec.selected = true;
     }
-    ide_write_reg(6, dev_base);
-    busy_wait_us_32(1);                     // 400 ns before status is valid
-    return ide_wait_until_ready(IDE_SRST_TIMEOUT_MS);
-}
-
-// Soft reset (SRST in Device Control). True if the drive came back ready.
-static bool srst_and_reselect(void) {
-    ide_write_control(0x04);
-    busy_wait_us_32(10);
-    ide_write_control(0x00);
-    chs_geometry_lost = true;               // SRST drops INITIALIZE DEVICE PARAMETERS
-    busy_wait_us_32(2000);                  // ATA: 2 ms before status is valid
-    return reselect_after_reset();
+    uint32_t used = ms_now() - start;
+    if (ide_wait_until_ready(used < limit ? limit - used : 0)) return 1;
+    return budget_ends_first ? 0 : -1;
 }
 
 // Hardware reset: RESET- on the cable, as the probe uses. It resets BOTH
 // devices on the cable, not only ours; a master sharing the cable with a
 // slave in use loses its own settings too (nothing here uses them). The drive
 // then runs its power-on diagnostics, holding IORDY low meanwhile, so IORDY
-// is ignored until it is ready. RECALIBRATE follows, as after every other
-// hardware reset in this firmware (some pre-ATA drives need it before they
-// will seek). Runs on core 0 inside a USB callback, so it busy-waits.
-// The CHS geometry is already marked lost by the soft reset that came first.
-static bool hw_reset_and_reselect(void) {
-    ide_set_iordy(false);
+// is ignored until it shows ready (iordy_hold, review L-3). Device Control
+// is written with nIEN=0, as the probe does, rather than trusting what the
+// drive comes out of reset with. Runs on core 0 inside a USB callback, so it
+// busy-waits; the 52 ms it takes is part of the fixed margin over the host
+// command's time (ide.h). The CHS geometry is already marked lost by the
+// soft reset that came first.
+static void hw_reset_start(void) {
+    iordy_hold();
     gpio_put(IDE_RESET, 0);
     busy_wait_us_32(IDE_HW_RESET_LOW_US);
     gpio_put(IDE_RESET, 1);
     busy_wait_us_32(2000);                  // as after SRST: 2 ms before status is valid
     ide_write_control(0x00);                // nIEN=0, as the probe does
-    bool ok = reselect_after_reset();
-    if (ok) {
-        ide_write_reg(7, 0x10);             // RECALIBRATE, to the device just selected
-        wait_after_command();
-        ok = ide_wait_until_ready(10000);
-    }
-    ide_set_iordy(config.iordy_enabled);
-    return ok;
-}
-
-// Reset a drive that is stuck or did not end a command cleanly, then put the
-// CHS translation back. A soft reset first. If the drive does not come back
-// ready from that, one hardware reset, and no more: found on hardware
-// 2026-09-24, a lone slave ST380011A stayed busy through the soft reset and
-// then read 0xFF until a re-detect pulsed RESET-. *hw_used says whether the
-// hardware reset was needed. True only if the drive came back ready and, in
-// CHS mode, took the geometry. On false, chs_geometry_lost stays set and CHS
-// transfers refuse until a later ide_set_geometry() succeeds.
-static bool reset_and_restore(bool *hw_used) {
-    *hw_used = false;
-    bool ready = srst_and_reselect();
-    if (!ready) {
-        *hw_used = true;
-        ready = hw_reset_and_reselect();
-    }
-    if (!ready) return false;
-    if (config.use_lba_mode) return true;
-    return ide_set_geometry(config.heads, config.spt);
-}
-
-// Reset for the sector I/O paths, recorded in the failure record.
-static void soft_reset_restore(void) {
+    rec.stage = REC_HW;
+    rec.selected = false;
+    rec.since = ms_now();
+    host.hw_resets++;
     last_fail.reset = true;
-    bool hw;
-    last_fail.reset_failed = !reset_and_restore(&hw);
-    last_fail.hw_reset = hw;
+    last_fail.hw_reset = true;
+}
+
+// RECALIBRATE, as after every other hardware reset in this firmware (some
+// pre-ATA drives need it before they will seek), to the device just
+// selected. Review L-4: its completion is checked before INITIALIZE DEVICE
+// PARAMETERS goes out, and with the SAT path's rule (sat_watch_t): a status
+// with BSY clear ends it only once it has visibly started, or once the drive
+// has stayed idle IDE_RECAL_GRACE_MS, which is how a drive that finished it
+// before the first poll, with no INTRQ wired, looks. ERR (a drive that does
+// not know the command) ends it too: the drive is idle, which is all 0x91
+// needs.
+static void recal_start(void) {
+    sat_watch_arm(&rec.recal);              // the ready wait's status read released INTRQ
+    ide_write_reg(7, 0x10);
+    wait_after_command();
+    rec.stage = REC_RECAL;
+    rec.since = ms_now();
+}
+
+// 1: done. 0: not yet, time left in its 10 s. -1: still busy after 10 s.
+static int recal_wait(uint32_t budget_ms) {
+    uint32_t window = stage_left_ms(IDE_RECAL_TIMEOUT_MS);
+    bool budget_ends_first = budget_ms < window;
+    uint32_t limit = budget_ends_first ? budget_ms : window;
+    uint32_t start = ms_now();
+    for (;;) {
+        uint8_t st = sat_poll(&rec.recal);
+        bool over = rec.recal.started || ms_passed(rec.since, IDE_RECAL_GRACE_MS);
+        if (over && !(st & 0x80) && !(st & 0x08) && (st & 0x40)) return 1;
+        if (ms_passed(start, limit)) return budget_ends_first ? 0 : -1;
+        busy_wait_us_32(10);
+    }
+}
+
+// The recovery is over, one way or the other. The record says how.
+static int recovery_end(bool ok) {
+    rec.stage = REC_NONE;
+    last_fail.pending = false;
+    last_fail.reset_failed = !ok;
+    return ok ? 1 : -1;
+}
+
+// Take the recovery as far as the host command's time allows. 1: the drive
+// is back (and in CHS mode has its geometry). 0: not yet; the next host
+// command carries on. -1: it did not come back, or did not take the geometry
+// (the recovery is over; CHS transfers refuse until the geometry is set, and
+// a drive that stayed busy is refused as not ready until it answers).
+static int recovery_run(void) {
+    if (rec.stage == REC_SRST) {
+        int r = after_reset_wait(recovery_ms(IDE_SRST_TIMEOUT_MS));
+        if (r == 0) return 0;
+        if (r < 0) hw_reset_start();        // once per recovery: only from REC_SRST
+    }
+    if (rec.stage == REC_HW) {
+        int r = after_reset_wait(recovery_ms(IDE_SRST_TIMEOUT_MS));
+        if (r == 0) return 0;
+        if (r < 0) return recovery_end(false);
+        recal_start();
+    }
+    if (rec.stage == REC_RECAL) {
+        int r = recal_wait(recovery_ms(IDE_RECAL_TIMEOUT_MS));
+        if (r == 0) return 0;
+        if (r < 0) return recovery_end(false);
+    }
+    if (rec.stage == REC_NONE) return 1;
+    // Back from the reset. CHS mode: the translation the host's sector
+    // numbers assume, or CHS reads and writes refuse (chs_geometry_ok).
+    if (config.use_lba_mode) return recovery_end(true);
+    return recovery_end(ide_set_geometry(config.heads, config.spt));
+}
+
+// Before anything is sent to the drive for the host: a recovery an earlier
+// host command left pending is carried on first, within this command's time.
+// False: the drive is not back; this command fails, nothing new is sent, and
+// the failure record stays the one that started the recovery.
+static bool recovery_gate(void) {
+    if (rec.stage == REC_NONE) return true;
+    return recovery_run() > 0;
+}
+
+// Reset a drive that is stuck or did not end a command cleanly (the failure
+// is already recorded), and take the recovery as far as time allows.
+static void soft_reset_restore(void) {
+    ide_write_control(0x04);
+    busy_wait_us_32(10);
+    ide_write_control(0x00);
+    chs_geometry_lost = true;               // SRST drops INITIALIZE DEVICE PARAMETERS
+    busy_wait_us_32(2000);                  // ATA: 2 ms before status is valid
+    rec.stage = REC_SRST;
+    rec.selected = false;
+    rec.since = ms_now();
+    host.resets++;
+    last_fail.reset = true;
+    last_fail.pending = true;
+    (void)recovery_run();
 }
 
 // CHS mode after a reset that could not restore the geometry: try once more
@@ -643,16 +903,29 @@ static bool chs_geometry_ok(void) {
     return ide_set_geometry(config.heads, config.spt);
 }
 
+// Inside a host command: is there time to send a command and still reset the
+// drive if it hangs (more than the recovery reserve left)? If not, nothing is
+// sent. That is recorded, unless this host command has recorded a failure of
+// its own already: the issue #13 call again at the failing sector must not
+// hide the failure that made it.
+static bool time_to_send(uint32_t lba, uint32_t count) {
+    if (work_ms(1) > 0) return true;
+    if (!host.recorded) record_failure(IDE_FAIL_NO_TIME, 0, ide_read_reg(7), lba, 0, count);
+    return false;
+}
+
 // After a command ends with ERR the drive should be idle again: BSY=0,
-// DRQ=0, DRDY=1. True if it gets there within timeout_ms.
+// DRQ=0, DRDY=1. True if it gets there within timeout_ms (or what is left of
+// the host command, if that is less).
 static bool idle_after_error(uint32_t timeout_ms) {
+    timeout_ms = recovery_ms(timeout_ms);
     uint32_t start = to_ms_since_boot(get_absolute_time());
-    while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
+    for (;;) {
         uint8_t st = ide_read_reg(7);
         if (!(st & 0x80) && !(st & 0x08) && (st & 0x40)) return true;
+        if (to_ms_since_boot(get_absolute_time()) - start >= timeout_ms) return false;
         busy_wait_us_32(10);
     }
-    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +945,11 @@ int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
 // with ERR (older drives put the flawed data in the buffer), that data is
 // drained and thrown away. A soft reset is only used when the drive does not
 // end the command (timeout) or is not idle afterwards.
+//
+// Time (review M-1): inside a host command every wait is cut to the command's
+// budget (work_ms, recovery_ms), and nothing is sent while a recovery from an
+// earlier command is still pending (recovery_gate) or when there is no longer
+// time to send a command and still reset the drive (time_to_send).
 int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
                                  uint32_t *done) {
     uint32_t s = 0;
@@ -679,7 +957,9 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
     uint8_t cmd = 0;
     if (done) *done = 0;
     if (count == 0) return -1;
-    if (!ide_wait_until_ready(5000)) {
+    if (!recovery_gate()) return -1;
+    if (!time_to_send(lba, count)) return -1;
+    if (!ide_wait_until_ready(work_ms(5000))) {
         record_failure(IDE_FAIL_NOT_READY, 0, ide_read_reg(7), lba, 0, count);
         return -1;
     }
@@ -737,14 +1017,15 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
     cmd = use_lba48 ? 0x24 : 0x20;
     ide_write_reg(7, cmd);                                 // READ SECTORS EXT / READ SECTORS
     wait_after_command();
-    uint32_t start = ms_now();                             // the whole command: IDE_CMD_TIMEOUT_MS
+    uint32_t start = ms_now();                             // the whole command: IDE_CMD_TIMEOUT_MS,
+    uint32_t limit = work_ms(IDE_CMD_TIMEOUT_MS);          // or what the host command has left
 
     uint16_t *wbuf = (uint16_t *)buf;
 
     for (s = 0; s < count; s++) {
         // Poll for DRQ — INTRQ provides early-exit if enabled, otherwise pure polling
         for (;;) {
-            if (ms_passed(start, IDE_CMD_TIMEOUT_MS)) goto read_timeout;   // read: no DRQ in time
+            if (ms_passed(start, limit)) goto read_timeout;   // read: no DRQ in time
             if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
             st = ide_read_reg(7);
             // While BSY is set the other status bits are not valid (ATA), so a
@@ -783,8 +1064,9 @@ read_err:
     return -1;
 
 read_timeout:
-    // No DRQ within IDE_CMD_TIMEOUT_MS: the drive may still be retrying, so
-    // abort with SRST (and, if it does not come back, one hardware reset).
+    // No DRQ in the time allowed: the drive may still be retrying, so abort
+    // with SRST (and, if it does not come back, one hardware reset). The
+    // sectors before this one are good and go to the host (issue #13).
     record_failure(IDE_FAIL_TIMEOUT, cmd, st, lba + s, s, count);
     soft_reset_restore();
     if (done) *done = s;
@@ -796,7 +1078,9 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     uint8_t st = 0;
     uint8_t fail_kind = IDE_FAIL_TIMEOUT;
     if (count == 0) return -1;
-    if (!ide_wait_until_ready(5000)) {
+    if (!recovery_gate()) return -1;                       // as for a read (review M-1)
+    if (!time_to_send(lba, count)) return -1;
+    if (!ide_wait_until_ready(work_ms(5000))) {
         record_failure(IDE_FAIL_NOT_READY, 0, ide_read_reg(7), lba, 0, count);
         return -1;
     }
@@ -840,7 +1124,8 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     uint8_t cmd = use_lba48 ? 0x34 : 0x30;
     ide_write_reg(7, cmd);                                 // WRITE SECTORS EXT / WRITE SECTORS
     wait_after_command();
-    uint32_t start = ms_now();                             // the whole command: IDE_CMD_TIMEOUT_MS
+    uint32_t start = ms_now();                             // the whole command: IDE_CMD_TIMEOUT_MS,
+    uint32_t limit = work_ms(IDE_CMD_TIMEOUT_MS);          // or what the host command has left
 
     const uint16_t *wbuf = (const uint16_t *)buf;
 
@@ -851,7 +1136,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
         // for s > 0 it provides early-exit if enabled, otherwise pure polling
         bool got_drq = false;
         for (;;) {
-            if (ms_passed(start, IDE_CMD_TIMEOUT_MS)) break;   // write: no DRQ in time
+            if (ms_passed(start, limit)) break;   // write: no DRQ in time
             if (s > 0 && config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);
             st = ide_read_reg(7);
             if (st & 0x80) { busy_wait_us_32(10); continue; }   // BSY: other bits not valid
@@ -875,7 +1160,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     // wait the ST380011A outlasted (IDE_CMD_TIMEOUT_MS above).
     if (write_ok) {
         for (;;) {
-            if (ms_passed(start, IDE_CMD_TIMEOUT_MS)) break;   // write commit: still busy
+            if (ms_passed(start, limit)) break;   // write commit: still busy
             if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);
             st = ide_read_reg(7);
             if (st & 0x80) { busy_wait_us_32(10); continue; }   // BSY: other bits not valid
@@ -885,7 +1170,9 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     }
 
     // Write errors still always reset, as before. Keep the registers first.
-    // For a write, 'done' is the number of sectors sent to the drive.
+    // For a write, 'done' is the number of sectors sent to the drive. The
+    // write is never sent again by the firmware, here or by a later host
+    // command's recovery; retrying is the host's decision.
     record_failure(fail_kind, cmd, st, lba + s, s, count);
     soft_reset_restore();
     return -1;
@@ -963,7 +1250,10 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba) {
 //    reports the failure. The READ(10) path is unchanged.
 //  - it refuses to start if the drive is busy or holds data from some earlier
 //    command, instead of guessing what that state means.
-// Timeouts are wall-clock, not loop counts.
+// Timeouts are wall-clock, not loop counts, and inside the host command's
+// budget like the sector paths (review M-1): waits for the command end the
+// recovery reserve before the budget does, and nothing is sent while a
+// recovery is pending or when there is no time left to reset after it.
 
 #define SAT_READY_TIMEOUT_MS  5000    // same as ide_read_sectors()
 #define SAT_CMD_TIMEOUT_MS    10000   // PIO: from issue to the last block; non-data: to completion
@@ -973,21 +1263,27 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba) {
 // Without this, a drive that finishes a slow read after our timeout raises
 // DRQ with that sector's data, and the next command on the bus (a READ(10)
 // from the host, say) can end up handed the stranded block as its own
-// result. A soft reset ends the command, and reset_and_restore() selects the
-// drive again and, in CHS mode, puts the geometry back; a drive that does not
-// come back from the soft reset gets one hardware reset, as on the READ(10)
-// path. There is no error state worth keeping at this point: the command
-// timed out or ended badly.
-static void sat_abort(void) {
-    bool hw;
-    (void)reset_and_restore(&hw);   // on failure, CHS reads refuse until restored
+// result. A soft reset ends the command, and the recovery selects the drive
+// again and, in CHS mode, puts the geometry back; a drive that does not come
+// back from the soft reset gets one hardware reset, as on the READ(10) path,
+// and one not back when the host command's time is up is carried on with by
+// the next host command. The host gets no registers (a reset replaces them),
+// but the failure record does (review L-2): the resets, the hardware one
+// above all, which resets both devices on the cable, show in Debug E.
+// `lba` is the task file's LBA, for the record.
+static void sat_abort(const sat_taskfile_t *tf, uint8_t kind, uint8_t st) {
+    uint32_t lba = (uint32_t)tf->lba_low | ((uint32_t)tf->lba_mid << 8) | ((uint32_t)tf->lba_high << 16);
+    lba |= tf->ext ? (uint32_t)tf->hob_lba_low << 24 : (uint32_t)(tf->device & 0x0F) << 24;
+    record_failure(kind, tf->command, st, lba, 0, tf->sectors);
+    soft_reset_restore();           // on failure, CHS reads refuse until restored
 }
 
 // Ready to take a new command: not busy, and not holding data from an
 // earlier one (that is not ours to discard; the READ(10) path's own guard
 // resets it). False means nothing was sent.
 static bool sat_can_issue(void) {
-    if (!ide_wait_until_ready(SAT_READY_TIMEOUT_MS)) return false;
+    if (!recovery_gate() || work_ms(1) == 0) return false;
+    if (!ide_wait_until_ready(work_ms(SAT_READY_TIMEOUT_MS))) return false;
     if (ide_read_reg(7) & 0x08) return false;   // stale DRQ
     return true;
 }
@@ -1048,6 +1344,7 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
 
     uint16_t *wbuf = (uint16_t *)buf;
     uint32_t start = to_ms_since_boot(get_absolute_time());
+    uint32_t limit = work_ms(SAT_CMD_TIMEOUT_MS);
 
     for (uint32_t s = 0; s < tf->sectors; s++) {
         for (;;) {
@@ -1063,8 +1360,8 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
                 }
                 if (st & 0x08) break;                           // DRQ: a block is ready
             }
-            if (to_ms_since_boot(get_absolute_time()) - start >= SAT_CMD_TIMEOUT_MS) {
-                sat_abort();
+            if (to_ms_since_boot(get_absolute_time()) - start >= limit) {
+                sat_abort(tf, IDE_FAIL_TIMEOUT, st);
                 return IDE_SAT_TIMEOUT;
             }
             busy_wait_us_32(10);
@@ -1085,15 +1382,17 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
     // after the last word, so it gets a short window rather than one look.
     busy_wait_us_32(1);
     uint32_t end_start = to_ms_since_boot(get_absolute_time());
+    uint32_t end_limit = recovery_ms(SAT_END_TIMEOUT_MS);   // leaves the abort most of the reserve
     for (;;) {
         uint8_t st = ide_read_reg(7);
         if (!(st & 0x80)) {
             if (st & 0x21) { sat_read_outputs(tf, st, regs); return IDE_SAT_ATA_ERROR; }
             if (!(st & 0x08)) return IDE_SAT_OK;
         }
-        if (to_ms_since_boot(get_absolute_time()) - end_start >= SAT_END_TIMEOUT_MS) {
-            sat_abort();
-            return (st & 0x80) ? IDE_SAT_TIMEOUT : IDE_SAT_BAD_END;
+        if (to_ms_since_boot(get_absolute_time()) - end_start >= end_limit) {
+            bool busy = (st & 0x80) != 0;
+            sat_abort(tf, busy ? IDE_FAIL_TIMEOUT : IDE_FAIL_BAD_END, st);
+            return busy ? IDE_SAT_TIMEOUT : IDE_SAT_BAD_END;
         }
         busy_wait_us_32(10);
     }
@@ -1113,6 +1412,7 @@ int ide_sat_nondata(const sat_taskfile_t *tf, ide_sat_regs_t *regs) {
     sat_write_taskfile(tf);
 
     uint32_t start = to_ms_since_boot(get_absolute_time());
+    uint32_t limit = work_ms(SAT_CMD_TIMEOUT_MS);
     for (;;) {
         uint8_t st = sat_poll(&w);                              // also clears INTRQ
         // BSY clear ends the command only once it has started (sat_watch_t);
@@ -1120,13 +1420,13 @@ int ide_sat_nondata(const sat_taskfile_t *tf, ide_sat_regs_t *regs) {
         if (!(st & 0x80) && w.started) {                        // other bits only valid with BSY=0
             sat_read_outputs(tf, st, regs);
             if (st & 0x08) {                                    // DRQ on a non-data command
-                sat_abort();
+                sat_abort(tf, IDE_FAIL_BAD_END, st);
                 return IDE_SAT_BAD_END;
             }
             return (st & 0x21) ? IDE_SAT_ATA_ERROR : IDE_SAT_OK;   // ERR or DF
         }
-        if (to_ms_since_boot(get_absolute_time()) - start >= SAT_CMD_TIMEOUT_MS) {
-            sat_abort();
+        if (to_ms_since_boot(get_absolute_time()) - start >= limit) {
+            sat_abort(tf, IDE_FAIL_TIMEOUT, st);
             return IDE_SAT_TIMEOUT;
         }
         busy_wait_us_32(10);

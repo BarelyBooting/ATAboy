@@ -4,6 +4,16 @@
 // tud_msc_read10_cb with at most CFG_TUD_MSC_EP_BUFSIZE bytes at a time,
 // sends whatever the callback returns, calls again for the rest, and fails
 // the command (CSW failed, remaining data not sent) on a negative return.
+// Once the CSW is out, passed or failed, it calls the complete callback, as
+// TinyUSB does (review M-1: usb.c finds command boundaries by them).
+//
+// The host's timeout (review M-1). Every command sent through the helpers
+// below (READ(10), WRITE(10), ATA PASS-THROUGH) is timed on the mock clock,
+// each callback and the command as a whole, and a command that keeps core 0
+// in its callbacks for longer than IDE_HOST_BUDGET_MS plus HOST_MARGIN_MS
+// fails the test: a real host would have given up on it and reset the
+// device under the callback. So every test that goes through the helpers
+// also tests the budget.
 //
 // Build and run: see run.sh. Exit status is the number of failed checks.
 #include "mock_pico.h"
@@ -39,6 +49,20 @@ static std::string current;
     std::printf("FAIL [%s] %s:%d: %s -- ", current.c_str(), __FILE__, __LINE__, #cond); \
     std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
 
+// The fixed margin over the budget that ide.h allows: the 52 ms of a RESET-
+// pulse started near the end, polls in flight, and register reads.
+static const uint64_t HOST_MARGIN_MS = 100;
+static const uint64_t HOST_LIMIT_NS = (IDE_HOST_BUDGET_MS + HOST_MARGIN_MS) * 1000000ull;
+// Worst times seen since the last reset_worst(): one callback, one command.
+static uint64_t worst_cb_ns = 0, worst_cmd_ns = 0;
+static void reset_worst() { worst_cb_ns = 0; worst_cmd_ns = 0; }
+static void note_cmd(const char *what, uint64_t cmd_ns) {
+    if (cmd_ns > worst_cmd_ns) worst_cmd_ns = cmd_ns;
+    CHECK(cmd_ns <= HOST_LIMIT_NS, "%s kept core 0 in its callbacks for %llu ms: the host has given up",
+          what, (unsigned long long)(cmd_ns / 1000000));
+}
+static void note_cb(uint64_t ns) { if (ns > worst_cb_ns) worst_cb_ns = ns; }
+
 // ---- host side of READ(10) -------------------------------------------------
 struct HostRead {
     bool ok = false;
@@ -47,8 +71,7 @@ struct HostRead {
     uint8_t key = 0, asc = 0;    // sense the firmware set (TinyUSB overwrites it today)
 };
 
-static HostRead host_read10(uint32_t lba, uint32_t nblocks) {
-    HostRead h;
+static void host_read10_body(HostRead &h, uint32_t lba, uint32_t nblocks) {
     uint32_t total = nblocks * 512, xferred = 0;
     static uint8_t epbuf[CFG_TUD_MSC_EP_BUFSIZE];
     last_key = last_asc = 0;
@@ -58,16 +81,57 @@ static HostRead host_read10(uint32_t lba, uint32_t nblocks) {
         uint32_t n = total - xferred;
         if (n > CFG_TUD_MSC_EP_BUFSIZE) n = CFG_TUD_MSC_EP_BUFSIZE;
         memset(epbuf, 0xA5, sizeof(epbuf));        // poison: anything not written shows up
+        uint64_t t = mock_now_ns;
         int32_t r = tud_msc_read10_cb(0, cur, off, epbuf, n);
+        note_cb(mock_now_ns - t);
         h.calls++;
-        if (r < 0) { h.key = last_key; h.asc = last_asc; return h; }
-        if (r == 0) { if (++busy > 100) return h; continue; }
-        if ((uint32_t)r > n) { std::printf("callback returned more than asked\n"); return h; }
+        if (r < 0) { h.key = last_key; h.asc = last_asc; return; }
+        if (r == 0) { if (++busy > 100) return; continue; }
+        if ((uint32_t)r > n) { std::printf("callback returned more than asked\n"); return; }
         h.data.insert(h.data.end(), epbuf, epbuf + r);
         xferred += r;
     }
     h.ok = true;
+}
+
+// A host asks for sense after a failed command (usb-storage and Windows both
+// do), and TinyUSB will not run the next command's callback while sense is
+// pending. Defined with the SAT helpers below.
+static std::vector<uint8_t> request_sense(uint8_t alloc);
+
+static HostRead host_read10(uint32_t lba, uint32_t nblocks) {
+    HostRead h;
+    uint64_t t0 = mock_now_ns;
+    host_read10_body(h, lba, nblocks);
+    note_cmd("READ(10)", mock_now_ns - t0);
+    tud_msc_read10_complete_cb(0);                  // the CSW has gone out
+    if (!h.ok) request_sense(18);
     return h;
+}
+
+// WRITE(10), as TinyUSB 0.18 hands it over: one callback per chunk of at
+// most CFG_TUD_MSC_EP_BUFSIZE, the command failed at a negative return, and
+// the complete callback once the CSW is out. Returns the bytes accepted, or
+// -1 if the command failed.
+static int32_t host_write10(uint32_t lba, const uint8_t *data, uint32_t nblocks) {
+    static uint8_t epbuf[CFG_TUD_MSC_EP_BUFSIZE];
+    uint32_t total = nblocks * 512, xferred = 0;
+    uint64_t t0 = mock_now_ns;
+    int32_t result = (int32_t)total;
+    while (xferred < total) {
+        uint32_t n = total - xferred;
+        if (n > CFG_TUD_MSC_EP_BUFSIZE) n = CFG_TUD_MSC_EP_BUFSIZE;
+        memcpy(epbuf, data + xferred, n);
+        uint64_t t = mock_now_ns;
+        int32_t r = tud_msc_write10_cb(0, lba + xferred / 512, 0, epbuf, n);
+        note_cb(mock_now_ns - t);
+        if (r < 0) { result = -1; break; }
+        xferred += (uint32_t)r;
+    }
+    note_cmd("WRITE(10)", mock_now_ns - t0);
+    tud_msc_write10_complete_cb(0);
+    if (result < 0) request_sense(18);
+    return result;
 }
 
 // Every byte the host received must be the medium's real content.
@@ -88,6 +152,16 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     current = name;
     sim = SimDrive();
     mock_now_ns = 0;
+    // A fresh start for the firmware's own state too: no recovery pending,
+    // no host command open (tud_mount_cb, as after a USB reset), IORDY as
+    // configured, no failure on record.
+    memset(&rec, 0, sizeof rec);
+    memset(&host, 0, sizeof host);
+    memset(&last_fail, 0, sizeof last_fail);
+    iordy_held = false;
+    chs_geometry_lost = false;
+    tud_mount_cb();
+    reset_worst();
     mock_gpio_out = (1u << 24) | (1u << 25);      // CS0/CS1 idle high
     memset(&config, 0, sizeof(config));
     config.dev_base = 0xA0;
@@ -312,7 +386,7 @@ static void test_writes() {
     config.drive_write_protected = false;
     std::vector<uint8_t> buf(4096);
     for (size_t i = 0; i < buf.size(); i++) buf[i] = (uint8_t)(i * 7 + 3);
-    int32_t r = tud_msc_write10_cb(0, 400, 0, buf.data(), 4096);
+    int32_t r = host_write10(400, buf.data(), 8);
     CHECK(r == 4096, "write returned %d", r);
     HostRead h = host_read10(400, 8);
     CHECK(h.ok && memcmp(h.data.data(), buf.data(), 4096) == 0, "read back");
@@ -557,7 +631,14 @@ static SatResult sat_cmd(const std::vector<uint8_t> &cdb, uint32_t xfer, bool di
                               (uint8_t)(dir_in ? 0x80 : 0x00), 0x00, (uint8_t)cdb.size() };
     memcpy(ep, cbw, 15);
     memcpy(ep + 15, cb, 16);
-    if (last_key == 0) { s.called = true; s.r = tud_msc_scsi_cb(0, cb, ep, (uint16_t)xfer); }
+    if (last_key == 0) {
+        s.called = true;
+        uint64_t t0 = mock_now_ns;
+        s.r = tud_msc_scsi_cb(0, cb, ep, (uint16_t)xfer);
+        note_cb(mock_now_ns - t0);
+        note_cmd("ATA PASS-THROUGH", mock_now_ns - t0);
+    }
+    tud_msc_scsi_complete_cb(0, cb);
     if (s.r > 0) s.data.assign(ep, ep + ((uint32_t)s.r < xfer ? (uint32_t)s.r : xfer));
     if (s.r < 0 && autosense) s.sense = request_sense(alloc);
     return s;
@@ -664,11 +745,12 @@ static bool written_is(uint32_t lba, const uint8_t *p) {
 static bool same_failure(const ide_fail_t &a, const ide_fail_t &b) { return memcmp(&a, &b, sizeof a) == 0; }
 static uint64_t ms_since(uint64_t t0) { return (mock_now_ns - t0) / 1000000; }
 
-// Pauses the old iteration-counted waits gave up on (3 s), and one just
-// inside the new limit (25 s), are waited out: no reset, the data right,
-// nothing recorded as a failure.
+// Pauses the old iteration-counted waits gave up on (3 s), and one well
+// inside the command limit (12 s of IDE_CMD_TIMEOUT_MS, 15 s), are waited
+// out: no reset, the data right, nothing recorded as a failure. Through the
+// USB callbacks, so inside the host command's budget.
 static void test_pause_outwaited(Mode m) {
-    std::string n = std::string("drive pauses 3 s and 25 s, outwaited, ") + lba_or_chs(m);
+    std::string n = std::string("drive pauses 3 s and 12 s, outwaited, ") + lba_or_chs(m);
     setup(n.c_str(), m);
     config.drive_write_protected = false;
     ide_fail_t f0; ide_last_failure(&f0);
@@ -677,13 +759,13 @@ static void test_pause_outwaited(Mode m) {
     std::vector<uint8_t> w = fill512(1, 1);
     sim.pause[L] = 3000000000ull;
     uint64_t t0 = mock_now_ns;
-    int32_t r = tud_msc_write10_cb(0, L, 0, w.data(), 512);
+    int32_t r = host_write10(L, w.data(), 1);
     CHECK(r == 512 && ms_since(t0) >= 3000, "3 s commit: r %d after %llu ms", r, (unsigned long long)ms_since(t0));
     CHECK(written_is(L, w.data()), "3 s commit: sector content");
     // Eight sectors, the pause after the third: the wait for the fourth DRQ
     std::vector<uint8_t> w8 = fill512(8, 2);
     sim.pause.clear(); sim.pause[L + 12] = 3000000000ull;
-    r = tud_msc_write10_cb(0, L + 10, 0, w8.data(), 4096);
+    r = host_write10(L + 10, w8.data(), 8);
     bool all = true;
     for (int i = 0; i < 8; i++) all = all && written_is(L + 10 + i, w8.data() + i * 512);
     CHECK(r == 4096 && all, "8 sectors, 3 s after the third: r %d content %d", r, all);
@@ -691,14 +773,14 @@ static void test_pause_outwaited(Mode m) {
     sim.pause.clear(); sim.pause[L + 104] = 3000000000ull;
     HostRead h = host_read10(L + 100, 8);
     CHECK(h.ok && matches_medium(h, L + 100), "read, 3 s before sector 5: ok %d size %zu", h.ok, h.data.size());
-    // 25 s: past any poll count the old code could have meant, inside 30 s
-    sim.pause.clear(); sim.pause[L + 200] = 25000000000ull;
+    // 12 s: past any poll count the old code could have meant, inside 15 s
+    sim.pause.clear(); sim.pause[L + 200] = 12000000000ull;
     std::vector<uint8_t> w25 = fill512(1, 3);
-    r = tud_msc_write10_cb(0, L + 200, 0, w25.data(), 512);
-    CHECK(r == 512 && written_is(L + 200, w25.data()), "25 s commit: r %d", r);
-    sim.pause.clear(); sim.pause[L + 300] = 25000000000ull;
+    r = host_write10(L + 200, w25.data(), 1);
+    CHECK(r == 512 && written_is(L + 200, w25.data()), "12 s commit: r %d", r);
+    sim.pause.clear(); sim.pause[L + 300] = 12000000000ull;
     h = host_read10(L + 300, 1);
-    CHECK(h.ok && matches_medium(h, L + 300), "read, 25 s: ok %d", h.ok);
+    CHECK(h.ok && matches_medium(h, L + 300), "read, 12 s: ok %d", h.ok);
     sim.pause.clear();
     ide_fail_t f; ide_last_failure(&f);
     CHECK(same_failure(f, f0), "a failure was recorded (kind %u cmd %02X)", f.kind, f.command);
@@ -745,16 +827,16 @@ static void test_pause_too_long(Mode m) {
     sim.pause.clear();
     HostRead g = host_read10(L + 100, 8);
     CHECK(g.ok && matches_medium(g, L + 100), "usable after the reset");
-    // The limit is for the whole command, as the host's is: two 20 s pauses
-    // in one 8-sector read end it at 30 s, after the fifth sector's wait began.
-    sim.pause[L + 202] = 20000000000ull;
-    sim.pause[L + 205] = 20000000000ull;
+    // The limit is for the whole command, as the host's is: two 8 s pauses
+    // in one 8-sector read end it at 15 s, after the fifth sector's wait began.
+    sim.pause[L + 202] = 8000000000ull;
+    sim.pause[L + 205] = 8000000000ull;
     done = 0;
     t0 = mock_now_ns;
     r = ide_read_sectors_partial(L + 200, 8, buf, &done);
     ms = ms_since(t0);
     CHECK(r < 0 && done == 5 && ms >= IDE_CMD_TIMEOUT_MS && ms < IDE_CMD_TIMEOUT_MS + 1000,
-          "two 20 s pauses: r %d done %u after %llu ms (a limit per sector would have read all 8)", r, done, (unsigned long long)ms);
+          "two 8 s pauses: r %d done %u after %llu ms (a limit per sector would have read all 8)", r, done, (unsigned long long)ms);
     sim.pause.clear();
     CHECK(sim.violations == 0 && sim.reset_writes == 0, "violations %d reset writes %d", sim.violations, sim.reset_writes);
 }
@@ -781,6 +863,13 @@ static void test_identify_slow() {
 // once, select the slave again, put the CHS geometry back, record that it
 // did, and the drive must work afterwards. A drive that stays busy through
 // the hardware reset too gets exactly one, and "reset FAILED".
+// The failing commands are sent by calling ide.c directly, outside any host
+// command, so each recovery runs to its end in one call; the same through
+// USB, where it spans host commands, is test_budget_* below. Also here, from
+// review 0.6f3p7: IORDY is ignored while the drive is in reset and believed
+// again once it is back (R1, R2, L-3), the RESET- pulse is the probe's 50 ms
+// (R5), Device Control gets nIEN=0 from the firmware whatever the drive came
+// out of reset with (R6).
 static void test_lone_slave_hw_reset(Mode m) {
     std::string n = std::string("lone slave, SRST does not bring it back, hardware reset does, ") + lba_or_chs(m);
     setup(n.c_str(), m);
@@ -791,13 +880,15 @@ static void test_lone_slave_hw_reset(Mode m) {
     uint16_t id[256];
     CHECK(ide_identify(id), "slave IDENTIFY");
     config.drive_write_protected = false;
+    config.iordy_enabled = true; ide_set_iordy(true);
+    sim.hw_reset_nien = true;
     sim.violations = 0; sim.init_params = 0;
     sim.srst_wedges = true;
     const uint32_t L = 2816372 % 166600;            // the finding's LBA, folded into this medium
     std::vector<uint8_t> w = fill512(1, 5);
     sim.pause[L] = 45000000000ull;
     uint64_t t0 = mock_now_ns;
-    int32_t r = tud_msc_write10_cb(0, L, 0, w.data(), 512);
+    int32_t r = ide_write_sectors(L, 1, w.data());
     ide_fail_t f; ide_last_failure(&f);
     CHECK(r < 0 && written_is(L, w.data()), "write r %d; the drive has the data", r);
     CHECK(f.kind == IDE_FAIL_TIMEOUT && f.command == 0x30 && f.done == 1, "kind %u cmd %02X done %u", f.kind, f.command, f.done);
@@ -809,11 +900,16 @@ static void test_lone_slave_hw_reset(Mode m) {
               "geometry after the hardware reset: %d %u x %u, %d INITIALIZE", sim.geo_valid, sim.heads, sim.spt, sim.init_params);
     CHECK(sim.cmd_count[0x10] >= 1, "no RECALIBRATE after the hardware reset");
     CHECK(ms_since(t0) < IDE_CMD_TIMEOUT_MS + 2 * 31000 + 5000, "took %llu ms", (unsigned long long)ms_since(t0));
+    CHECK(sim.iordy_stalls == 0, "%d register cycles with IORDY believed while the drive held it low", sim.iordy_stalls);
+    CHECK(mock_iordy_inover == GPIO_OVERRIDE_NORMAL, "IORDY not believed again once the drive was back (%u)", mock_iordy_inover);
+    CHECK(sim.min_reset_low >= 50000000ull, "RESET- held low %llu us, the probe holds it 50 ms",
+          (unsigned long long)(sim.min_reset_low / 1000));
+    CHECK(!(sim.devctl & 0x02), "nIEN left set after the hardware reset (Device Control %02X)", sim.devctl);
     sim.pause.clear();
     HostRead g = host_read10(100, 8);
     CHECK(g.ok && matches_medium(g, 100), "slave usable after the hardware reset");
     std::vector<uint8_t> w2 = fill512(1, 6);
-    r = tud_msc_write10_cb(0, L, 0, w2.data(), 512);
+    r = host_write10(L, w2.data(), 1);
     CHECK(r == 512 && written_is(L, w2.data()), "write after the hardware reset: r %d", r);
     // The same through a read that hangs: reset, hardware reset, prefix kept.
     sim.bad[5003] = {BAD_HANG, 0};
@@ -824,29 +920,51 @@ static void test_lone_slave_hw_reset(Mode m) {
           r, done, f.hw_reset, sim.hw_resets);
     sim.bad.clear();
 #if ATABOY_SAT
-    // A SAT command the drive never finishes: the abort escalates the same way.
+    // A SAT command the drive never finishes: the abort escalates the same
+    // way. Through USB, so it spans host commands: the one that timed out
+    // (10 s, then the soft reset for the rest of its 20 s), a retry that
+    // waits out most of the SRST's 31 s, and one that sends RESET- and gets
+    // the drive back. Each is answered inside its budget; the retries are
+    // refused as not ready, and nothing new reaches the drive until it is
+    // back. The failure record says what happened (review L-2).
     sim.hang_cmd = 0xF8;
+    int f8 = sim.cmd_count[0xF8];
     SatResult s = sat_cmd(native_max12(), 0, false);
-    CHECK(!s.ok() && sense_is(s.sense, 0x0B, 0x00, 0x00) && sim.hw_resets == 3, "SAT abort: hw resets %d", sim.hw_resets);
+    CHECK(!s.ok() && sense_is(s.sense, 0x0B, 0x00, 0x00) && sim.hw_resets == 2, "SAT abort: hw resets %d", sim.hw_resets);
+    ide_last_failure(&f);
+    CHECK(f.kind == IDE_FAIL_TIMEOUT && f.command == 0xF8 && f.reset && f.pending && !f.hw_reset,
+          "SAT abort record: kind %u cmd %02X reset %d pending %d hw %d", f.kind, f.command, f.reset, f.pending, f.hw_reset);
     sim.hang_cmd = 0;
-    s = sat_cmd(native_max12(), 0, false);
-    CHECK(is_desc(s.sense) && sense_is(s.sense, 0x01, 0x00, 0x1D), "SAT after the hardware reset");
+    int tries = 0;
+    do { s = sat_cmd(native_max12(), 0, false); tries++; }
+    while (tries < 5 && sense_is(s.sense, 0x02, 0x04, 0x00));
+    CHECK(is_desc(s.sense) && sense_is(s.sense, 0x01, 0x00, 0x1D) && tries == 2, "SAT after the hardware reset, try %d", tries);
+    CHECK(sim.hw_resets == 3 && sim.cmd_count[0xF8] == f8 + 2, "hw resets %d, F8 sent %d times (want 2: the hung one, the good one)",
+          sim.hw_resets, sim.cmd_count[0xF8] - f8);
+    ide_last_failure(&f);
+    CHECK(f.command == 0xF8 && f.hw_reset && !f.pending && !f.reset_failed, "record after: cmd %02X hw %d pending %d failed %d",
+          f.command, f.hw_reset, f.pending, f.reset_failed);
 #endif
     CHECK(sim.violations == 0, "violations %d", sim.violations);
     // Stays busy through the hardware reset as well: one attempt, then FAILED.
     sim.hw_reset_wedges = true;
     sim.pause[L] = 45000000000ull;
     int hw = sim.hw_resets;
-    r = tud_msc_write10_cb(0, L, 0, w.data(), 512);
+    r = ide_write_sectors(L, 1, w.data());
     ide_last_failure(&f);
     CHECK(r < 0 && f.reset && f.hw_reset && f.reset_failed, "wedged: reset %d hw %d failed %d", f.reset, f.hw_reset, f.reset_failed);
     CHECK(sim.hw_resets == hw + 1, "wedged: %d hardware resets, want exactly one", sim.hw_resets - hw);
     hw = sim.hw_resets;
     CHECK(sim.short_resets == 0, "RESET- held low too briefly %d times", sim.short_resets);
+    // Review L-3: the drive never came back, so IORDY stays ignored; the
+    // commands below read status from a drive still holding it low.
+    CHECK(mock_iordy_inover == GPIO_OVERRIDE_HIGH, "IORDY believed again although the drive never came back");
     HostRead d = host_read10(100, 8);
     CHECK(!d.ok && d.data.empty() && sim.hw_resets == hw, "while wedged: ok %d, %d more hardware resets", d.ok, sim.hw_resets - hw);
     ide_last_failure(&f);
     CHECK(f.kind == IDE_FAIL_NOT_READY, "while wedged: kind %u", f.kind);
+    CHECK(sim.iordy_stalls == 0, "%d register cycles with IORDY believed while the drive held it low", sim.iordy_stalls);
+    config.iordy_enabled = false;
 }
 
 // A master that stays busy after SRST: the reset gives up on device 0 after
@@ -885,7 +1003,7 @@ static void test_msc_busy_flag() {
     HostRead h = host_read10(100, 16);
     CHECK(h.ok && !usb_msc_ide_busy(), "after READ(10): ok %d", h.ok);
     std::vector<uint8_t> w(4096, 0x3C);
-    int32_t r = tud_msc_write10_cb(0, 500, 0, w.data(), 4096);
+    int32_t r = host_write10(500, w.data(), 8);
     CHECK(r == 4096 && !usb_msc_ide_busy(), "after WRITE(10): r %d", r);
     sim.bad[700] = {BAD_ERR, 0};
     h = host_read10(700, 1);
@@ -905,7 +1023,7 @@ static void test_msc_busy_flag() {
     is_mounted = false;
     c0 = sim.commands;
     h = host_read10(100, 8);
-    r = tud_msc_write10_cb(0, 500, 0, w.data(), 4096);
+    r = host_write10(500, w.data(), 8);
     CHECK(!h.ok && r < 0 && sim.commands == c0 && !usb_msc_ide_busy(), "unmounted: commands %d", sim.commands - c0);
     is_mounted = true;
 }
@@ -1271,7 +1389,7 @@ static void test_sat_sense_delivery() {
     config.drive_write_protected = false;
     s = sat_cmd(verify12(0x20, 1, 10), 0, false, 32, false);     // 01/00/1D, pending
     std::vector<uint8_t> wb(512, 0x5A);
-    r = tud_msc_write10_cb(0, 30, 0, wb.data(), 512);
+    r = host_write10(30, wb.data(), 1);
     CHECK(r == 512, "WRITE(10) ok: r %d", r);
     rs = request_sense(32);
     CHECK(rs.size() == 18 && rs[0] == 0xF0, "stale descriptor after WRITE(10): size %zu", rs.size());
@@ -1696,6 +1814,441 @@ static void test_no_sat() {
 }
 #endif
 
+// ---- review M-1: one time budget per host command -------------------------
+//
+// The first 0.6f3p7 draft gave every ATA command 30 s, the issue #13 call
+// again at the failing sector its own 30 s, and every reset its own 31 s,
+// inside one host command. The reviewer measured, on this simulator: a hang
+// at the fourth sector of an 8-sector READ(10) kept core 0 in the callbacks
+// for 60 s with two soft resets (0.6f3p6: 2 s); with SRST not bringing the
+// drive back, 123 s and two hardware resets; a lone slave that comes back
+// from neither, 92 s in one callback. A host gives up after 30 s and resets
+// the device under the callback.
+//
+// Below, every failure the review listed goes through the USB callbacks as a
+// host would send it, and the helpers fail any command that keeps core 0 past
+// the budget (note_cmd). A host that is told a command failed may send it
+// again: host_read_retry() does, up to `tries` commands in all, as Linux's sd
+// driver retries a failed command. What is checked besides the time: the
+// good prefix still reaches the host, a pending recovery sends nothing new to
+// the drive, RESET- is used at most once per recovery, a WRITE is never sent
+// to the drive a second time by the firmware, and the drive works afterwards.
+
+struct Timing { std::string name; uint64_t cb_ms, cmd_ms; };
+static std::vector<Timing> timings;
+static void keep_timing(const std::string &name) {
+    timings.push_back({ name, worst_cb_ns / 1000000, worst_cmd_ns / 1000000 });
+}
+
+// Sends READ(10) until it succeeds or `tries` commands have been sent.
+// Returns the command that succeeded (1-based), or 0.
+static int host_read_retry(uint32_t lba, uint32_t n, int tries, HostRead *out = nullptr) {
+    for (int i = 1; i <= tries; i++) {
+        HostRead h = host_read10(lba, n);
+        if (out) *out = h;
+        if (h.ok) return i;
+    }
+    return 0;
+}
+
+// Commands the drive got other than those of a recovery (RECALIBRATE,
+// INITIALIZE DEVICE PARAMETERS) and IDENTIFY.
+static int work_commands() {
+    int n = sim.commands;
+    for (uint8_t c : { 0x10, 0x91, 0xEC }) { auto it = sim.cmd_count.find(c); if (it != sim.cmd_count.end()) n -= it->second; }
+    return n;
+}
+
+// A hang at every position of an 8-sector READ(10), the drive back from the
+// soft reset: the command fails inside the budget with the good prefix, and
+// the issue #13 call at the failing sector, which has no time left to send a
+// command and still reset the drive, sends nothing (one READ reaches the
+// drive, not two). The drive works afterwards.
+static void test_budget_read_hang(Mode m) {
+    for (uint32_t k = 0; k < 8; k++) {
+        std::string n = std::string("budget: hang at sector ") + std::to_string(k) + " of 8, " + lba_or_chs(m);
+        setup(n.c_str(), m);
+        sim.bad[5000 + k] = {BAD_HANG, 0};
+        int reads = sim.cmd_count[0x20];
+        HostRead h = host_read10(5000, 8);
+        CHECK(!h.ok && h.data.size() == k * 512 && matches_medium(h, 5000), "ok %d prefix %zu", h.ok, h.data.size());
+        CHECK(sim.srst == 1 && sim.hw_resets == 0, "srst %d hw %d", sim.srst, sim.hw_resets);
+        CHECK(sim.cmd_count[0x20] == reads + 1, "%d READs sent (the call at the failing sector had no time)",
+              sim.cmd_count[0x20] - reads);
+        ide_fail_t f; ide_last_failure(&f);
+        CHECK(f.kind == IDE_FAIL_TIMEOUT && f.lba == 5000 + k && f.reset && !f.pending && !f.reset_failed,
+              "record: kind %u lba %u reset %d pending %d", f.kind, f.lba, f.reset, f.pending);
+        if (k == 3) keep_timing(std::string("hang at sector 3 of 8, SRST works (review A), ") + lba_or_chs(m));
+        sim.bad.clear();
+        HostRead g = host_read10(5000, 8);
+        CHECK(g.ok && matches_medium(g, 5000), "usable afterwards");
+        CHECK(sim.violations == 0, "violations %d", sim.violations);
+    }
+    // A single-sector READ(10) that hangs.
+    setup((std::string("budget: single-sector read hangs, ") + lba_or_chs(m)).c_str(), m);
+    sim.bad[777] = {BAD_HANG, 0};
+    HostRead h = host_read10(777, 1);
+    CHECK(!h.ok && h.data.empty() && sim.srst == 1, "ok %d srst %d", h.ok, sim.srst);
+    keep_timing(std::string("single-sector read hangs, ") + lba_or_chs(m));
+}
+
+// WRITE(10): the drive busy past the limit committing a sector (the
+// ST380011A finding), and one that never asks for the next sector. The
+// command fails inside the budget, the write reaches the drive once, and
+// the next write works.
+static void test_budget_write_hang(Mode m) {
+    setup((std::string("budget: write hangs, ") + lba_or_chs(m)).c_str(), m);
+    config.drive_write_protected = false;
+    const uint32_t L = 23456;
+    std::vector<uint8_t> w = fill512(8, 7);
+    sim.pause[L] = 45000000000ull;                  // commit of the only sector
+    int32_t r = host_write10(L, w.data(), 1);
+    CHECK(r < 0 && written_is(L, w.data()) && sim.cmd_count[0x30] == 1, "commit hang: r %d, %d WRITEs", r, sim.cmd_count[0x30]);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(f.kind == IDE_FAIL_TIMEOUT && f.command == 0x30 && f.reset && !f.pending, "record: kind %u cmd %02X", f.kind, f.command);
+    sim.pause.clear();
+    sim.pause[L + 102] = 45000000000ull;            // after the third of 8: no DRQ for the fourth
+    r = host_write10(L + 100, w.data(), 8);
+    CHECK(r < 0 && sim.cmd_count[0x30] == 2, "DRQ hang: r %d, %d WRITEs", r, sim.cmd_count[0x30]);
+    keep_timing(std::string("write hangs, SRST works, ") + lba_or_chs(m));
+    sim.pause.clear();
+    r = host_write10(L + 100, w.data(), 8);
+    bool all = true;
+    for (int i = 0; i < 8; i++) all = all && written_is(L + 100 + i, w.data() + i * 512);
+    CHECK(r == 4096 && all && sim.violations == 0, "write afterwards: r %d content %d", r, all);
+}
+
+// The reviewer's B: a hang at the fourth of 8 sectors, and the drive stays
+// busy through the soft reset; RESET- brings it back. The first command
+// fails with the prefix and the recovery pending; the host's next command
+// waits out more of ATA's 31 s and fails too, sending nothing; the one after
+// sends RESET- (once), gets the drive back, and reads. Meanwhile no command
+// of any kind is sent to the drive: a SAT command and a WRITE(10) are
+// refused without reaching it.
+static void test_budget_srst_fails(Mode m) {
+    setup((std::string("budget: SRST does not bring the drive back, ") + lba_or_chs(m)).c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    config.drive_write_protected = false;
+    sim.srst_wedges = true;
+    sim.bad[5003] = {BAD_HANG, 0};
+    HostRead h = host_read10(5000, 8);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(!h.ok && h.data.size() == 3 * 512 && matches_medium(h, 5000), "prefix %zu", h.data.size());
+    CHECK(f.kind == IDE_FAIL_TIMEOUT && f.reset && f.pending && !f.hw_reset, "record: kind %u pending %d hw %d",
+          f.kind, f.pending, f.hw_reset);
+    sim.bad.clear();
+    // The next command waits out 20 s more of the 31 s and is refused, with
+    // nothing sent to the drive.
+    int work = work_commands();
+#if ATABOY_SAT
+    // (SAT reads are LBA mode only; in CHS mode READ NATIVE MAX stands in.)
+    SatResult s = m == LBA ? sat_cmd(pt12(4, 0x0E, 0, 1, 100, 0xE0, 0x20), 512, true) : sat_cmd(native_max12(), 0, false);
+    CHECK(!s.ok() && sense_is(s.sense, 0x02, 0x04, 0x00), "SAT while the recovery is pending: r %d", s.r);
+#else
+    HostRead p = host_read10(100, 1);
+    CHECK(!p.ok, "READ(10) while the recovery is pending");
+#endif
+    CHECK(work_commands() == work && sim.hw_resets == 0, "%d commands sent while the recovery was pending", work_commands() - work);
+    // The one after sends RESET-, gets the drive back, and then does its own
+    // work: a WRITE, sent once.
+    std::vector<uint8_t> w = fill512(1, 9);
+    int32_t r = host_write10(9000, w.data(), 1);
+    CHECK(r == 512 && written_is(9000, w.data()) && sim.cmd_count[0x30] == 1, "write after the recovery: r %d", r);
+    int got = host_read_retry(5000, 8, 5, &h);
+    CHECK(got == 1 && h.ok && matches_medium(h, 5000), "read after the recovery: try %d", got);
+    CHECK(sim.hw_resets == 1, "%d hardware resets for one recovery", sim.hw_resets);
+    ide_last_failure(&f);
+    CHECK(f.hw_reset && !f.pending && !f.reset_failed, "record: hw %d pending %d failed %d", f.hw_reset, f.pending, f.reset_failed);
+    if (m == CHS) CHECK(sim.geo_valid && sim.heads == 5 && sim.spt == 34, "geometry %d %u x %u", sim.geo_valid, sim.heads, sim.spt);
+    CHECK(sim.violations == 0 && sim.reset_writes == 0, "violations %d reset writes %d", sim.violations, sim.reset_writes);
+    keep_timing(std::string("hang at sector 3, SRST fails, RESET- works (review B), ") + lba_or_chs(m));
+}
+
+// The fixed margin: RESET- is due 10 ms before the host command's time runs
+// out (the SRST's 31 s end then). The 52 ms of the pulse and its settle time
+// go past the budget; that is what HOST_MARGIN_MS allows, and no more.
+static void test_budget_reset_at_the_end() {
+    setup("budget: RESET- due in the last 10 ms of a command", LBA);
+    sim.srst_wedges = true;
+    sim.bad[5003] = {BAD_HANG, 0};
+    HostRead h = host_read10(5000, 8);              // SRST at about 15 s, pending at 20 s
+    sim.bad.clear();
+    uint64_t srst = sim.srst_at;
+    // The host's next command comes when the SRST's 31 s will end 10 ms
+    // before that command's 20 s do.
+    mock_now_ns = srst + (IDE_SRST_TIMEOUT_MS - IDE_HOST_BUDGET_MS + 10) * 1000000ull;
+    reset_worst();
+    h = host_read10(5000, 8);
+    CHECK(sim.hw_resets == 1 && !h.ok, "hw resets %d ok %d", sim.hw_resets, h.ok);
+    CHECK(worst_cmd_ns > IDE_HOST_BUDGET_MS * 1000000ull, "the pulse was not past the budget (%llu ms): the test missed the edge",
+          (unsigned long long)(worst_cmd_ns / 1000000));
+    keep_timing("RESET- due in the last 10 ms of a command");
+    int got = host_read_retry(5000, 8, 3, &h);
+    CHECK(got == 1 && h.ok && matches_medium(h, 5000) && sim.hw_resets == 1, "afterwards: try %d hw %d", got, sim.hw_resets);
+}
+
+// The reviewer's C: a lone slave that comes back from neither reset, IORDY
+// enabled. Every command fails inside the budget, RESET- is used once, IORDY
+// stays ignored while the drive holds it low (review L-3), and once the
+// recovery is over the record says it failed and later commands are refused
+// as not ready without another reset. When the drive does come back, it
+// works, and IORDY is believed again.
+static void test_budget_lone_slave_wedged() {
+    setup("budget: lone slave, back from neither reset", LBA);
+    sim.slave = true;
+    ide_select_device(0xB0); ide_write_reg(6, 0xB0); busy_wait_us_32(1);
+    uint16_t id[256];
+    CHECK(ide_identify(id), "slave IDENTIFY");
+    config.iordy_enabled = true; ide_set_iordy(true);
+    sim.srst_wedges = true; sim.hw_reset_wedges = true;
+    sim.bad[5000] = {BAD_HANG, 0};
+    int reads = sim.cmd_count[0x20];
+    int got = host_read_retry(5000, 1, 6);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(got == 0 && sim.hw_resets == 1 && sim.srst == 1, "try %d, hw resets %d, srst %d", got, sim.hw_resets, sim.srst);
+    CHECK(sim.cmd_count[0x20] == reads + 1, "%d READs sent to a drive that never came back", sim.cmd_count[0x20] - reads);
+    CHECK(f.kind == IDE_FAIL_NOT_READY || (f.hw_reset && f.reset_failed), "record: kind %u hw %d failed %d", f.kind, f.hw_reset, f.reset_failed);
+    CHECK(sim.iordy_stalls == 0 && mock_iordy_inover == GPIO_OVERRIDE_HIGH, "IORDY: %d stalls, override %u",
+          sim.iordy_stalls, mock_iordy_inover);
+    keep_timing("lone slave, back from neither reset (review C)");
+    // Six more commands: still nothing but not ready, and no second RESET-.
+    got = host_read_retry(100, 8, 6);
+    ide_last_failure(&f);
+    CHECK(got == 0 && sim.hw_resets == 1 && f.kind == IDE_FAIL_NOT_READY, "later: try %d hw %d kind %u", got, sim.hw_resets, f.kind);
+    // The drive comes back by itself.
+    sim.srst_wedges = false; sim.hw_reset_wedges = false; sim.wedged = false; sim.bad.clear();
+    HostRead h;
+    got = host_read_retry(100, 8, 2, &h);
+    CHECK(got == 1 && h.ok && matches_medium(h, 100), "once the drive is back: try %d", got);
+    CHECK(mock_iordy_inover == GPIO_OVERRIDE_NORMAL && sim.iordy_stalls == 0, "IORDY not believed again, or stalled (%d)", sim.iordy_stalls);
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+    config.iordy_enabled = false;
+}
+
+// Data left over from an earlier command, and the soft reset that should
+// clear it does not bring the drive back: the stale block is never handed
+// over, the recovery spans host commands, and RESET- is used once.
+static void test_budget_stale_drq() {
+    setup("budget: stale DRQ, SRST does not bring the drive back", LBA);
+    for (int i = 0; i < 256; i++) sim.xfer[i] = 0xDEAD;
+    sim.widx = 0; sim.phase = SimDrive::DRQ_IN; sim.status = 0x58; sim.left = 1;
+    sim.srst_wedges = true;
+    HostRead h;
+    int got = host_read_retry(300, 4, 5, &h);
+    CHECK(got >= 2 && h.ok && matches_medium(h, 300) && sim.hw_resets == 1, "try %d, hw resets %d", got, sim.hw_resets);
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+    keep_timing("stale DRQ, SRST fails, RESET- works");
+}
+
+#if ATABOY_SAT
+// SAT: a non-data command the drive never ends, and a PIO read that never
+// gives data. Aborted inside the budget, recorded (review L-2), and the next
+// command works.
+static void test_budget_sat_timeout() {
+    setup("budget: SAT commands time out", LBA);
+    sim.hang_cmd = 0xB0;
+    SatResult s = sat_cmd(smart_status12(), 0, false);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(!s.ok() && sense_is(s.sense, 0x0B, 0x00, 0x00) && sim.srst == 1, "r %d srst %d", s.r, sim.srst);
+    CHECK(f.kind == IDE_FAIL_TIMEOUT && f.command == 0xB0 && f.reset && !f.pending, "record: kind %u cmd %02X", f.kind, f.command);
+    sim.hang_cmd = 0x20;
+    s = sat_cmd(pt12(4, 0x0E, 0, 2, 0x1234, 0xE0, 0x20), 1024, true);
+    ide_last_failure(&f);
+    CHECK(!s.ok() && s.data.empty() && f.command == 0x20 && f.lba == 0x1234 && f.count == 2,
+          "PIO: r %d cmd %02X lba %x count %u", s.r, f.command, f.lba, f.count);
+    sim.hang_cmd = 0;
+    keep_timing("SAT non-data and PIO commands time out, SRST works");
+    s = sat_cmd(smart_status12(), 0, false);
+    CHECK(is_desc(s.sense) && sense_is(s.sense, 0x01, 0x00, 0x1D), "SAT afterwards");
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+}
+
+// The identity check's IDENTIFY gets no answer: aborted after its 10 s with
+// a reset and recorded, the gated command refused and never sent, all inside
+// the budget; nothing is left stranded for the next READ(10).
+static void test_budget_identity_timeout() {
+    setup("budget: identity check IDENTIFY times out", LBA);
+    sim.t_identify_extra = 60000000000ull;
+    int b0 = sim.cmd_count[0xB0];
+    SatResult s = sat_cmd(smart_status12(), 0, false);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(!s.ok() && sense_is(s.sense, 0x05, 0x24, 0x00) && sim.cmd_count[0xB0] == b0, "r %d, SMART sent %d times",
+          s.r, sim.cmd_count[0xB0] - b0);
+    CHECK(f.kind == IDE_FAIL_TIMEOUT && f.command == 0xEC && f.reset && sim.srst == 1, "record: kind %u cmd %02X srst %d",
+          f.kind, f.command, sim.srst);
+    keep_timing("identity check IDENTIFY times out");
+    sim.t_identify_extra = 0;
+    HostRead h = host_read10(1000, 8);
+    CHECK(h.ok && matches_medium(h, 1000) && sim.violations == 0, "READ(10) afterwards: ok %d", h.ok);
+}
+#endif
+
+// usb.c's command boundaries. The chunks of one READ(10) or WRITE(10) share
+// one budget; the next command, after TinyUSB's complete callback, has its
+// own; so does one after a USB reset (tud_mount_cb) that abandoned the last
+// command mid-way.
+static void test_budget_boundaries() {
+    setup("budget: the chunks of one command share it", LBA);
+    config.drive_write_protected = false;
+    const uint32_t L = 40000;
+    sim.pause[L + 2] = 12000000000ull;              // first chunk
+    sim.pause[L + 10] = 12000000000ull;             // second chunk: 3 s left for it
+    HostRead h = host_read10(L, 16);
+    CHECK(!h.ok && h.data.size() == 10 * 512 && matches_medium(h, L), "READ(10) of 16: ok %d size %zu", h.ok, h.data.size());
+    sim.pause.clear();
+    std::vector<uint8_t> w = fill512(16, 3);
+    sim.pause[L + 102] = 12000000000ull;            // WRITE: the commit of sector 2, then sector 10
+    sim.pause[L + 110] = 12000000000ull;
+    int32_t r = host_write10(L + 100, w.data(), 16);
+    CHECK(r < 0 && sim.cmd_count[0x30] == 2, "WRITE(10) of 16: r %d, %d WRITEs", r, sim.cmd_count[0x30]);
+    sim.pause.clear();
+
+    setup("budget: each command has its own", LBA);
+    sim.pause[L + 1] = 12000000000ull;
+    sim.pause[L + 9] = 12000000000ull;
+    HostRead a = host_read10(L, 8);
+    HostRead b = host_read10(L + 8, 8);             // starts where the last one ended
+    CHECK(a.ok && b.ok && matches_medium(b, L + 8), "two 12 s commands in a row: %d %d", a.ok, b.ok);
+
+    setup("budget: a USB reset ends an abandoned command", LBA);
+    static uint8_t buf[CFG_TUD_MSC_EP_BUFSIZE];
+    sim.pause[L + 1] = 12000000000ull;
+    sim.pause[L + 9] = 12000000000ull;
+    int32_t r1 = tud_msc_read10_cb(0, L, 0, buf, 4096);    // first chunk of 16, then the host resets
+    tud_mount_cb();                                         // SET_CONFIGURATION after the USB reset
+    HostRead c = host_read10(L + 8, 8);
+    CHECK(r1 == 4096 && c.ok, "after the reset: first %d, new command ok %d", r1, c.ok);
+    // A bulk-only reset has no callback: a READ(10) that starts exactly where
+    // the abandoned one stopped inherits what is left of its budget (usb.c).
+    // It may fail for that, but never outlasts it.
+    setup("budget: after a bulk-only reset (no callback)", LBA);
+    sim.pause[L + 1] = 12000000000ull;
+    sim.pause[L + 9] = 12000000000ull;
+    uint64_t t0 = mock_now_ns;
+    r1 = tud_msc_read10_cb(0, L, 0, buf, 4096);
+    HostRead d = host_read10(L + 8, 8);
+    CHECK(r1 == 4096 && mock_now_ns - t0 <= HOST_LIMIT_NS, "abandoned and next: %llu ms", (unsigned long long)ms_since(t0));
+    (void)d;
+    // ...but only one that starts exactly there, in the same direction. A
+    // WRITE(10) there, or a READ(10) anywhere else, is a new command.
+    setup("budget: after a bulk-only reset, a new command elsewhere", LBA);
+    config.drive_write_protected = false;
+    sim.pause[L + 1] = 12000000000ull;
+    sim.pause[L + 8] = 12000000000ull;              // the commit of the write below
+    sim.pause[L + 101] = 12000000000ull;
+    sim.pause[L + 21] = 12000000000ull;             // the second abandoned READ(10) below
+    r1 = tud_msc_read10_cb(0, L, 0, buf, 4096);
+    std::vector<uint8_t> w8 = fill512(8, 4);
+    int32_t wr = host_write10(L + 8, w8.data(), 8);
+    CHECK(r1 == 4096 && wr == 4096, "WRITE(10) where an abandoned READ(10) stopped: r %d", wr);
+    r1 = tud_msc_read10_cb(0, L + 20, 0, buf, 4096);
+    HostRead e = host_read10(L + 100, 8);
+    CHECK(r1 == 4096 && e.ok, "READ(10) elsewhere after an abandoned one: ok %d", e.ok);
+}
+
+// A detection (the probe pulses RESET- itself) ends a recovery in progress:
+// the record no longer says pending, and the next command does not wait on it.
+static void test_redetect_ends_recovery() {
+    setup("a re-detect ends a pending recovery", LBA);
+    sim.srst_wedges = true;
+    sim.bad[5003] = {BAD_HANG, 0};
+    HostRead h = host_read10(5000, 8);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(!h.ok && f.pending, "pending %d", f.pending);
+    sim.bad.clear();
+    is_mounted = false;                             // Auto Detect runs unmounted, on core 1
+    CHECK(ide_probe_devices() == 0xA0, "probe");
+    ide_last_failure(&f);
+    CHECK(!f.pending && f.kind == IDE_FAIL_TIMEOUT, "after the probe: pending %d kind %u", f.pending, f.kind);
+    is_mounted = true;
+    uint64_t t0 = mock_now_ns;
+    h = host_read10(5000, 8);
+    CHECK(h.ok && matches_medium(h, 5000) && ms_since(t0) < 100 && sim.hw_resets == 1,
+          "read after the probe: ok %d after %llu ms, RESET- %d (the probe's)", h.ok, (unsigned long long)ms_since(t0), sim.hw_resets);
+}
+
+// Review L-2: the reset flags cover the host command. The hardware reset
+// here is sent by the command that finds a recovery pending; the read it
+// then sends fails with a plain ERR (no reset of its own), and so does the
+// issue #13 call at the failing sector. The record still says RESET- was
+// used in this command. A later command's failure does not carry it.
+static void test_budget_record_sticky() {
+    setup("budget: reset flags cover the host command", LBA);
+    sim.srst_wedges = true;
+    sim.bad[5003] = {BAD_HANG, 0};
+    HostRead h = host_read10(5000, 8);              // SRST, pending
+    sim.bad.clear();
+    h = host_read10(5000, 8);                       // most of the 31 s, still pending
+    CHECK(!h.ok && sim.hw_resets == 0, "second command: ok %d hw %d", h.ok, sim.hw_resets);
+    sim.bad[6003] = {BAD_ERR, 0};
+    h = host_read10(6000, 8);                       // RESET-, back, then ERR at 6003 twice
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(!h.ok && h.data.size() == 3 * 512 && sim.hw_resets == 1 && sim.attempts[6003] == 2,
+          "ok %d size %zu hw %d attempts %d", h.ok, h.data.size(), sim.hw_resets, sim.attempts[6003]);
+    CHECK(f.kind == IDE_FAIL_ERR && f.lba == 6003 && f.count == 5 && f.reset && f.hw_reset && !f.reset_failed,
+          "record of the call at the failing sector: kind %u lba %u count %u reset %d hw %d", f.kind, f.lba, f.count, f.reset, f.hw_reset);
+    h = host_read10(6003, 1);
+    ide_last_failure(&f);
+    CHECK(!h.ok && f.kind == IDE_FAIL_ERR && !f.reset && !f.hw_reset, "next command: reset %d hw %d", f.reset, f.hw_reset);
+}
+
+// Review R7: the time is up at exactly the limit, not a millisecond later.
+static void test_deadline_boundary() {
+    setup("deadline boundary: a read gives up at exactly IDE_CMD_TIMEOUT_MS", LBA);
+    mock_now_ns = (mock_now_ns / 1000000 + 1) * 1000000;    // on a millisecond
+    sim.pause[900] = 45000000000ull;
+    uint8_t buf[512]; uint32_t done = 0;
+    int32_t r = ide_read_sectors_partial(900, 1, buf, &done);
+    uint64_t gave_up = sim.srst_at - sim.cmd_at;
+    CHECK(r < 0 && sim.srst == 1, "r %d srst %d", r, sim.srst);
+    CHECK(gave_up >= (IDE_CMD_TIMEOUT_MS - 1) * 1000000ull && gave_up < IDE_CMD_TIMEOUT_MS * 1000000ull + 500000,
+          "gave up %llu us after the command, want %u ms", (unsigned long long)(gave_up / 1000), (unsigned)IDE_CMD_TIMEOUT_MS);
+}
+
+// Review L-4 (and R3): RECALIBRATE after the hardware reset must have ended
+// before INITIALIZE DEVICE PARAMETERS goes out. A drive that never ends it:
+// no 0x91 over the busy drive, and the recovery is recorded as failed. A
+// drive slow to raise BSY for it, with no INTRQ: its idle status before it
+// started is not taken as the end. Called directly, so each recovery runs to
+// its end in one call.
+static void test_recal_after_hw_reset() {
+    setup("RECALIBRATE after RESET-: never ends", CHS);
+    chs_user_geometry();
+    sim.srst_wedges = true;
+    sim.bad[5003] = {BAD_HANG, 0};
+    sim.hang_cmd = 0x10;
+    uint8_t buf[8 * 512]; uint32_t done = 0;
+    int32_t r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(r < 0 && f.hw_reset && f.reset_failed && sim.cmd_count[0x10] == 1, "hw %d failed %d RECAL %d",
+          f.hw_reset, f.reset_failed, sim.cmd_count[0x10]);
+    CHECK(sim.init_params == 0 && sim.violations == 0, "0x91 sent %d times, violations %d", sim.init_params, sim.violations);
+
+    setup("RECALIBRATE after RESET-: slow to start, no INTRQ", CHS);
+    chs_user_geometry();
+    sim.srst_wedges = true;
+    sim.intrq_wired = false;
+    sim.t_bsy_delay = 5000;
+    sim.t_recal = 5000000;
+    sim.bad[5003] = {BAD_HANG, 0};
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_last_failure(&f);
+    CHECK(r < 0 && f.hw_reset && !f.reset_failed && sim.init_params == 1, "hw %d failed %d 0x91 %d", f.hw_reset, f.reset_failed,
+          sim.init_params);
+    CHECK(sim.violations == 0 && sim.geo_valid && sim.heads == 5, "violations %d (0x91 while RECALIBRATE ran)", sim.violations);
+}
+
+// Review R4: IDENTIFY that ends at once with ERR and a block of data, from a
+// drive that shows no BSY and has no INTRQ wired. The DRQ shows the command
+// started, so it is an error, never 256 words of IDENTIFY.
+static void test_identify_err_drq() {
+    setup("IDENTIFY ends at once with ERR and data", LBA);
+    sim.identify_err_drq = true; sim.intrq_wired = false; sim.t_sector = 0;
+    uint16_t id[256];
+    CHECK(!ide_identify(id), "an aborted IDENTIFY taken as its answer");
+    CHECK(!(sim.read_status(mock_now_ns + 1000000) & 0x08) && sim.violations == 0, "DRQ left, or violations %d", sim.violations);
+}
+
 #if ATABOY_SAT
 // The shipping build refuses SMART READ DATA (D0) and RETURN STATUS (DA):
 // on ATA-3 drives both save attribute values to the drive (sat_policy.h).
@@ -1730,6 +2283,13 @@ static void test_sat_smart_saves_off(Mode m) {
 #endif
 
 int main() {
+    // The budget is a design number, not only what the helpers measure
+    // against: 10 s under the 30 s that Linux and the project's tools give a
+    // command (ide.c). A larger one would pass every test above and still
+    // lose the host.
+    current = "budget design";
+    CHECK(IDE_HOST_BUDGET_MS <= 20000 && IDE_RECOVERY_RESERVE_MS >= 5000 && HOST_MARGIN_MS <= 100,
+          "budget %u ms, reserve %u ms", (unsigned)IDE_HOST_BUDGET_MS, (unsigned)IDE_RECOVERY_RESERVE_MS);
 #if ATABOY_SAT && !ATABOY_SAT_SMART_SAVES
     test_sat_smart_saves_off(LBA);
     test_sat_smart_saves_off(CHS);
@@ -1774,6 +2334,26 @@ int main() {
     test_lone_slave_hw_reset(CHS);
     test_master_hw_reset();
     test_identify_slow();
+    // review M-1 and the LOW items of the 0.6f3p7 review
+    test_budget_read_hang(LBA);
+    test_budget_read_hang(CHS);
+    test_budget_write_hang(LBA);
+    test_budget_write_hang(CHS);
+    test_budget_srst_fails(LBA);
+    test_budget_srst_fails(CHS);
+    test_budget_lone_slave_wedged();
+    test_budget_reset_at_the_end();
+    test_budget_stale_drq();
+#if ATABOY_SAT
+    test_budget_sat_timeout();
+    test_budget_identity_timeout();
+#endif
+    test_budget_boundaries();
+    test_redetect_ends_recovery();
+    test_budget_record_sticky();
+    test_deadline_boundary();
+    test_recal_after_hw_reset();
+    test_identify_err_drq();
 #if ATABOY_SAT
     test_sat_smart_status(LBA);
     test_sat_smart_status(CHS);
@@ -1801,6 +2381,11 @@ int main() {
 #else
     test_no_sat();
 #endif
+    // Worst time core 0 spent in one callback, and in one host command, per
+    // failure scenario (the report quotes these).
+    for (auto &tm : timings)
+        std::printf("budget: %-62s callback %6llu ms, command %6llu ms\n", tm.name.c_str(),
+                    (unsigned long long)tm.cb_ms, (unsigned long long)tm.cmd_ms);
     std::printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;
 }

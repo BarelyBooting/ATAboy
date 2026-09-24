@@ -17,9 +17,10 @@
 #define FWUPDATE_KEY        0x06
 
 // How long Y waits for a USB mass storage command that is still running on
-// core 0 before giving up. Since 0.6f3p7 a READ(10) or WRITE(10) on a stuck
-// drive can take longer than this (30 s, then the resets in ide.c); Y then
-// refuses, which is the safe answer, and can be tried again.
+// core 0 before giving up. Since review M-1 (0.6f3p7) a host command ends
+// within its budget, IDE_HOST_BUDGET_MS (20 s, ide.h), plus a small margin,
+// so this is three times that; should one still be running, Y refuses,
+// which is the safe answer, and can be tried again.
 #define FWUPDATE_WAIT_MS    60000u
 
 // Does this key, on this screen, open the prompt? Only on the main menu, and

@@ -44,7 +44,11 @@ static inline void gpio_set_dir(unsigned, bool) {}
 static inline void gpio_pull_down(unsigned) {}
 static inline void gpio_pull_up(unsigned) {}
 static inline void gpio_disable_pulls(unsigned) {}
-static inline void gpio_set_inover(unsigned, unsigned) {}
+// IORDY (GPIO 29) input override, as the firmware last set it: NORMAL means
+// IORDY is believed, HIGH means it is ignored. The simulator uses it to see
+// a PIO cycle that would wait on a drive holding IORDY low (review R1, R2).
+inline unsigned mock_iordy_inover = 0;
+static inline void gpio_set_inover(unsigned pin, unsigned v) { if (pin == 29) mock_iordy_inover = v; }
 static inline void gpio_put(unsigned pin, bool v) {
     if (v) mock_gpio_out |= (1u << pin); else mock_gpio_out &= ~(1u << pin);
     if (pin == 23) mock_reset_line(v);

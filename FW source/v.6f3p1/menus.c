@@ -735,9 +735,10 @@ static void run_debug_errors(void) {
     if (f.kind == IDE_FAIL_NONE) {
         debug_print(2, FG_WHITE, "[Last Failed I/O] none since power-up");
     } else {
-        static const char *kinds[] = {"?", "not ready", "ERR", "timeout", "stale data", "no geometry"};
+        static const char *kinds[] = {"?", "not ready", "ERR", "timeout", "stale data", "no geometry",
+                                      "no time", "bad end"};
         debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
-                    f.command, kinds[f.kind < 6 ? f.kind : 0], (unsigned long)f.lba,
+                    f.command, kinds[f.kind < 8 ? f.kind : 0], (unsigned long)f.lba,
                     (unsigned long)f.done, (unsigned long)f.count);
         // "HW reset": the soft reset did not bring the drive back, so RESET-
         // was used as well (both devices on the cable). The longest row,
@@ -747,6 +748,10 @@ static void run_debug_errors(void) {
         debug_print(3, FG_WHITE, "ST:%02X ERR:%02X SC:%02X SN:%02X CL:%02X CH:%02X DH:%02X%s%s",
                     f.status, f.error, f.tf[0], f.tf[1], f.tf[2], f.tf[3], f.tf[4],
                     f.drained ? "  drained" : "", rs);
+        // The drive was not back when the USB command's time ran out (review
+        // M-1): the next USB command carries on with the reset first.
+        if (f.pending)
+            debug_print(4, FG_YELLOW, "Reset still running: the next USB command waits for it");
     }
 }
 
@@ -779,38 +784,44 @@ static void run_seek_test(void) {
 }
 
 // ---------------------------------------------------------------------------
-//  Core 1 and a USB command still running (review L-5)
+//  Core 1 and a USB command still running (review L-5, L-1)
 // ---------------------------------------------------------------------------
 // Unmounting stops new USB commands from reaching the drive, but one that
 // started before the unmount can still be running on core 0 (usb.c,
-// usb_msc_ide_busy), for a long time: up to IDE_CMD_TIMEOUT_MS on the command
-// and then the resets (ide.c). Auto Detect and the debug commands drive the
-// bus from core 1, and two cores on the bus at once can corrupt either one's
-// command. So they wait for it first, up to IDE_BUS_WAIT_MS, Esc cancels, and
-// if it is still running they do nothing and say why. Once the flag reads
-// clear with nothing mounted it stays clear for bus purposes: a callback that
-// starts later sees "not mounted" and never touches the drive (usb.c).
-#define IDE_BUS_WAIT_MS 60000u
+// usb_msc_ide_busy), for up to the host command's budget (IDE_HOST_BUDGET_MS,
+// ide.h) and a small margin. Auto Detect and the debug commands drive the bus
+// from core 1, and two cores on the bus at once can corrupt either one's
+// command. So they wait for it first, up to IDE_BUS_WAIT_MS.
+// Review L-1: while core 0 is inside that callback it does not run cdc_task(),
+// which carries console bytes both ways. A message drawn during the wait only
+// reaches the screen once the wait is over, and a key pressed during it only
+// reaches core 1 then too. The first 0.6f3p7 draft printed "Waiting ... (Esc:
+// cancel)" and read Esc meanwhile; neither could work. So the wait is silent
+// and cannot be cancelled, and because it could not be, what was asked for is
+// NOT then done: the screen says a USB command was running and nothing was
+// sent, and the key can simply be pressed again (by then the drive may also
+// have been reset by that command, which is worth a look first). If the
+// command is somehow still running after IDE_BUS_WAIT_MS, it says that.
+// Once the flag reads clear with nothing mounted it stays clear for bus
+// purposes: a callback that starts later sees "not mounted" and never touches
+// the drive (usb.c).
+#define IDE_BUS_WAIT_MS (IDE_HOST_BUDGET_MS + 5000u)
 
-// True once no USB command is using the bus. On false the caller must not
-// touch it. on_debug: where to say so (the debug box, or a confirm box).
+// True if no USB command was using the bus: go ahead. False: one was (or
+// still is), nothing may be sent, and the screen now says so. on_debug: where
+// (the debug box, or a confirm box that waits for a key).
 static bool bus_free_wait(bool on_debug) {
     if (!usb_msc_ide_busy()) return true;
-    const char *wait_msg = "Waiting for a USB command to finish (Esc: cancel)";
-    if (on_debug) debug_print(0, FG_YELLOW, "%s", wait_msg); else draw_confirm_box(wait_msg);
     uint32_t t0 = to_ms_since_boot(get_absolute_time());
-    while (usb_msc_ide_busy()) {
-        bool esc = cdc_getchar_timeout_us(20000) == KEY_ESC;
-        if (esc || to_ms_since_boot(get_absolute_time()) - t0 >= IDE_BUS_WAIT_MS) {
-            const char *no = esc ? "Cancelled, nothing sent to the drive. Press a key"
-                                 : "USB still busy, nothing sent to the drive. Press a key";
-            if (on_debug) debug_print(0, FG_RED, "%s", no); else draw_confirm_box(no);
-            if (!on_debug) while (get_input() == -1) tight_loop_contents();
-            return false;
-        }
-    }
-    if (on_debug) debug_print(0, FG_WHITE, "");
-    return true;
+    while (usb_msc_ide_busy() && to_ms_since_boot(get_absolute_time()) - t0 < IDE_BUS_WAIT_MS)
+        sleep_ms(10);
+    bool still = usb_msc_ide_busy();
+    const char *no = still ? "USB still busy, nothing sent to the drive. Press a key"
+                           : on_debug ? "A USB command was running, nothing sent. Try again"
+                                      : "A USB command was running, nothing sent. Press a key";
+    if (on_debug) debug_print(0, FG_RED, "%s", no); else draw_confirm_box(no);
+    if (!on_debug) while (get_input() == -1) tight_loop_contents();
+    return false;
 }
 
 // Debug screen keys other than Esc. Every one of them reads or drives the
@@ -932,7 +943,10 @@ static void fwupdate_confirmed(void) {
             return;
         }
         if (step == FWUPDATE_WAIT) {
-            if (!told) { draw_confirm_box("Waiting for a USB command to finish (Esc: cancel)"); told = true; }
+            // No "Esc: cancel" here (review L-1): while the command runs on
+            // core 0 neither this box nor a key gets through. An Esc typed
+            // before it started is still honoured.
+            if (!told) { draw_confirm_box("Waiting for a USB command to finish"); told = true; }
             if (cdc_getchar_timeout_us(20000) == KEY_ESC) return;
             continue;
         }
