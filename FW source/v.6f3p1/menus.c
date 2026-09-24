@@ -224,7 +224,7 @@ static void draw_bios_frame(void) {
     // whether an erase uses the current background colour depends on the
     // terminal (screen with bce off, for one, erases to the default colour).
     for (int row = 1; row <= 24; row++) cdc_printf("\033[%d;1H%80s", row, "");
-    cdc_printf("\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p1 (fork) - (C) 2026 obsoletetech.us");
+    cdc_printf("\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p3 (fork) - (C) 2026 obsoletetech.us");
 
     bool feat = (current_screen == SCREEN_FEATURES);
 
