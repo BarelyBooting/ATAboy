@@ -28,6 +28,8 @@ static struct {
     uint16_t w82, w83, w84;
 } id_words;
 
+void ide_id_words_forget(void) { id_words.valid = false; }
+
 void ide_id_words(ide_id_words_t *out) {
     out->valid = id_words.valid && id_words.dev_base == dev_base;
     out->w82 = id_words.w82;

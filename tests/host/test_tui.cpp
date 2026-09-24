@@ -19,6 +19,8 @@ static inline bool time_reached(absolute_time_t t) { return get_absolute_time() 
 
 uint64_t mock_now_ns = 0;
 int mock_usb_boot_requests = 0;
+int mock_id_words_forgotten = 0;
+void ide_id_words_forget(void) { mock_id_words_forgotten++; }
 uint32_t mock_gpio_out = 0;
 MockSio mock_sio;
 bool mock_intrq(void) { return false; }

@@ -233,6 +233,9 @@ MUTANTS = [
      '#endif\n    if (!is_mounted || config.drive_write_protected) return -1;'),
     ('SAT: HOB bytes read with HOB clear', 'ide.c',
      '        ide_write_control(0x80);\n        r->hob_count', '        ide_write_control(0x00);\n        r->hob_count'),
+    # --- unmount forgets the IDENTIFY words (review follow-up to H1) ---
+    ('unmount keeps the old drive IDENTIFY words', 'menus.c',
+     '    media_changed_waiting = true;\n    ide_id_words_forget();\n', '    media_changed_waiting = true;\n'),
     # --- M3, L1, L3: firmware update mode (fwupdate.h, menus.c, usb.c) ---
     ('update key opens the prompt on any screen', 'fwupdate.h',
      'return on_main_menu && !mounted && key == FWUPDATE_KEY;', 'return !mounted && key == FWUPDATE_KEY;'),

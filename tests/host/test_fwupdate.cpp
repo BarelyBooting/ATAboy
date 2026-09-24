@@ -32,6 +32,8 @@ static inline bool time_reached(absolute_time_t t) { return get_absolute_time() 
 
 uint64_t mock_now_ns = 0;
 int mock_usb_boot_requests = 0;
+int mock_id_words_forgotten = 0;
+void ide_id_words_forget(void) { mock_id_words_forgotten++; }
 uint32_t mock_gpio_out = 0;
 MockSio mock_sio;
 bool mock_intrq(void) { return false; }
@@ -232,12 +234,22 @@ static void test_help_row() {
     is_mounted = false;
 }
 
+// Unmount forgets the captured IDENTIFY words, so a drive swapped on the
+// cable is not judged by the previous drive's SMART / HPA support bits.
+static void test_unmount_forgets_identify() {
+    is_mounted = true; media_changed_waiting = false; mock_id_words_forgotten = 0;
+    menu_unmount();
+    CHECK(!is_mounted && media_changed_waiting, "unmount state %d %d", is_mounted, media_changed_waiting);
+    CHECK(mock_id_words_forgotten == 1, "IDENTIFY words forgotten %d times", mock_id_words_forgotten);
+}
+
 int main() {
     test_decisions();
     test_key_in_menus();
     test_escape_sequences();
     test_confirm();
     test_help_row();
+    test_unmount_forgets_identify();
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;
 }

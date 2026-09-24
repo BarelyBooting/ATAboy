@@ -838,6 +838,16 @@ static bool fwupdate_key(int k) {
 // picotool, the mode BOOTSEL gives), or come back with a message saying why
 // not. A USB command that started before the drive was unmounted may still
 // be running on core 0; wait for it, up to FWUPDATE_WAIT_MS, Esc cancels.
+// Unmount. Also forgets the drive's captured IDENTIFY words: with the drive
+// released, it can be swapped on the cable, and a later mount without a new
+// detection must not let the SAT policy judge the new drive by the old one's
+// IDENTIFY (a donor's SMART support would then admit SMART on a specimen).
+static void menu_unmount(void) {
+    is_mounted = false;
+    media_changed_waiting = true;
+    ide_id_words_forget();
+}
+
 static void fwupdate_confirmed(void) {
     uint32_t t0 = to_ms_since_boot(get_absolute_time());
     bool told = false;
@@ -1015,7 +1025,7 @@ void core1_entry(void) {
                 if (confirm_type == 0) { config_defaults(); sync_from_config(); config_save(); current_screen = SCREEN_MAIN; }
                 else if (confirm_type == 1) { sync_to_config(); config_save(); current_screen = confirm_return_screen; }
                 else if (confirm_type == 3) { is_mounted = true; media_changed_waiting = true; current_screen = SCREEN_MOUNTED; }
-                else if (confirm_type == 4) { is_mounted = false; media_changed_waiting = true; current_screen = SCREEN_MAIN; }
+                else if (confirm_type == 4) { menu_unmount(); current_screen = SCREEN_MAIN; }
                 else if (confirm_type == 5) {
                     // Reboot into the ROM bootloader, so new firmware can be
                     // loaded without holding BOOTSEL. Mounted state and any

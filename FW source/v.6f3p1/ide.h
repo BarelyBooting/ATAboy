@@ -132,6 +132,10 @@ typedef struct {
     uint16_t w82, w83, w84;
 } ide_id_words_t;
 void ide_id_words(ide_id_words_t *out);
+// Forget the captured IDENTIFY words. Called at unmount: the next drive on
+// the cable may be a different one, and it must not be judged by this one's
+// IDENTIFY. Until a detection captures new words, the gated SAT rows refuse.
+void ide_id_words_forget(void);
 #endif
 
 #endif
