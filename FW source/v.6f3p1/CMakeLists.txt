@@ -75,5 +75,13 @@ target_include_directories(ATAboy PRIVATE
 # palimpsest fork: never zero-fill reads beyond the configured medium (see usb.c)
 target_compile_definitions(ATAboy PRIVATE ATABOY_STRICT_MEDIA_BOUNDS=1)
 
+# palimpsest fork: read-only ATA PASS-THROUGH (SAT) for IDENTIFY and READ
+# SECTORS, allowlist in sat_policy.c. -DATABOY_SAT=0 leaves it out entirely.
+option(ATABOY_SAT "Restricted read-only ATA PASS-THROUGH" ON)
+if(ATABOY_SAT)
+    target_sources(ATAboy PRIVATE sat.c sat_policy.c)
+    target_compile_definitions(ATAboy PRIVATE ATABOY_SAT=1)
+endif()
+
 pico_add_extra_outputs(ATAboy)
 

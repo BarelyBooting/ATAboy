@@ -488,3 +488,91 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba) {
 
     return ide_read_reg(7);
 }
+
+#if ATABOY_SAT
+// ---------------------------------------------------------------------------
+//  SAT pass-through: one PIO data-in command, task file exactly as given
+// ---------------------------------------------------------------------------
+//
+// Used only by sat.c, for the commands sat_policy.c allows (IDENTIFY, READ
+// SECTORS, READ SECTORS EXT). Differs from ide_read_sectors() on purpose:
+//  - it sends the ATA command byte the host chose (0x21 stays 0x21), and the
+//    48-bit registers only when the host asked for a 48-bit command;
+//  - on an error it does NOT soft-reset the drive or re-send INITIALIZE DRIVE
+//    PARAMETERS. It stops, leaves the drive's registers as they are, and
+//    reports the failure. The READ(10) path is unchanged.
+//  - it refuses to start if the drive is busy or holds data from some earlier
+//    command, instead of guessing what that state means.
+// Timeouts are wall-clock, not loop counts.
+
+#define SAT_READY_TIMEOUT_MS  5000    // same as ide_read_sectors()
+#define SAT_CMD_TIMEOUT_MS    10000   // data phase, from issue to the last block
+#define SAT_END_TIMEOUT_MS    1000    // after the last block, for BSY and DRQ to drop
+
+int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf) {
+    if (tf->sectors == 0 || tf->sectors > SAT_MAX_SECTORS) return IDE_SAT_NOT_ISSUED;
+    if (!ide_wait_until_ready(SAT_READY_TIMEOUT_MS)) return IDE_SAT_NOT_ISSUED;
+    if (ide_read_reg(7) & 0x08) return IDE_SAT_NOT_ISSUED;   // stale DRQ: not ours to discard
+
+    if (tf->ext) {
+        // 48-bit: previous (HOB) value first, then current, per register
+        ide_write_reg(1, tf->hob_feature);
+        ide_write_reg(2, tf->hob_count);
+        ide_write_reg(3, tf->hob_lba_low);
+        ide_write_reg(4, tf->hob_lba_mid);
+        ide_write_reg(5, tf->hob_lba_high);
+    }
+    ide_write_reg(1, tf->feature);
+    ide_write_reg(2, tf->count);
+    ide_write_reg(3, tf->lba_low);
+    ide_write_reg(4, tf->lba_mid);
+    ide_write_reg(5, tf->lba_high);
+    ide_write_reg(6, dev_base | (tf->device & 0x4F));
+    ide_write_reg(7, tf->command);
+    busy_wait_us_32(1);             // give the drive time to assert BSY
+
+    uint16_t *wbuf = (uint16_t *)buf;
+    uint32_t start = to_ms_since_boot(get_absolute_time());
+
+    for (uint32_t s = 0; s < tf->sectors; s++) {
+        for (;;) {
+            uint8_t st = ide_read_reg(7);                       // also clears INTRQ
+            if (!(st & 0x80)) {                                 // other bits only valid with BSY=0
+                if (st & 0x01) {
+                    if (st & 0x08) ide_drain_sector();          // don't leave DRQ stranded
+                    return IDE_SAT_ATA_ERROR;
+                }
+                if (st & 0x08) break;                           // DRQ: a block is ready
+            }
+            if (to_ms_since_boot(get_absolute_time()) - start >= SAT_CMD_TIMEOUT_MS)
+                return IDE_SAT_TIMEOUT;
+            busy_wait_us_32(10);
+        }
+
+        set_address(0);
+        xcvr_read();
+        sio_hw->gpio_clr = (1 << IDE_CS0);
+
+        ide_pio_read(256, wbuf + s * 256);
+
+        sio_hw->gpio_set = (1 << IDE_CS0);
+        bus_idle();
+    }
+
+    // All blocks read. The drive must now end the command cleanly: not busy,
+    // no error, and no more data on offer. DRQ can take a moment to drop
+    // after the last word, so it gets a short window rather than one look.
+    busy_wait_us_32(1);
+    uint32_t end_start = to_ms_since_boot(get_absolute_time());
+    for (;;) {
+        uint8_t st = ide_read_reg(7);
+        if (!(st & 0x80)) {
+            if (st & 0x01) return IDE_SAT_ATA_ERROR;
+            if (!(st & 0x08)) return IDE_SAT_OK;
+        }
+        if (to_ms_since_boot(get_absolute_time()) - end_start >= SAT_END_TIMEOUT_MS)
+            return (st & 0x80) ? IDE_SAT_TIMEOUT : IDE_SAT_BAD_END;
+        busy_wait_us_32(10);
+    }
+}
+#endif

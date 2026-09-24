@@ -6,6 +6,9 @@
 #include "ide.h"
 #include "config.h"
 #include <string.h>
+#if ATABOY_SAT
+#include "sat.h"
+#endif
 
 extern volatile bool is_mounted;
 extern volatile bool media_changed_waiting;
@@ -211,6 +214,9 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
     // the buffer overwrote RAM past it - TinyUSB's own USB state, is_mounted,
     // the current geometry. Newer TinyUSB clamps this; clamp here as well so
     // the firmware is safe whichever TinyUSB it is built against.
+#if ATABOY_SAT
+    uint16_t host_bufsize = bufsize;    // sat.c checks it against the CBW
+#endif
     if (bufsize > CFG_TUD_MSC_EP_BUFSIZE) bufsize = CFG_TUD_MSC_EP_BUFSIZE;
     uint8_t opcode = scsi_cmd[0];
     uint8_t *buf = (uint8_t *)buffer;
@@ -266,6 +272,12 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
     case 0x1B: return 0;  // START STOP UNIT
     case 0x35: return 0;  // SYNCHRONIZE CACHE
     case 0x1E: return 0;  // PREVENT ALLOW MEDIUM REMOVAL
+
+#if ATABOY_SAT
+    case 0xA1:  // ATA PASS-THROUGH (12)
+    case 0x85:  // ATA PASS-THROUGH (16)
+        return sat_scsi(lun, scsi_cmd, buffer, host_bufsize);
+#endif
 
     default:
         tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0);
