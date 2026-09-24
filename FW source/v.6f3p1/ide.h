@@ -60,7 +60,7 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
 #define IDE_FAIL_NONE       0
 #define IDE_FAIL_NOT_READY  1   // drive not ready before the command was sent
 #define IDE_FAIL_ERR        2   // drive finished the command with ERR set
-#define IDE_FAIL_TIMEOUT    3   // no DRQ / no completion in time
+#define IDE_FAIL_TIMEOUT    3   // no DRQ / no completion within IDE_CMD_TIMEOUT_MS (ide.c)
 #define IDE_FAIL_STALE_DRQ  4   // drive still offering data from an earlier command
 #define IDE_FAIL_NO_GEOMETRY 5  // CHS mode, and the drive would not take our geometry
 typedef struct {
@@ -71,6 +71,8 @@ typedef struct {
     uint8_t  tf[5];         // registers 2..6: count, sector, cyl lo, cyl hi, dev/head
     bool     drained;       // drive offered data for the failed sector; discarded
     bool     reset;         // a soft reset was needed to get the drive back
+    bool     hw_reset;      // ...and the drive did not come back from it, so a
+                            // hardware reset (RESET-, both devices) was used too
     bool     reset_failed;  // ...and the drive did not come back ready, or in CHS
                             // mode did not take the geometry again
     uint32_t lba;           // first sector not transferred
@@ -120,7 +122,8 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
 int ide_sat_nondata(const sat_taskfile_t *tf, ide_sat_regs_t *regs);
 
 // The drive's own IDENTIFY DEVICE words 82, 83 and 84 (command sets and
-// features supported), from the last ide_identify() on the selected device.
+// features supported), 85 (enabled) and 87 (whose bits 15:14 say whether
+// 85..87 are valid), from the last ide_identify() on the selected device.
 // valid is false when there is nothing to trust: no IDENTIFY since power-up,
 // the last one failed, a probe (ide_probe_devices) has run since, or another
 // device is selected now. Only the firmware's own IDENTIFY (detection,
@@ -129,7 +132,7 @@ int ide_sat_nondata(const sat_taskfile_t *tf, ide_sat_regs_t *regs);
 // commands on them (sat_policy.h, "Drive capability").
 typedef struct {
     bool     valid;
-    uint16_t w82, w83, w84;
+    uint16_t w82, w83, w84, w85, w87;
 } ide_id_words_t;
 void ide_id_words(ide_id_words_t *out);
 // Forget the captured IDENTIFY words. Called at unmount: the next drive on
@@ -137,7 +140,7 @@ void ide_id_words(ide_id_words_t *out);
 // IDENTIFY. Until a detection captures new words, the gated SAT rows refuse.
 void ide_id_words_forget(void);
 // Re-IDENTIFY the drive and check it is the one the words came from (serial,
-// model, words 82..84): 1 yes; 0 no or IDENTIFY failed (words forgotten), or
+// model, words 82..85 and 87): 1 yes; 0 no or IDENTIFY failed (words forgotten), or
 // no words held (nothing sent); -1 drive busy or offering stale data (nothing
 // sent, words kept).
 int ide_id_words_verify(void);

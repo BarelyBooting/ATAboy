@@ -45,7 +45,6 @@ add_executable(ATAboy
         config.c)
 
 pico_set_program_name(ATAboy "ATAboy")
-pico_set_program_version(ATAboy "0.6f3p6-palimpsest")
 
 # Generate PIO header
 pico_generate_pio_header(ATAboy ${CMAKE_CURRENT_LIST_DIR}/ataboy.pio)
@@ -90,6 +89,11 @@ endif()
 option(ATABOY_SAT_SMART_SAVES "Also allow SMART READ DATA and RETURN STATUS through SAT" OFF)
 if(ATABOY_SAT AND ATABOY_SAT_SMART_SAVES)
     target_compile_definitions(ATAboy PRIVATE ATABOY_SAT_SMART_SAVES=1)
+    # The opt-in build names itself, so picotool info tells it apart (review
+    # L-2); the setup screen banner says so too (menus.c).
+    pico_set_program_version(ATAboy "0.6f3p7-palimpsest-smartsaves")
+else()
+    pico_set_program_version(ATAboy "0.6f3p7-palimpsest")
 endif()
 
 pico_add_extra_outputs(ATAboy)

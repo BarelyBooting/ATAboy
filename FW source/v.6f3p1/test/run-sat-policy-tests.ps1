@@ -339,14 +339,57 @@ $mutants = @(
        Find = 'if (in->id_w83 & (1u << 10)) caps |= CAP_LBA48;'
        Repl = 'if (in->id_w82 & (1u << 10)) caps |= CAP_LBA48;' }
     @{ Name = 'SMART rows not gated'
-       Find = 'need = CAP_SMART;       // smart'
-       Repl = 'need = 0;       // smart' }
+       Find = 'need = CAP_SMART | CAP_SMART_ON;    // smart:'
+       Repl = 'need = 0;    // smart:' }
     @{ Name = 'SMART READ LOG: error logging bit not needed'
-       Find = 'need = CAP_SMART | CAP_SMART_LOG;   // smart read log'
-       Repl = 'need = CAP_SMART;   // smart read log' }
+       Find = 'need = CAP_SMART | CAP_SMART_ON | CAP_SMART_LOG;   // smart read log'
+       Repl = 'need = CAP_SMART | CAP_SMART_ON;   // smart read log' }
     @{ Name = 'SMART READ LOG: SMART bit not needed'
-       Find = 'need = CAP_SMART | CAP_SMART_LOG;   // smart read log'
-       Repl = 'need = CAP_SMART_LOG;   // smart read log' }
+       Find = 'need = CAP_SMART | CAP_SMART_ON | CAP_SMART_LOG;   // smart read log'
+       Repl = 'need = CAP_SMART_ON | CAP_SMART_LOG;   // smart read log' }
+
+    # ---- 0.6f3p7: SMART must be enabled (word 85 bit 0, valid per word 87) ----
+    @{ Name = 'SMART rows: enabled bit (85.0) not needed'
+       Find = 'need = CAP_SMART | CAP_SMART_ON;    // smart:'
+       Repl = 'need = CAP_SMART;    // smart:' }
+    @{ Name = 'SMART READ LOG: enabled bit (85.0) not needed'
+       Find = 'need = CAP_SMART | CAP_SMART_ON | CAP_SMART_LOG;   // smart read log'
+       Repl = 'need = CAP_SMART | CAP_SMART_LOG;   // smart read log' }
+    @{ Name = 'SMART rows: only the enabled bit needed (supported bit 82.0 dropped)'
+       Find = 'need = CAP_SMART | CAP_SMART_ON;    // smart:'
+       Repl = 'need = CAP_SMART_ON;    // smart:' }
+    @{ Name = 'IDENTIFY gate: word 87 signature not checked'
+       Find = 'if ((in->id_w87 & 0xC000u) == 0x4000u && (in->id_w85 & (1u << 0))) caps |= CAP_SMART_ON;'
+       Repl = 'if (in->id_w85 & (1u << 0)) caps |= CAP_SMART_ON;' }
+    @{ Name = 'IDENTIFY gate: word 87 signature 11b accepted (bit 14 only)'
+       Find = '(in->id_w87 & 0xC000u) == 0x4000u'
+       Repl = '(in->id_w87 & 0x4000u) == 0x4000u' }
+    @{ Name = 'IDENTIFY gate: word 85 checked against word 84 signature instead of 87'
+       Find = '(in->id_w87 & 0xC000u) == 0x4000u'
+       Repl = '(in->id_w84 & 0xC000u) == 0x4000u' }
+    @{ Name = 'IDENTIFY gate: SMART enabled read from word 85 bit 1'
+       Find = '(in->id_w85 & (1u << 0))) caps |= CAP_SMART_ON;'
+       Repl = '(in->id_w85 & (1u << 1))) caps |= CAP_SMART_ON;' }
+    @{ Name = 'IDENTIFY gate: SMART enabled read from word 82 (supported, not enabled)'
+       Find = '(in->id_w85 & (1u << 0))) caps |= CAP_SMART_ON;'
+       Repl = '(in->id_w82 & (1u << 0))) caps |= CAP_SMART_ON;' }
+
+    # ---- 0.6f3p7: needs_identity derived from the row's capabilities (review L-1) ----
+    @{ Name = 'needs_identity never set'
+       Find = 'sat_verdict_t ok = { true, 0, 0, 0, need != 0 };'
+       Repl = 'sat_verdict_t ok = { true, 0, 0, 0, false };' }
+    @{ Name = 'needs_identity set on every allowed row'
+       Find = 'sat_verdict_t ok = { true, 0, 0, 0, need != 0 };'
+       Repl = 'sat_verdict_t ok = { true, 0, 0, 0, true };' }
+    @{ Name = 'needs_identity not set for rows that only need SMART'
+       Find = 'sat_verdict_t ok = { true, 0, 0, 0, need != 0 };'
+       Repl = 'sat_verdict_t ok = { true, 0, 0, 0, (need & ~(CAP_SMART | CAP_SMART_ON)) != 0 };' }
+    @{ Name = 'needs_identity not set for READ NATIVE MAX EXT (HPA and 48-bit)'
+       Find = 'sat_verdict_t ok = { true, 0, 0, 0, need != 0 };'
+       Repl = 'sat_verdict_t ok = { true, 0, 0, 0, need != 0 && need != (CAP_HPA | CAP_LBA48) };' }
+    @{ Name = 'refusal carries needs_identity'
+       Find = 'sat_verdict_t v = { false, sk, asc, 0x00, false };'
+       Repl = 'sat_verdict_t v = { false, sk, asc, 0x00, true };' }
     @{ Name = 'READ NATIVE MAX not gated'
        Find = 'need = CAP_HPA;         // native max'
        Repl = 'need = 0;         // native max' }

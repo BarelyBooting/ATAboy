@@ -40,3 +40,10 @@ ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indenta
     -I "$here/mock" -I "$here" -I "$src" \
     -o "$out/test_fwupdate" "$here/test_fwupdate.cpp"
 "$out/test_fwupdate"
+# ...and once more with the SMART opt-in, whose banner must say so (review L-2).
+if [ -n "$smart" ]; then
+    ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation $defs $smart \
+        -I "$here/mock" -I "$here" -I "$src" \
+        -o "$out/test_fwupdate_smart" "$here/test_fwupdate.cpp"
+    "$out/test_fwupdate_smart"
+fi

@@ -17,8 +17,9 @@
 #define FWUPDATE_KEY        0x06
 
 // How long Y waits for a USB mass storage command that is still running on
-// core 0 before giving up. A READ(10) retrying a failing sector can take
-// about 41 s.
+// core 0 before giving up. Since 0.6f3p7 a READ(10) or WRITE(10) on a stuck
+// drive can take longer than this (30 s, then the resets in ide.c); Y then
+// refuses, which is the safe answer, and can be tried again.
 #define FWUPDATE_WAIT_MS    60000u
 
 // Does this key, on this screen, open the prompt? Only on the main menu, and

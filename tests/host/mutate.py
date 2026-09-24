@@ -104,7 +104,7 @@ MUTANTS = [
     ('geometry restore ignores ABRT', 'ide.c',
      'bool ok = ide_wait_until_ready(1000) && !(ide_read_reg(7) & 0x01);', 'bool ok = ide_wait_until_ready(1000);'),
     ('reset recorded as fine when it failed', 'ide.c',
-     '    last_fail.reset_failed = !srst_and_restore();', '    (void)srst_and_restore();'),
+     '    last_fail.reset_failed = !reset_and_restore(&hw);', '    (void)reset_and_restore(&hw);'),
     ('no geometry check before a write', 'ide.c',
      '    uint8_t fail_kind = IDE_FAIL_TIMEOUT;\n    if (count == 0) return -1;\n'
      '    if (!ide_wait_until_ready(5000)) {\n'
@@ -238,7 +238,7 @@ MUTANTS = [
     ('SAT: HOB bytes read with HOB clear', 'ide.c',
      '        ide_write_control(0x80);\n        r->hob_count', '        ide_write_control(0x00);\n        r->hob_count'),
     # --- gated SAT rows re-verify the drive (re-review M-A) ---
-    ('gated rows skip the identity check', 'sat.c', '    if (gated) {\n        int same', '    if (0) {\n        int same'),
+    ('gated rows skip the identity check', 'sat.c', '    if (v.needs_identity) {\n        int same', '    if (0) {\n        int same'),
     ('identity check ignores the serial', 'ide.c',
      '    for (int i = 0; same && i < 10; i++) same = buf[10 + i] == id_words.serial[i];\n', ''),
     ('identity check ignores the model', 'ide.c',
@@ -250,8 +250,12 @@ MUTANTS = [
      '    if (!ide_wait_until_ready(1000) || (ide_read_reg(7) & 0x08)) return -1;\n', ''),
     ('identity check keeps the words on a mismatch', 'ide.c', '    if (!same) id_words.valid = false;\n', ''),
     ('not ready at the identity check answered as a refusal', 'sat.c', '        if (same < 0) {', '        if (0) {'),
-    ('READ SECTORS EXT not re-verified', 'sat.c', ' ||\n                 tf.command == 0x27 || tf.command == 0x24;', ' ||\n                 tf.command == 0x27;'),
-    ('READ NATIVE MAX not re-verified', 'sat.c', 'tf.command == 0xB0 || tf.command == 0xF8 ||', 'tf.command == 0xB0 ||'),
+    # Since 0.6f3p7 the rows come from the policy (needs_identity, review L-1);
+    # each mutant exempts one command byte at the call site.
+    ('READ SECTORS EXT not re-verified', 'sat.c', '    if (v.needs_identity) {', '    if (v.needs_identity && tf.command != 0x24) {'),
+    ('READ NATIVE MAX not re-verified', 'sat.c', '    if (v.needs_identity) {', '    if (v.needs_identity && tf.command != 0xF8) {'),
+    ('READ NATIVE MAX EXT not re-verified (review L-1)', 'sat.c', '    if (v.needs_identity) {', '    if (v.needs_identity && tf.command != 0x27) {'),
+    ('SMART not re-verified (review L-1)', 'sat.c', '    if (v.needs_identity) {', '    if (v.needs_identity && tf.command != 0xB0) {'),
     # --- unmount forgets the IDENTIFY words (review follow-up to H1) ---
     ('unmount keeps the old drive IDENTIFY words', 'menus.c',
      '    ide_id_words_forget();          // only SAT builds keep the words\n', ''),
@@ -288,11 +292,85 @@ MUTANTS = [
      '        msc_busy_begin();\n        int32_t r = sat_scsi(', '        int32_t r = sat_scsi('),
     ('usb: busy flag never cleared', 'usb.c',
      '    msc_ide_busy = false;\n}', '}'),
+    # --- 0.6f3p7: wall-clock limits (hardware finding 2026-09-24, ST380011A) ---
+    ('write commit wait counts polls again (the defect as found)', 'ide.c',
+     '        for (;;) {\n            if (ms_passed(start, IDE_CMD_TIMEOUT_MS)) break;   // write commit: still busy',
+     '        for (uint32_t t = 0; ; t++) {\n            if (t >= 100000) break;   // write commit: still busy'),
+    ('write DRQ wait counts polls again', 'ide.c',
+     '        for (;;) {\n            if (ms_passed(start, IDE_CMD_TIMEOUT_MS)) break;   // write: no DRQ in time',
+     '        for (uint32_t t = 0; ; t++) {\n            if (t >= 100000) break;   // write: no DRQ in time'),
+    ('read DRQ wait counts polls again', 'ide.c',
+     '        for (;;) {\n            if (ms_passed(start, IDE_CMD_TIMEOUT_MS)) goto read_timeout;',
+     '        for (uint32_t t = 0; ; t++) {\n            if (t >= 100000) goto read_timeout;'),
+    ('IDENTIFY wait counts polls again', 'ide.c',
+     '    for (;;) {\n        if (ms_passed(start, IDE_IDENTIFY_TIMEOUT_MS)) return false;',
+     '    for (uint32_t t = 0; ; t++) {\n        if (t >= 100000) return false;'),
+    ('command limit 10 s instead of 30 s', 'ide.c',
+     '#define IDE_CMD_TIMEOUT_MS      30000', '#define IDE_CMD_TIMEOUT_MS      10000'),
+    ('command limit 60 s instead of 30 s', 'ide.c',
+     '#define IDE_CMD_TIMEOUT_MS      30000', '#define IDE_CMD_TIMEOUT_MS      60000'),
+    ('IDENTIFY limit 5 s instead of 10 s', 'ide.c',
+     '#define IDE_IDENTIFY_TIMEOUT_MS 10000', '#define IDE_IDENTIFY_TIMEOUT_MS 5000'),
+    ('read limit restarts for every sector (per sector, not per command)', 'ide.c',
+     '        for (;;) {\n            if (ms_passed(start, IDE_CMD_TIMEOUT_MS)) goto read_timeout;',
+     '        start = ms_now();\n        for (;;) {\n            if (ms_passed(start, IDE_CMD_TIMEOUT_MS)) goto read_timeout;'),
+    # --- 0.6f3p7: soft reset escalates once to a hardware reset ---
+    ('no hardware reset when the soft reset fails', 'ide.c',
+     '    if (!ready) {\n        *hw_used = true;\n        ready = hw_reset_and_reselect();\n    }\n', ''),
+    ('hardware reset even when the soft reset worked', 'ide.c',
+     '    if (!ready) {\n        *hw_used = true;', '    if (1) {\n        *hw_used = true;'),
+    ('hardware reset repeated until the drive answers (not once)', 'ide.c',
+     '        ready = hw_reset_and_reselect();\n',
+     '        for (int i = 0; i < 3 && !ready; i++) ready = hw_reset_and_reselect();\n'),
+    ('CHS geometry not restored after the hardware reset', 'ide.c',
+     '        ready = hw_reset_and_reselect();\n    }\n    if (!ready) return false;',
+     '        return hw_reset_and_reselect();\n    }\n    if (!ready) return false;'),
+    ('hardware reset not recorded', 'ide.c',
+     '    last_fail.hw_reset = hw;', '    last_fail.hw_reset = false;'),
+    ('hardware reset not cleared by a new failure record', 'ide.c',
+     '    last_fail.hw_reset = false;\n    last_fail.lba', '    last_fail.lba'),
+    ('RESET- pulse shorter than ATA\'s 25 us', 'ide.c',
+     '    busy_wait_us_32(IDE_HW_RESET_LOW_US);\n', '    busy_wait_us_32(10);\n'),
+    ('no RECALIBRATE after the hardware reset', 'ide.c',
+     '        ide_write_reg(7, 0x10);             // RECALIBRATE, to the device just selected\n', ''),
+    ('device not selected again after the hardware reset (the finding: reads 0xFF)', 'ide.c',
+     '    bool ok = reselect_after_reset();\n    if (ok) {', '    bool ok = ide_wait_until_ready(IDE_SRST_TIMEOUT_MS);\n    if (ok) {'),
+    ('SAT abort does not escalate', 'ide.c',
+     '    (void)reset_and_restore(&hw);   // on failure', '    (void)srst_and_reselect(); (void)hw;   // on failure'),
+    # --- 0.6f3p7: IDENTIFY believes ERR only once the command has started (review L-3) ---
+    ('IDENTIFY: stale ERR taken as its answer', 'ide.c',
+     '        if (w.started && (st & 0x01)) { if (st & 0x08) ide_drain_sector(); return false; }',
+     '        if (st & 0x01) { if (st & 0x08) ide_drain_sector(); return false; }'),
+    # --- 0.6f3p7: SMART needs word 85 bit 0 (policy mutants in run-sat-policy-tests.ps1) ---
+    ('word 85 not captured', 'ide.c', '        id_words.w85 = buf[85];', '        id_words.w85 = 0x4401;'),
+    ('word 87 not captured', 'ide.c', '        id_words.w87 = buf[87];', '        id_words.w87 = 0x4000;'),
+    ('SAT: word 85 not passed to the policy', 'sat.c', '    in.id_w85 = id.w85;', '    in.id_w85 = 0x4401;'),
+    ('SAT: word 87 not passed to the policy', 'sat.c', '    in.id_w87 = id.w87;', '    in.id_w87 = 0x4000;'),
+    ('identity check ignores words 85 and 87', 'ide.c',
+     '    same = same && buf[85] == id_words.w85 && buf[87] == id_words.w87;\n', ''),
+    # --- 0.6f3p7: core 1 waits for a running USB command (review L-5) ---
+    ('Auto Detect does not wait for a USB command', 'menus.c',
+     '    if (!bus_free_wait(false)) { needs_full_redraw = true; return false; }\n', ''),
+    ('debug keys do not wait for a USB command', 'menus.c',
+     '    if (!known || !bus_free_wait(true)) return;', '    if (!known) return;'),
+    ('bus wait never gives up', 'menus.c',
+     'if (esc || to_ms_since_boot(get_absolute_time()) - t0 >= IDE_BUS_WAIT_MS) {', 'if (esc) {'),
+    ('bus wait ignores Esc', 'menus.c',
+     '        bool esc = cdc_getchar_timeout_us(20000) == KEY_ESC;', '        (void)cdc_getchar_timeout_us(20000); bool esc = false;'),
+    # --- 0.6f3p7: Debug E and the version on the unit (review L-2) ---
+    ('Debug E does not show the hardware reset', 'menus.c',
+     'const char *rs = !f.reset ? "" : f.hw_reset ?', 'const char *rs = !f.reset ? "" : false ?'),
+    ('SMART opt-in build shows the shipping banner', 'menus.c',
+     '#if ATABOY_SAT && ATABOY_SAT_SMART_SAVES\n#define BANNER', '#if 0\n#define BANNER'),
 ]
 
 
 # run.sh builds and runs these in order, each ending with "N checks, M failed".
-PROGRAMS = ['test_read', 'test_fwupdate']
+# Mutants run with SAT on, where run.sh builds test_read and test_fwupdate
+# twice each (with and without the SMART opt-in). This list said two programs
+# while run.sh ran three from 0a6cb06 on; a surviving mutant would then have
+# been reported as "not run" instead of SURVIVED (fixed in 0.6f3p7).
+PROGRAMS = ['test_read', 'test_read_shipping', 'test_fwupdate', 'test_fwupdate_smart']
 
 
 def run_tests(srcdir, outdir):

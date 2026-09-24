@@ -24,6 +24,7 @@ void ide_id_words_forget(void) { mock_id_words_forgotten++; }
 uint32_t mock_gpio_out = 0;
 MockSio mock_sio;
 bool mock_intrq(void) { return false; }
+void mock_reset_line(bool) {}
 bool tud_msc_set_sense(uint8_t, uint8_t, uint8_t, uint8_t) { return true; }
 bool usb_msc_ide_busy(void) { return false; }   // 0.6f3p6 on; unused by older menus.c
 queue_t cdc_tx_queue, cdc_rx_queue;

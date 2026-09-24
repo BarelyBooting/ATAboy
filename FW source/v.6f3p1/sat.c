@@ -156,6 +156,8 @@ int32_t sat_scsi(uint8_t lun, uint8_t const cdb[16], void *buffer, uint16_t host
     in.id_w82 = id.w82;
     in.id_w83 = id.w83;
     in.id_w84 = id.w84;
+    in.id_w85 = id.w85;
+    in.id_w87 = id.w87;
 
     sat_taskfile_t tf;
     sat_verdict_t v = sat_policy_check(&in, &tf);
@@ -168,10 +170,9 @@ int32_t sat_scsi(uint8_t lun, uint8_t const cdb[16], void *buffer, uint16_t host
     // through, make sure the drive on the cable is still that drive: a drive
     // swapped after detection and mounted without a new one must not be
     // judged by the old drive's words (re-review M-A). Same refusal as having
-    // no words at all.
-    bool gated = tf.command == 0xB0 || tf.command == 0xF8 ||
-                 tf.command == 0x27 || tf.command == 0x24;
-    if (gated) {
+    // no words at all. Which rows: the policy says (needs_identity), so this
+    // cannot drift from its capability table (review L-1).
+    if (v.needs_identity) {
         int same = ide_id_words_verify();
         if (same < 0) {                 // busy or stale DRQ: as the SAT paths answer it
             sense_plain(lun, SCSI_SENSE_NOT_READY, 0x04, 0x00);

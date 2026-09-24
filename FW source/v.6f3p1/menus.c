@@ -221,13 +221,23 @@ static void print_help(const char *text) {
 //  row 21 mid, 22-23 status, row 24 bottom
 // ---------------------------------------------------------------------------
 
+// The top row. A build with SMART READ DATA and RETURN STATUS let through
+// (ATABOY_SAT_SMART_SAVES, sat_policy.h) says so, so it cannot be mistaken on
+// the unit for the shipping build (review L-2). That line is 11 characters
+// longer, so it starts further left to stay inside 80 columns.
+#if ATABOY_SAT && ATABOY_SAT_SMART_SAVES
+#define BANNER "\033[1;4H" FG_WHITE "ATAboy Setup Utility v0.6f3p7 (fork+smartsaves) - (C) 2026 obsoletetech.us"
+#else
+#define BANNER "\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p7 (fork) - (C) 2026 obsoletetech.us"
+#endif
+
 static void draw_bios_frame(void) {
     cdc_printf(BG_BLUE FG_WHITE CLR_SCR HIDE_CUR "\033[H");
     // Paint every cell of the 80x24 screen blue. ESC[2J alone is not enough:
     // whether an erase uses the current background colour depends on the
     // terminal (screen with bce off, for one, erases to the default colour).
     for (int row = 1; row <= 24; row++) cdc_printf("\033[%d;1H%80s", row, "");
-    cdc_printf("\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p6 (fork) - (C) 2026 obsoletetech.us");
+    cdc_printf(BANNER);
 
     bool feat = (current_screen == SCREEN_FEATURES);
 
@@ -729,9 +739,14 @@ static void run_debug_errors(void) {
         debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
                     f.command, kinds[f.kind < 6 ? f.kind : 0], (unsigned long)f.lba,
                     (unsigned long)f.done, (unsigned long)f.count);
+        // "HW reset": the soft reset did not bring the drive back, so RESET-
+        // was used as well (both devices on the cable). The longest row,
+        // drained and "HW reset FAILED", is exactly the 68 columns there are.
+        const char *rs = !f.reset ? "" : f.hw_reset ? (f.reset_failed ? "  HW reset FAILED" : "  HW reset")
+                                                    : (f.reset_failed ? "  reset FAILED" : "  reset");
         debug_print(3, FG_WHITE, "ST:%02X ERR:%02X SC:%02X SN:%02X CL:%02X CH:%02X DH:%02X%s%s",
                     f.status, f.error, f.tf[0], f.tf[1], f.tf[2], f.tf[3], f.tf[4],
-                    f.drained ? "  drained" : "", f.reset ? (f.reset_failed ? "  reset FAILED" : "  reset") : "");
+                    f.drained ? "  drained" : "", rs);
     }
 }
 
@@ -761,6 +776,60 @@ static void run_seek_test(void) {
     }
     debug_print(14, FG_WHITE, "%*s", 60, ""); debug_print(15, FG_WHITE, "%*s", 60, "");
     sleep_ms(50);
+}
+
+// ---------------------------------------------------------------------------
+//  Core 1 and a USB command still running (review L-5)
+// ---------------------------------------------------------------------------
+// Unmounting stops new USB commands from reaching the drive, but one that
+// started before the unmount can still be running on core 0 (usb.c,
+// usb_msc_ide_busy), for a long time: up to IDE_CMD_TIMEOUT_MS on the command
+// and then the resets (ide.c). Auto Detect and the debug commands drive the
+// bus from core 1, and two cores on the bus at once can corrupt either one's
+// command. So they wait for it first, up to IDE_BUS_WAIT_MS, Esc cancels, and
+// if it is still running they do nothing and say why. Once the flag reads
+// clear with nothing mounted it stays clear for bus purposes: a callback that
+// starts later sees "not mounted" and never touches the drive (usb.c).
+#define IDE_BUS_WAIT_MS 60000u
+
+// True once no USB command is using the bus. On false the caller must not
+// touch it. on_debug: where to say so (the debug box, or a confirm box).
+static bool bus_free_wait(bool on_debug) {
+    if (!usb_msc_ide_busy()) return true;
+    const char *wait_msg = "Waiting for a USB command to finish (Esc: cancel)";
+    if (on_debug) debug_print(0, FG_YELLOW, "%s", wait_msg); else draw_confirm_box(wait_msg);
+    uint32_t t0 = to_ms_since_boot(get_absolute_time());
+    while (usb_msc_ide_busy()) {
+        bool esc = cdc_getchar_timeout_us(20000) == KEY_ESC;
+        if (esc || to_ms_since_boot(get_absolute_time()) - t0 >= IDE_BUS_WAIT_MS) {
+            const char *no = esc ? "Cancelled, nothing sent to the drive. Press a key"
+                                 : "USB still busy, nothing sent to the drive. Press a key";
+            if (on_debug) debug_print(0, FG_RED, "%s", no); else draw_confirm_box(no);
+            if (!on_debug) while (get_input() == -1) tight_loop_contents();
+            return false;
+        }
+    }
+    if (on_debug) debug_print(0, FG_WHITE, "");
+    return true;
+}
+
+// Debug screen keys other than Esc. Every one of them reads or drives the
+// bus, so each waits for a running USB command first (bus_free_wait).
+static void debug_key(int k) {
+    bool known = k == 'i' || k == 'I' || k == 't' || k == 'T' || k == 'e' || k == 'E' ||
+                 k == 's' || k == 'S' || k == 'r' || k == 'R';
+    if (!known || !bus_free_wait(true)) return;
+    if (k == 'i' || k == 'I') run_debug_identify();
+    else if (k == 't' || k == 'T') run_debug_taskfile();
+    else if (k == 'e' || k == 'E') run_debug_errors();
+    else if (k == 's' || k == 'S') { run_seek_test(); current_screen = SCREEN_DEBUG; needs_full_redraw = true; }
+    else {
+        debug_cls();
+        debug_print(0, FG_YELLOW, "Resetting drive...");
+        ide_reset_drive();
+        bool rdy = ide_wait_until_ready(5000);
+        debug_print(1, rdy ? FG_GREEN : FG_RED, rdy ? "Drive ready." : "Drive not responding.");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -872,6 +941,99 @@ static void fwupdate_confirmed(void) {
         while (get_input() == -1) tight_loop_contents();
         return;
     }
+}
+
+// Auto Detect (main menu, Enter on the first item). Waits first for a USB
+// command that is still running on core 0 (bus_free_wait, review L-5).
+// True when the result box should be drawn (core1_entry's trigger_overlay).
+static bool run_auto_detect(void) {
+    if (!bus_free_wait(false)) { needs_full_redraw = true; return false; }
+    bool overlay = false;
+    // Auto Detect: single reset, probe master then slave
+    uint16_t id_buf[256];
+    bool detected = false;
+    uint8_t found = ide_probe_devices();
+    if (found) {
+        ide_select_device(found);
+        config.dev_base = found;
+        if (ide_identify(id_buf)) detected = true;
+    }
+    if (!detected) ide_select_device(config.dev_base);
+    if (detected) {
+            for (int i = 0; i < 20; i++) {
+                uint16_t val = id_buf[27+i];
+                hdd_model_raw[i*2] = (char)(val>>8); hdd_model_raw[i*2+1] = (char)(val&0xFF);
+            }
+            hdd_model_raw[40] = '\0'; sanitize_identify_model(hdd_model_raw);
+
+            bool ls = (id_buf[49] & 0x0200);
+            int geo_idx = ls ? 2 : 0;
+            bool waiting = true, sd = true;
+
+            while (waiting) {
+                if (sd) { draw_selection_menu(id_buf, geo_idx); sd = false; }
+                int ch = get_input();
+                if (ch == -1) { tight_loop_contents(); continue; }
+
+                if (ch == KEY_UP && geo_idx > 0) { geo_idx--; if (!ls && geo_idx == 2) geo_idx--; sd = true; }
+                else if (ch == KEY_DOWN && geo_idx < 3) { geo_idx++; if (!ls && geo_idx == 2) geo_idx++; sd = true; }
+                else if (ch == KEY_ESC) { waiting = false; }
+                else if (ch == '\t' || (ch == KEY_ENTER && geo_idx == 3)) {
+                    geo_idx = 3; draw_selection_menu(id_buf, geo_idx);
+                    int mf[3] = {detect_cyls, detect_heads, detect_spt};
+                    int mc[3] = {9+26, 9+38, 9+48};
+                    bool manual_aborted = false;
+                    for (int f = 0; f < 3; f++) {
+                        char ib[7] = {0}; int p = 0;
+                        draw_at(mc[f], 14, "\033[103;30m     \033[0m");
+                        cdc_printf("\033[%d;%dH", 14, mc[f]);
+                        while (true) {
+                            int c = get_input();
+                            if (c >= '0' && c <= '9' && p < 5) { ib[p++] = (char)c; cdc_putchar(c); }
+                            else if ((c == 8 || c == 127) && p > 0) { p--; cdc_printf("\b \b\033[%d;%dH", 14, mc[f]+p); }
+                            else if (c == KEY_ENTER || c == '\t') { ib[p] = '\0'; if (p > 0) mf[f] = atoi(ib); draw_at(mc[f], 14, RESET "\033[41;37;1m"); cdc_printf("%-5d", mf[f]); break; }
+                            else if (c == KEY_ESC) { manual_aborted = true; f = 3; break; }
+                            tight_loop_contents();
+                        }
+                    }
+                    // Esc used to fall through to here and APPLY geometry (0x91)
+                    // from whatever mf[] held. An abort must apply nothing.
+                    if (manual_aborted) { sd = true; }
+                    else {
+                    detect_cyls = (uint16_t)mf[0]; detect_heads = (uint8_t)mf[1]; detect_spt = (uint8_t)mf[2];
+                    if (detect_cyls > 0 && detect_heads > 0 && detect_spt > 0) {
+                        use_lba_mode = false;
+                        cur_cyls = detect_cyls; cur_heads = detect_heads; cur_spt = detect_spt;
+                        ide_set_geometry(cur_heads, cur_spt);
+                        sync_to_config(); waiting = false;
+                    } else { sd = true; }
+                    }   /* !manual_aborted */
+                } else if (ch == KEY_ENTER) {
+                    bool valid = false;
+                    if (geo_idx == 0) { use_lba_mode = false; cur_cyls = id_buf[1]; cur_heads = (uint8_t)id_buf[3]; cur_spt = (uint8_t)id_buf[6]; valid = true; }
+                    else if (geo_idx == 1) { use_lba_mode = false; get_large_geometry(id_buf[1],(uint8_t)id_buf[3],(uint8_t)id_buf[6],&cur_cyls,&cur_heads); cur_spt = (uint8_t)id_buf[6]; valid = true; }
+                    else if (geo_idx == 2 && ls) {
+                        use_lba_mode = true; cur_cyls = id_buf[1]; cur_heads = (uint8_t)id_buf[3]; cur_spt = (uint8_t)id_buf[6];
+                        uint64_t l48 = ((uint64_t)id_buf[103]<<48)|((uint64_t)id_buf[102]<<32)|((uint64_t)id_buf[101]<<16)|((uint64_t)id_buf[100]);
+                        total_lba_sectors = l48; if (!total_lba_sectors) total_lba_sectors = id_buf[60]|((uint32_t)id_buf[61]<<16);
+                        valid = true;
+                    }
+
+                    if (valid) { if (!use_lba_mode) ide_set_geometry(cur_heads, cur_spt); sync_to_config(); waiting = false; }
+                }
+            }
+    } else {
+        if (found) {
+            strcpy(hdd_status_text, "\033[91;1mIDENTIFY failed");
+            force_detect = true;
+        } else {
+            strcpy(hdd_status_text, "\033[91;1mNo drive detected");
+            force_detect = false;
+        }
+        show_detect_result = true; overlay = true; hdd_model_raw[0] = '\0';
+    }
+    needs_full_redraw = true;
+    return overlay;
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,17 +1170,7 @@ void core1_entry(void) {
 
         if (current_screen == SCREEN_DEBUG) {
             if (k == KEY_ESC) { current_screen = SCREEN_FEATURES; needs_full_redraw = true; }
-            else if (k == 'i' || k == 'I') run_debug_identify();
-            else if (k == 't' || k == 'T') run_debug_taskfile();
-            else if (k == 'e' || k == 'E') run_debug_errors();
-            else if (k == 's' || k == 'S') { run_seek_test(); current_screen = SCREEN_DEBUG; needs_full_redraw = true; }
-            else if (k == 'r' || k == 'R') {
-                debug_cls();
-                debug_print(0, FG_YELLOW, "Resetting drive...");
-                ide_reset_drive();
-                bool rdy = ide_wait_until_ready(5000);
-                debug_print(1, rdy ? FG_GREEN : FG_RED, rdy ? "Drive ready." : "Drive not responding.");
-            }
+            else debug_key(k);
             continue;
         }
 
@@ -1064,90 +1216,7 @@ void core1_entry(void) {
             }
             else if (k == KEY_ENTER) {
                 if (config.main_selected == 0) {
-                    // Auto Detect — single reset, probe master then slave
-                    uint16_t id_buf[256];
-                    bool detected = false;
-                    uint8_t found = ide_probe_devices();
-                    if (found) {
-                        ide_select_device(found);
-                        config.dev_base = found;
-                        if (ide_identify(id_buf)) detected = true;
-                    }
-                    if (!detected) ide_select_device(config.dev_base);
-                    if (detected) {
-                            for (int i = 0; i < 20; i++) {
-                                uint16_t val = id_buf[27+i];
-                                hdd_model_raw[i*2] = (char)(val>>8); hdd_model_raw[i*2+1] = (char)(val&0xFF);
-                            }
-                            hdd_model_raw[40] = '\0'; sanitize_identify_model(hdd_model_raw);
-
-                            bool ls = (id_buf[49] & 0x0200);
-                            int geo_idx = ls ? 2 : 0;
-                            bool waiting = true, sd = true;
-
-                            while (waiting) {
-                                if (sd) { draw_selection_menu(id_buf, geo_idx); sd = false; }
-                                int ch = get_input();
-                                if (ch == -1) { tight_loop_contents(); continue; }
-
-                                if (ch == KEY_UP && geo_idx > 0) { geo_idx--; if (!ls && geo_idx == 2) geo_idx--; sd = true; }
-                                else if (ch == KEY_DOWN && geo_idx < 3) { geo_idx++; if (!ls && geo_idx == 2) geo_idx++; sd = true; }
-                                else if (ch == KEY_ESC) { waiting = false; }
-                                else if (ch == '\t' || (ch == KEY_ENTER && geo_idx == 3)) {
-                                    geo_idx = 3; draw_selection_menu(id_buf, geo_idx);
-                                    int mf[3] = {detect_cyls, detect_heads, detect_spt};
-                                    int mc[3] = {9+26, 9+38, 9+48};
-                                    bool manual_aborted = false;
-                                    for (int f = 0; f < 3; f++) {
-                                        char ib[7] = {0}; int p = 0;
-                                        draw_at(mc[f], 14, "\033[103;30m     \033[0m");
-                                        cdc_printf("\033[%d;%dH", 14, mc[f]);
-                                        while (true) {
-                                            int c = get_input();
-                                            if (c >= '0' && c <= '9' && p < 5) { ib[p++] = (char)c; cdc_putchar(c); }
-                                            else if ((c == 8 || c == 127) && p > 0) { p--; cdc_printf("\b \b\033[%d;%dH", 14, mc[f]+p); }
-                                            else if (c == KEY_ENTER || c == '\t') { ib[p] = '\0'; if (p > 0) mf[f] = atoi(ib); draw_at(mc[f], 14, RESET "\033[41;37;1m"); cdc_printf("%-5d", mf[f]); break; }
-                                            else if (c == KEY_ESC) { manual_aborted = true; f = 3; break; }
-                                            tight_loop_contents();
-                                        }
-                                    }
-                                    // Esc used to fall through to here and APPLY geometry (0x91)
-                                    // from whatever mf[] held. An abort must apply nothing.
-                                    if (manual_aborted) { sd = true; }
-                                    else {
-                                    detect_cyls = (uint16_t)mf[0]; detect_heads = (uint8_t)mf[1]; detect_spt = (uint8_t)mf[2];
-                                    if (detect_cyls > 0 && detect_heads > 0 && detect_spt > 0) {
-                                        use_lba_mode = false;
-                                        cur_cyls = detect_cyls; cur_heads = detect_heads; cur_spt = detect_spt;
-                                        ide_set_geometry(cur_heads, cur_spt);
-                                        sync_to_config(); waiting = false;
-                                    } else { sd = true; }
-                                    }   /* !manual_aborted */
-                                } else if (ch == KEY_ENTER) {
-                                    bool valid = false;
-                                    if (geo_idx == 0) { use_lba_mode = false; cur_cyls = id_buf[1]; cur_heads = (uint8_t)id_buf[3]; cur_spt = (uint8_t)id_buf[6]; valid = true; }
-                                    else if (geo_idx == 1) { use_lba_mode = false; get_large_geometry(id_buf[1],(uint8_t)id_buf[3],(uint8_t)id_buf[6],&cur_cyls,&cur_heads); cur_spt = (uint8_t)id_buf[6]; valid = true; }
-                                    else if (geo_idx == 2 && ls) {
-                                        use_lba_mode = true; cur_cyls = id_buf[1]; cur_heads = (uint8_t)id_buf[3]; cur_spt = (uint8_t)id_buf[6];
-                                        uint64_t l48 = ((uint64_t)id_buf[103]<<48)|((uint64_t)id_buf[102]<<32)|((uint64_t)id_buf[101]<<16)|((uint64_t)id_buf[100]);
-                                        total_lba_sectors = l48; if (!total_lba_sectors) total_lba_sectors = id_buf[60]|((uint32_t)id_buf[61]<<16);
-                                        valid = true;
-                                    }
-
-                                    if (valid) { if (!use_lba_mode) ide_set_geometry(cur_heads, cur_spt); sync_to_config(); waiting = false; }
-                                }
-                            }
-                    } else {
-                        if (found) {
-                            strcpy(hdd_status_text, "\033[91;1mIDENTIFY failed");
-                            force_detect = true;
-                        } else {
-                            strcpy(hdd_status_text, "\033[91;1mNo drive detected");
-                            force_detect = false;
-                        }
-                        show_detect_result = true; trigger_overlay = true; hdd_model_raw[0] = '\0';
-                    }
-                    needs_full_redraw = true;
+                    if (run_auto_detect()) trigger_overlay = true;
                 } else if (config.main_selected == 1) {
                     bool dv = (hdd_model_raw[0] != '\0');
                     bool gv = (use_lba_mode && total_lba_sectors > 0) || (!use_lba_mode && cur_cyls > 0 && cur_heads > 0 && cur_spt > 0);

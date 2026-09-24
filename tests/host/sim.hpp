@@ -13,6 +13,14 @@
 // the command register, or SRST releases it. INTRQ can also be not wired or
 // stuck high. A drive can ignore a command outright (ignore_cmd: no BSY, no
 // INTRQ, status unchanged) or end one with DF (device fault) set.
+//
+// Long internal pauses (0.6f3p7): a sector can keep the drive busy for extra
+// time while it is read or while a write to it is committed (pause), as the
+// ST380011A did on a write. The RESET- line is modelled (hw_reset_line(),
+// driven by gpio_put on GPIO 23): low puts the drive in reset, high starts
+// its power-on diagnostics, t_hw_reset long. A drive can stay busy for ever
+// after a soft reset (srst_wedges) and come back only from a hardware reset,
+// or not even then (hw_reset_wedges).
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -63,6 +71,24 @@ struct SimDrive {
     uint64_t master_ready_at = 0;
     int      reset_writes = 0;              // task-file writes while in SRST
     bool     reject_idp = false;            // ABRT INITIALIZE DEVICE PARAMETERS
+    // Extra busy time (ns) while reading this sector, or committing a write
+    // to it. On a write the data is already in the drive (written[]) when
+    // the pause starts, as on the ST380011A.
+    std::map<uint32_t, uint64_t> pause;
+    // Hardware reset (RESET-).
+    bool     reset_low = false;             // the line is held low now
+    uint64_t t_hw_reset = 500000000ull;     // power-on diagnostics after RESET- goes high
+    bool     srst_wedges = false;           // after SRST, BSY until a hardware reset
+    bool     hw_reset_wedges = false;       // ...and after a hardware reset too
+    bool     wedged = false;
+    int      hw_resets = 0;
+    // ATA: RESET- must be held low at least 25 us. A shorter pulse is not
+    // taken as a reset here: the drive goes on as it was.
+    uint64_t reset_low_at = 0;
+    bool     wedged_before_reset = false;
+    int      short_resets = 0;
+    // IDENTIFY takes this much longer than a sector (drive busy).
+    uint64_t t_identify_extra = 0;
 
     // SAT-path features. nsect is the size the drive reports now; a larger
     // native_max models a Host Protected Area (0 = no HPA, same as nsect).
@@ -93,6 +119,10 @@ struct SimDrive {
     // 48-bit (83.10), SMART error logging (84.0), and the 01b signature in
     // bits 15:14 of words 83 and 84. identify_ok = false: IDENTIFY aborts.
     uint16_t id_w82 = 0x4401, id_w83 = 0x4400, id_w84 = 0x4001;
+    // Word 85: enabled; SMART (bit 0) and HPA (bit 10) on, NOP (14). Word 87:
+    // the 01b signature that makes 85..87 valid. A drive whose word 85 says
+    // SMART is off aborts every SMART command, as the ST380011A did.
+    uint16_t id_w85 = 0x4401, id_w87 = 0x4000;
     bool     identify_ok = true;
     const char *id_model = "SIMULATED ATA DRIVE";  // words 27..46
     const char *id_serial = "SIM0000001";           // words 10..19
@@ -183,7 +213,7 @@ struct SimDrive {
     // advance the state machine to 'now'
     void tick(uint64_t now) {
         if (phase == IN_RESET) {
-            if (!(devctl & 0x04) && now >= ready_at) {
+            if (!(devctl & 0x04) && !reset_low && !wedged && now >= ready_at) {
                 phase = IDLE; status = 0x50; error = 0x01;
                 geo_valid = false;              // SRST drops INITIALIZE DEVICE PARAMETERS
             }
@@ -243,6 +273,7 @@ struct SimDrive {
         xfer[49] = 0x0200;                                  // LBA
         xfer[60] = (uint16_t)nsect; xfer[61] = (uint16_t)(nsect >> 16);
         xfer[82] = id_w82; xfer[83] = id_w83; xfer[84] = id_w84;
+        xfer[85] = id_w85; xfer[87] = id_w87;
         xfer[100] = (uint16_t)nsect; xfer[101] = (uint16_t)(nsect >> 16);
     }
 
@@ -275,8 +306,10 @@ struct SimDrive {
 
     uint64_t sector_delay(uint32_t lba) const {
         auto b = bad.find(lba);
-        if (b != bad.end() && (b->second.mode != BAD_MARGINAL || b->second.fails > 0)) return t_bad;
-        return t_sector;
+        auto p = pause.find(lba);
+        uint64_t extra = p != pause.end() ? p->second : 0;
+        if (b != bad.end() && (b->second.mode != BAD_MARGINAL || b->second.fails > 0)) return t_bad + extra;
+        return t_sector + extra;
     }
 
     bool selected() const { return ((reg[6] >> 4) & 1) == (slave ? 1 : 0); }
@@ -369,7 +402,7 @@ struct SimDrive {
         case 0xEC:
             if (!identify_ok) { abort_cmd(); break; }
             left = 1; cur = 0;
-            phase = BUSY_IN; status = 0x80; ready_at = now + t_sector;
+            phase = BUSY_IN; status = 0x80; ready_at = now + t_sector + t_identify_extra;
             break;
         case 0x40: verify(now); break;
         case 0xB0: smart(now); break;
@@ -420,7 +453,7 @@ struct SimDrive {
     }
 
     void smart(uint64_t now) {
-        if (!smart_supported || reg[4] != 0x4F || reg[5] != 0xC2) { abort_cmd(); return; }
+        if (!smart_supported || !(id_w85 & 1) || reg[4] != 0x4F || reg[5] != 0xC2) { abort_cmd(); return; }
         switch (reg[1]) {
         case 0xD0: case 0xD1:
             left = 1; cur = smart_sector(reg[1], 0, 0);
@@ -460,6 +493,7 @@ struct SimDrive {
             intrq = false;
             if (!(devctl & 0x04)) { srst++; status_before_srst = status; }
             phase = IN_RESET; status = 0x80;
+            if (srst_wedges) wedged = true;
             reg[6] &= ~0x10;                       // SRST selects device 0
         } else if (devctl & 0x04) {
             ready_at = now + t_reset;
@@ -467,6 +501,35 @@ struct SimDrive {
             master_ready_at = now + master_t_reset;
         }
         devctl = v;
+    }
+
+    // RESET- (hardware reset). Low: every device on the cable is in reset,
+    // device 0 selected, registers and Device Control cleared, CHS
+    // translation lost. High: power-on diagnostics for t_hw_reset (a master
+    // modelled for SRST also waits that long).
+    void hw_reset_line(bool high, uint64_t now) {
+        tick(now);
+        if (!high) {
+            if (reset_low) return;
+            reset_low = true; hw_resets++;
+            reset_low_at = now; wedged_before_reset = wedged;
+            intrq = false; devctl = 0;
+            phase = IN_RESET; status = 0x80; error = 0x01;
+            for (int i = 0; i < 8; i++) { reg[i] = 0; hob[i] = 0; }
+            geo_valid = false;
+            wedged = hw_reset_wedges;
+            return;
+        }
+        if (!reset_low) return;                // already high: nothing happens
+        reset_low = false;
+        if (now - reset_low_at < 25000) {      // too short to count
+            short_resets++;
+            wedged = wedged_before_reset;
+        }
+        ready_at = now + t_hw_reset;
+        srst_released_at = now;
+        status_before_srst = 0x80;             // BSY through the 2 ms window
+        master_ready_at = now + t_hw_reset;
     }
 
     uint16_t read_data(uint64_t now) {
@@ -499,8 +562,10 @@ struct SimDrive {
             std::vector<uint8_t> s(512);
             for (int i = 0; i < 256; i++) { s[2 * i] = xfer[i] & 0xFF; s[2 * i + 1] = xfer[i] >> 8; }
             written[cur] = s;
+            auto p = pause.find(cur);
+            uint64_t extra = p != pause.end() ? p->second : 0;
             cur++; left--;
-            phase = BUSY_COMMIT; status = 0x80; ready_at = now + 1000;
+            phase = BUSY_COMMIT; status = 0x80; ready_at = now + 1000 + extra;
         }
     }
 };
@@ -535,3 +600,4 @@ void ide_pio_write(uint32_t count, const uint16_t *buf) {
     }
 }
 bool mock_intrq(void) { return sim.intrq_line(mock_now_ns); }
+void mock_reset_line(bool high) { sim.hw_reset_line(high, mock_now_ns); }

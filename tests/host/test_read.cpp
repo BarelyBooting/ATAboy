@@ -381,6 +381,7 @@ static void test_slow_reset_chs() {
     CHECK(never_wrong(h, 5000), "wrong sectors handed to the host");
     ide_fail_t f; ide_last_failure(&f);
     CHECK(f.kind == IDE_FAIL_TIMEOUT && f.reset && !f.reset_failed, "kind %u reset %d failed %d", f.kind, f.reset, f.reset_failed);
+    CHECK(!f.hw_reset && sim.hw_resets == 0, "a 3 s soft reset is within ATA's 31 s: no hardware reset (%d)", sim.hw_resets);
     CHECK(sim.geo_valid && sim.heads == 5 && sim.spt == 34, "geometry %d %u x %u", sim.geo_valid, sim.heads, sim.spt);
     sim.bad.clear();
     HostRead g = host_read10(1234, 8);
@@ -390,10 +391,13 @@ static void test_slow_reset_chs() {
 
 // A reset that outlasts the 31 s allowance: reads must refuse (never read
 // through the default translation), and work again once the drive is back.
+// Since 0.6f3p7 a soft reset that fails is followed by one hardware reset,
+// so that has to be slow too for the drive to stay unready.
 static void test_reset_never_ready_chs() {
     setup("soft reset never finishes in time, CHS", CHS);
     chs_user_geometry();
     sim.t_reset = 45000000000ull;                  // 45 s
+    sim.t_hw_reset = 60000000000ull;               // 60 s
     sim.bad[5003] = {BAD_HANG, 0};
     // One call first, so the record read back is this failure's (the host
     // retry that follows fails "not ready" and records that instead).
@@ -402,6 +406,7 @@ static void test_reset_never_ready_chs() {
     ide_fail_t f; ide_last_failure(&f);
     CHECK(r < 0 && done == 3, "r %d done %u", r, done);
     CHECK(f.kind == IDE_FAIL_TIMEOUT && f.reset && f.reset_failed, "kind %u reset %d failed %d", f.kind, f.reset, f.reset_failed);
+    CHECK(f.hw_reset && sim.hw_resets == 1, "hardware reset %d, %d of them", f.hw_reset, sim.hw_resets);
     HostRead h = host_read10(5000, 8);             // drive still in reset
     CHECK(never_wrong(h, 5000) && !h.ok, "ok %d size %zu", h.ok, h.data.size());
     sim.bad.clear();
@@ -467,7 +472,11 @@ static void test_slave_after_reset(Mode m) {
     int32_t r = ide_read_sectors_partial(5000, 8, buf, &done);
     ide_fail_t f2; ide_last_failure(&f2);
     CHECK(r < 0 && f2.reset && !f2.reset_failed, "slow slave reset: r %d reset %d failed %d", r, f2.reset, f2.reset_failed);
-    CHECK(mock_now_ns - t0 < 20000000000ull, "reset took %llu ms: waited on the absent master", (unsigned long long)((mock_now_ns - t0) / 1000000));
+    // The hang itself takes IDE_CMD_TIMEOUT_MS to give up on; waiting on the
+    // absent master would add up to 31 s on top of the slave's own 3 s.
+    CHECK(mock_now_ns - t0 < (IDE_CMD_TIMEOUT_MS + 20000) * 1000000ull, "reset took %llu ms: waited on the absent master",
+          (unsigned long long)((mock_now_ns - t0) / 1000000));
+    CHECK(!f2.hw_reset && sim.hw_resets == 0, "a slave that comes back from SRST got a hardware reset");
     CHECK(((sim.reg[6] >> 4) & 1) == 1, "slave not selected after the reset (DH %02X)", sim.reg[6]);
     sim.bad.clear();
     HostRead g2 = host_read10(100, 8);
@@ -631,6 +640,236 @@ static void test_slave_with_master_after_reset(Mode m) {
 #endif
     HostRead g2 = host_read10(200, 8);
     CHECK(g2.ok && matches_medium(g2, 200) && sim.violations == 0, "slave usable at the end, violations %d", sim.violations);
+}
+
+// ---- 0.6f3p7: long internal pauses, wall-clock limits, hardware reset -----
+//
+// Found on hardware 2026-09-24 (ST380011A alone on the cable as a slave,
+// 0.6f3p6): one single-sector WRITE kept the drive busy past the commit
+// wait, which counted polls (about 1 s) instead of time. The firmware
+// soft-reset the drive in the middle of its own work; the drive stayed busy
+// through that and read 0xFF until a re-detect pulsed RESET-. The sector held
+// the written data.
+
+static const char *lba_or_chs(Mode m) { return m == LBA ? "LBA" : "CHS"; }
+static std::vector<uint8_t> fill512(size_t sectors, uint8_t seed) {
+    std::vector<uint8_t> v(sectors * 512);
+    for (size_t i = 0; i < v.size(); i++) v[i] = (uint8_t)(i * 13 + seed);
+    return v;
+}
+static bool written_is(uint32_t lba, const uint8_t *p) {
+    auto w = sim.written.find(lba);
+    return w != sim.written.end() && memcmp(w->second.data(), p, 512) == 0;
+}
+static bool same_failure(const ide_fail_t &a, const ide_fail_t &b) { return memcmp(&a, &b, sizeof a) == 0; }
+static uint64_t ms_since(uint64_t t0) { return (mock_now_ns - t0) / 1000000; }
+
+// Pauses the old iteration-counted waits gave up on (3 s), and one just
+// inside the new limit (25 s), are waited out: no reset, the data right,
+// nothing recorded as a failure.
+static void test_pause_outwaited(Mode m) {
+    std::string n = std::string("drive pauses 3 s and 25 s, outwaited, ") + lba_or_chs(m);
+    setup(n.c_str(), m);
+    config.drive_write_protected = false;
+    ide_fail_t f0; ide_last_failure(&f0);
+    const uint32_t L = 123456;
+    // WRITE(10), one sector, the drive busy 3 s committing it (the finding)
+    std::vector<uint8_t> w = fill512(1, 1);
+    sim.pause[L] = 3000000000ull;
+    uint64_t t0 = mock_now_ns;
+    int32_t r = tud_msc_write10_cb(0, L, 0, w.data(), 512);
+    CHECK(r == 512 && ms_since(t0) >= 3000, "3 s commit: r %d after %llu ms", r, (unsigned long long)ms_since(t0));
+    CHECK(written_is(L, w.data()), "3 s commit: sector content");
+    // Eight sectors, the pause after the third: the wait for the fourth DRQ
+    std::vector<uint8_t> w8 = fill512(8, 2);
+    sim.pause.clear(); sim.pause[L + 12] = 3000000000ull;
+    r = tud_msc_write10_cb(0, L + 10, 0, w8.data(), 4096);
+    bool all = true;
+    for (int i = 0; i < 8; i++) all = all && written_is(L + 10 + i, w8.data() + i * 512);
+    CHECK(r == 4096 && all, "8 sectors, 3 s after the third: r %d content %d", r, all);
+    // READ(10), the drive busy 3 s before the fifth of eight sectors
+    sim.pause.clear(); sim.pause[L + 104] = 3000000000ull;
+    HostRead h = host_read10(L + 100, 8);
+    CHECK(h.ok && matches_medium(h, L + 100), "read, 3 s before sector 5: ok %d size %zu", h.ok, h.data.size());
+    // 25 s: past any poll count the old code could have meant, inside 30 s
+    sim.pause.clear(); sim.pause[L + 200] = 25000000000ull;
+    std::vector<uint8_t> w25 = fill512(1, 3);
+    r = tud_msc_write10_cb(0, L + 200, 0, w25.data(), 512);
+    CHECK(r == 512 && written_is(L + 200, w25.data()), "25 s commit: r %d", r);
+    sim.pause.clear(); sim.pause[L + 300] = 25000000000ull;
+    h = host_read10(L + 300, 1);
+    CHECK(h.ok && matches_medium(h, L + 300), "read, 25 s: ok %d", h.ok);
+    sim.pause.clear();
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(same_failure(f, f0), "a failure was recorded (kind %u cmd %02X)", f.kind, f.command);
+    CHECK(sim.srst == 0 && sim.hw_resets == 0 && sim.violations == 0, "srst %d hw %d violations %d",
+          sim.srst, sim.hw_resets, sim.violations);
+}
+
+// A pause longer than IDE_CMD_TIMEOUT_MS ends in a soft reset at the limit,
+// recorded as a timeout; the drive comes back from the SRST, so no hardware
+// reset. On a read the good prefix is still handed over (issue #13).
+static void test_pause_too_long(Mode m) {
+    std::string n = std::string("drive pauses 45 s, soft reset at the limit, ") + lba_or_chs(m);
+    setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    config.drive_write_protected = false;
+    const uint32_t L = 23456;
+    std::vector<uint8_t> w = fill512(1, 4);
+    sim.pause[L] = 45000000000ull;
+    uint64_t t0 = mock_now_ns;
+    int32_t r = ide_write_sectors(L, 1, w.data());
+    uint64_t ms = ms_since(t0);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(r < 0, "write r %d", r);
+    CHECK(ms >= IDE_CMD_TIMEOUT_MS && ms < IDE_CMD_TIMEOUT_MS + 1000, "write gave up after %llu ms", (unsigned long long)ms);
+    CHECK(f.kind == IDE_FAIL_TIMEOUT && f.command == 0x30 && f.done == 1 && f.lba == L + 1,
+          "kind %u cmd %02X done %u lba %u", f.kind, f.command, f.done, f.lba);
+    CHECK(f.status & 0x80, "status %02X: the drive was busy when given up on", f.status);
+    CHECK(f.reset && !f.hw_reset && !f.reset_failed && sim.srst == 1 && sim.hw_resets == 0,
+          "reset %d hw %d failed %d srst %d hw resets %d", f.reset, f.hw_reset, f.reset_failed, sim.srst, sim.hw_resets);
+    if (m == CHS) CHECK(sim.geo_valid && sim.heads == 5 && sim.spt == 34, "geometry %d %u x %u", sim.geo_valid, sim.heads, sim.spt);
+    sim.pause.clear();
+    sim.pause[L + 103] = 45000000000ull;
+    uint8_t buf[8 * 512]; uint32_t done = 0;
+    t0 = mock_now_ns;
+    r = ide_read_sectors_partial(L + 100, 8, buf, &done);
+    ms = ms_since(t0);
+    ide_last_failure(&f);
+    CHECK(r < 0 && done == 3 && f.kind == IDE_FAIL_TIMEOUT && f.reset && !f.hw_reset && f.lba == L + 103,
+          "read r %d done %u kind %u lba %u", r, done, f.kind, f.lba);
+    CHECK(ms >= IDE_CMD_TIMEOUT_MS && ms < IDE_CMD_TIMEOUT_MS + 1000, "read gave up after %llu ms", (unsigned long long)ms);
+    bool prefix = true;
+    for (uint32_t i = 0; i < 3 * 512; i++) prefix = prefix && buf[i] == sim.byte_at(L + 100 + i / 512, (int)(i % 512));
+    CHECK(prefix, "the three sectors before the pause are not the medium");
+    sim.pause.clear();
+    HostRead g = host_read10(L + 100, 8);
+    CHECK(g.ok && matches_medium(g, L + 100), "usable after the reset");
+    // The limit is for the whole command, as the host's is: two 20 s pauses
+    // in one 8-sector read end it at 30 s, after the fifth sector's wait began.
+    sim.pause[L + 202] = 20000000000ull;
+    sim.pause[L + 205] = 20000000000ull;
+    done = 0;
+    t0 = mock_now_ns;
+    r = ide_read_sectors_partial(L + 200, 8, buf, &done);
+    ms = ms_since(t0);
+    CHECK(r < 0 && done == 5 && ms >= IDE_CMD_TIMEOUT_MS && ms < IDE_CMD_TIMEOUT_MS + 1000,
+          "two 20 s pauses: r %d done %u after %llu ms (a limit per sector would have read all 8)", r, done, (unsigned long long)ms);
+    sim.pause.clear();
+    CHECK(sim.violations == 0 && sim.reset_writes == 0, "violations %d reset writes %d", sim.violations, sim.reset_writes);
+}
+
+// IDENTIFY is timed by the clock too: 7 s (past the old 100000 polls of
+// 50 us) is waited out; 12 s (past IDE_IDENTIFY_TIMEOUT_MS) fails.
+static void test_identify_slow() {
+    setup("IDENTIFY takes 7 s, then 12 s", LBA);
+    uint16_t id[256];
+    sim.t_identify_extra = 7000000000ull;
+    uint64_t t0 = mock_now_ns;
+    CHECK(ide_identify(id) && id[27] == ('S' << 8 | 'I'), "7 s IDENTIFY failed");
+    CHECK(ms_since(t0) >= 7000, "returned after %llu ms", (unsigned long long)ms_since(t0));
+    sim.t_identify_extra = 12000000000ull;
+    t0 = mock_now_ns;
+    CHECK(!ide_identify(id), "12 s IDENTIFY taken");
+    uint64_t ms = ms_since(t0);
+    CHECK(ms + 1 >= IDE_IDENTIFY_TIMEOUT_MS && ms < IDE_IDENTIFY_TIMEOUT_MS + 1000, "gave up after %llu ms", (unsigned long long)ms);
+    CHECK(sim.srst == 0 && sim.violations == 0, "srst %d violations %d", sim.srst, sim.violations);
+}
+
+// The finding itself: a lone slave that stays busy through the soft reset,
+// and comes back only from a hardware reset. The firmware must use RESET-
+// once, select the slave again, put the CHS geometry back, record that it
+// did, and the drive must work afterwards. A drive that stays busy through
+// the hardware reset too gets exactly one, and "reset FAILED".
+static void test_lone_slave_hw_reset(Mode m) {
+    std::string n = std::string("lone slave, SRST does not bring it back, hardware reset does, ") + lba_or_chs(m);
+    setup(n.c_str(), m);
+    sim.slave = true;
+    ide_select_device(0xB0);
+    if (m == CHS) chs_user_geometry();
+    else { ide_write_reg(6, 0xB0); busy_wait_us_32(1); }
+    uint16_t id[256];
+    CHECK(ide_identify(id), "slave IDENTIFY");
+    config.drive_write_protected = false;
+    sim.violations = 0; sim.init_params = 0;
+    sim.srst_wedges = true;
+    const uint32_t L = 2816372 % 166600;            // the finding's LBA, folded into this medium
+    std::vector<uint8_t> w = fill512(1, 5);
+    sim.pause[L] = 45000000000ull;
+    uint64_t t0 = mock_now_ns;
+    int32_t r = tud_msc_write10_cb(0, L, 0, w.data(), 512);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(r < 0 && written_is(L, w.data()), "write r %d; the drive has the data", r);
+    CHECK(f.kind == IDE_FAIL_TIMEOUT && f.command == 0x30 && f.done == 1, "kind %u cmd %02X done %u", f.kind, f.command, f.done);
+    CHECK(f.reset && f.hw_reset && !f.reset_failed, "reset %d hw %d failed %d", f.reset, f.hw_reset, f.reset_failed);
+    CHECK(sim.srst == 1 && sim.hw_resets == 1, "srst %d hardware resets %d", sim.srst, sim.hw_resets);
+    CHECK(((sim.reg[6] >> 4) & 1) == 1, "slave not selected after the hardware reset (DH %02X)", sim.reg[6]);
+    if (m == CHS)
+        CHECK(sim.geo_valid && sim.heads == 5 && sim.spt == 34 && sim.init_params == 1,
+              "geometry after the hardware reset: %d %u x %u, %d INITIALIZE", sim.geo_valid, sim.heads, sim.spt, sim.init_params);
+    CHECK(sim.cmd_count[0x10] >= 1, "no RECALIBRATE after the hardware reset");
+    CHECK(ms_since(t0) < IDE_CMD_TIMEOUT_MS + 2 * 31000 + 5000, "took %llu ms", (unsigned long long)ms_since(t0));
+    sim.pause.clear();
+    HostRead g = host_read10(100, 8);
+    CHECK(g.ok && matches_medium(g, 100), "slave usable after the hardware reset");
+    std::vector<uint8_t> w2 = fill512(1, 6);
+    r = tud_msc_write10_cb(0, L, 0, w2.data(), 512);
+    CHECK(r == 512 && written_is(L, w2.data()), "write after the hardware reset: r %d", r);
+    // The same through a read that hangs: reset, hardware reset, prefix kept.
+    sim.bad[5003] = {BAD_HANG, 0};
+    uint8_t buf[8 * 512]; uint32_t done = 0;
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_last_failure(&f);
+    CHECK(r < 0 && done == 3 && f.hw_reset && !f.reset_failed && sim.hw_resets == 2, "hang: r %d done %u hw %d hw resets %d",
+          r, done, f.hw_reset, sim.hw_resets);
+    sim.bad.clear();
+#if ATABOY_SAT
+    // A SAT command the drive never finishes: the abort escalates the same way.
+    sim.hang_cmd = 0xF8;
+    SatResult s = sat_cmd(native_max12(), 0, false);
+    CHECK(!s.ok() && sense_is(s.sense, 0x0B, 0x00, 0x00) && sim.hw_resets == 3, "SAT abort: hw resets %d", sim.hw_resets);
+    sim.hang_cmd = 0;
+    s = sat_cmd(native_max12(), 0, false);
+    CHECK(is_desc(s.sense) && sense_is(s.sense, 0x01, 0x00, 0x1D), "SAT after the hardware reset");
+#endif
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+    // Stays busy through the hardware reset as well: one attempt, then FAILED.
+    sim.hw_reset_wedges = true;
+    sim.pause[L] = 45000000000ull;
+    int hw = sim.hw_resets;
+    r = tud_msc_write10_cb(0, L, 0, w.data(), 512);
+    ide_last_failure(&f);
+    CHECK(r < 0 && f.reset && f.hw_reset && f.reset_failed, "wedged: reset %d hw %d failed %d", f.reset, f.hw_reset, f.reset_failed);
+    CHECK(sim.hw_resets == hw + 1, "wedged: %d hardware resets, want exactly one", sim.hw_resets - hw);
+    hw = sim.hw_resets;
+    CHECK(sim.short_resets == 0, "RESET- held low too briefly %d times", sim.short_resets);
+    HostRead d = host_read10(100, 8);
+    CHECK(!d.ok && d.data.empty() && sim.hw_resets == hw, "while wedged: ok %d, %d more hardware resets", d.ok, sim.hw_resets - hw);
+    ide_last_failure(&f);
+    CHECK(f.kind == IDE_FAIL_NOT_READY, "while wedged: kind %u", f.kind);
+}
+
+// A master that stays busy after SRST: the reset gives up on device 0 after
+// 31 s, and the hardware reset brings it back.
+static void test_master_hw_reset() {
+    setup("master, SRST does not bring it back, hardware reset does", LBA);
+    sim.srst_wedges = true;
+    sim.bad[5003] = {BAD_HANG, 0};
+    uint8_t buf[8 * 512]; uint32_t done = 0;
+    int32_t r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(r < 0 && done == 3 && f.reset && f.hw_reset && !f.reset_failed && sim.hw_resets == 1,
+          "r %d done %u reset %d hw %d failed %d hw resets %d", r, done, f.reset, f.hw_reset, f.reset_failed, sim.hw_resets);
+    sim.bad.clear();
+    HostRead g = host_read10(5000, 8);
+    CHECK(g.ok && matches_medium(g, 5000), "master usable after the hardware reset");
+    // A later failure that needs no reset must not carry the old flag over.
+    sim.bad[6000] = {BAD_ERR, 0};
+    r = ide_read_sectors_partial(6000, 1, buf, &done);
+    ide_last_failure(&f);
+    CHECK(r < 0 && f.kind == IDE_FAIL_ERR && !f.reset && !f.hw_reset, "plain ERR after a hardware reset: reset %d hw %d", f.reset, f.hw_reset);
+    sim.bad.clear();
+    CHECK(sim.violations == 0 && sim.reset_writes == 0, "violations %d reset writes %d", sim.violations, sim.reset_writes);
 }
 
 // Review finding L3: while an MSC callback is using the drive, usb.c says so
@@ -1083,10 +1322,13 @@ static void check_gate(const char *when, unsigned allowed, bool ungated = true) 
     }
 }
 
-static void identify_with(uint16_t w82, uint16_t w83, uint16_t w84) {
-    sim.id_w82 = w82; sim.id_w83 = w83; sim.id_w84 = w84;
+// Words 85 and 87 default to what the simulated drive answers: SMART and HPA
+// enabled, 85..87 valid.
+static void identify_with(uint16_t w82, uint16_t w83, uint16_t w84,
+                          uint16_t w85 = 0x4401, uint16_t w87 = 0x4000) {
+    sim.id_w82 = w82; sim.id_w83 = w83; sim.id_w84 = w84; sim.id_w85 = w85; sim.id_w87 = w87;
     uint16_t id[256];
-    CHECK(ide_identify(id), "IDENTIFY %04x %04x %04x", w82, w83, w84);
+    CHECK(ide_identify(id), "IDENTIFY %04x %04x %04x %04x %04x", w82, w83, w84, w85, w87);
 }
 
 // Re-review M-A: a drive swapped on the cable after detection and mounted
@@ -1095,8 +1337,11 @@ static void identify_with(uint16_t w82, uint16_t w83, uint16_t w84) {
 // drive for IDENTIFY again and compares serial, model and words 82..84.
 struct IdRow { const char *name; std::vector<uint8_t> cdb; uint32_t xfer; bool dir_in; uint8_t op; bool lba_only; };
 static std::vector<IdRow> id_check_rows() {
+    // Every row the policy marks needs_identity, one of each command byte
+    // (review L-1 found READ NATIVE MAX EXT missing here).
     return { { "SMART RETURN STATUS", smart_status12(), 0, false, 0xB0, false },
              { "READ NATIVE MAX", native_max12(), 0, false, 0xF8, false },
+             { "READ NATIVE MAX EXT", native_max_ext16(), 0, false, 0x27, false },
              { "READ SECTORS EXT", pt16(4, true, 0x0E, 0, 1, 100, 0x40, 0x24), 512, true, 0x24, true } };
 }
 static void test_sat_identity_verified(Mode m) {
@@ -1105,6 +1350,7 @@ static void test_sat_identity_verified(Mode m) {
     auto reset_drive = [&]() {
         sim.id_model = "SIMULATED ATA DRIVE"; sim.id_serial = "SIM0000001";
         sim.id_w82 = 0x4401; sim.id_w83 = 0x4400; sim.id_w84 = 0x4001; sim.identify_ok = true;
+        sim.id_w85 = 0x4401; sim.id_w87 = 0x4000;
         identify_with(0x4401, 0x4400, 0x4001);            // a detection of this drive
     };
     // want: 1 ran, 0 refused 5/24/00, 2 not ready 2/04/00
@@ -1131,6 +1377,12 @@ static void test_sat_identity_verified(Mode m) {
         reset_drive();
         sim.id_w82 = 0x4001;                              // same drive text, words changed
         run(g, "other words 82..84", 0, 1);
+        reset_drive();
+        sim.id_w85 = 0x4001;                              // HPA switched off since detection
+        run(g, "other word 85", 0, 1);
+        reset_drive();
+        sim.id_w87 = 0x4001;                              // word 87 differs
+        run(g, "other word 87", 0, 1);
         reset_drive();
         sim.id_model = "CONNER CFS1275A"; sim.id_serial = "CONNER0001";
         sim.id_w82 = 0; sim.id_w83 = 0; sim.id_w84 = 0;
@@ -1172,6 +1424,17 @@ static void test_sat_identify_gate() {
     identify_with(0x4401, 0x4400, 0x4000);  check_gate("no SMART error log (84.0)", G_ALL & ~G_LOG);
     identify_with(0x4001, 0x4400, 0x4001);  check_gate("no HPA (82.10)", G_SMART | G_LOG | G_READ_EXT);
     identify_with(0x4401, 0x4000, 0x4001);  check_gate("no 48-bit (83.10)", G_SMART | G_LOG | G_NMAX);
+    // SMART supported but switched off (word 85 bit 0), and word 85 not valid
+    // (word 87 bits 15:14 not 01b): every SMART row refused, the rest run.
+    identify_with(0x4401, 0x4400, 0x4001, 0x4400);          check_gate("SMART disabled (85.0)", G_NMAX | G_NMAX_EXT | G_READ_EXT);
+    identify_with(0x4401, 0x4400, 0x4001, 0x4401, 0x0000);  check_gate("word 87 signature 00b", G_NMAX | G_NMAX_EXT | G_READ_EXT);
+    identify_with(0x4401, 0x4400, 0x4001, 0x4401, 0xC000);  check_gate("word 87 signature 11b", G_NMAX | G_NMAX_EXT | G_READ_EXT);
+    identify_with(0x4401, 0x4400, 0x4001, 0x4401, 0x8000);  check_gate("word 87 signature 10b", G_NMAX | G_NMAX_EXT | G_READ_EXT);
+    identify_with(0x4401, 0x4400, 0x4001, 0xFFFF, 0xFFFF);  check_gate("words 85 and 87 FFFFh", G_NMAX | G_NMAX_EXT | G_READ_EXT);
+    // The ST380011A donor's words 82 and 85 (346Bh, 3468h: SMART supported,
+    // not enabled; HPA supported and enabled). Its words 83, 84 and 87 were not
+    // recorded, so the simulated drive's valid ones stand in.
+    identify_with(0x346B, 0x4400, 0x4001, 0x3468, 0x4000);  check_gate("ST380011A words 82 and 85", G_NMAX | G_NMAX_EXT | G_READ_EXT);
     // Words 82..84 not valid: nothing gated may run, whatever the bits say.
     identify_with(0x0401 | 0x0001, 0x0400, 0x0001);   check_gate("pre-ATA-4, no signature (CFS1275A-like)", 0);
     identify_with(0x4401, 0xC400, 0x4001);  check_gate("word 83 signature 11b", 0);
@@ -1212,7 +1475,7 @@ static void test_sat_identify_gate() {
         sat_cmd(r.cdb, r.xfer, r.in);
         CHECK(sim.non_id_commands() == cmds + 1, "CHS, full IDENTIFY: %s not sent", r.name);
     }
-    identify_with(0x0001, 0x0000, 0x0000);
+    identify_with(0x0001, 0x0000, 0x0000, 0x0000, 0x0000);
     for (auto &r : gated_rows()) {
         int cmds = sim.non_id_commands();
         SatResult s = sat_cmd(r.cdb, r.xfer, r.in);
@@ -1272,6 +1535,15 @@ static void test_sat_slow_bsy() {
         mock_now_ns += 700000000;
         s = sat_cmd(verify12(0x00, 4, 100), 0, false);
         CHECK(s.r == 0 && s.sense.empty(), "good verify after an ERR: r %d sense %zu", s.r, s.sense.size());
+        // Review L-3: a gated command straight after an ERR. Its identity
+        // check sends IDENTIFY, which must not take the stale ERR as its
+        // answer (that would forget the words and refuse the command).
+        s = sat_cmd(verify12(0x00, 8, 4996), 0, false);
+        CHECK(!s.ok(), "verify fails again");
+        mock_now_ns += 700000000;
+        s = sat_cmd(native_max12(), 0, false);
+        CHECK(is_desc(s.sense) && desc_lba28(s.sense) == 156301487u, "READ NATIVE MAX after an ERR: sense %zu %s", s.sense.size(),
+              sense_is(s.sense, 0x05, 0x24, 0x00) ? "(refused: identity check took the stale ERR)" : "");
         CHECK(sim.srst == 0 && sim.violations == 0 && sim.non_id_data_reads() == 512, "srst %d violations %d data reads %d",
               sim.srst, sim.violations, sim.non_id_data_reads());
     }
@@ -1494,6 +1766,14 @@ int main() {
     test_slave_with_master_after_reset(CHS);
     test_host_offsets();
     test_msc_busy_flag();
+    test_pause_outwaited(LBA);
+    test_pause_outwaited(CHS);
+    test_pause_too_long(LBA);
+    test_pause_too_long(CHS);
+    test_lone_slave_hw_reset(LBA);
+    test_lone_slave_hw_reset(CHS);
+    test_master_hw_reset();
+    test_identify_slow();
 #if ATABOY_SAT
     test_sat_smart_status(LBA);
     test_sat_smart_status(CHS);

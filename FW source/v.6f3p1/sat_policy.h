@@ -13,12 +13,15 @@
 //   0x21 READ SECTORS (NR)       A1 or 85             4      1..8    LBA28                         -
 //   0x24 READ SECTORS EXT        85, EXTEND=1         4      1..8    LBA48                         83.10
 //   0x40 READ VERIFY SECTORS     A1 or 85             3      0..255  LBA28 (count 0 = 256)         -
-//   0xB0 SMART READ DATA         A1 or 85, FEAT D0    4      1       LBA low 0, mid/high 4F/C2     82.0
-//   0xB0 SMART READ THRESHOLDS   A1 or 85, FEAT D1    4      1       LBA low 0, mid/high 4F/C2     82.0
-//   0xB0 SMART READ LOG          A1 or 85, FEAT D5    4      1..8    LBA low = log address, 4F/C2  82.0 and 84.0
-//   0xB0 SMART RETURN STATUS     A1 or 85, FEAT DA    3 CK   0       LBA low 0, mid/high 4F/C2     82.0
+//   0xB0 SMART READ DATA *       A1 or 85, FEAT D0    4      1       LBA low 0, mid/high 4F/C2     82.0, 85.0
+//   0xB0 SMART READ THRESHOLDS   A1 or 85, FEAT D1    4      1       LBA low 0, mid/high 4F/C2     82.0, 85.0
+//   0xB0 SMART READ LOG          A1 or 85, FEAT D5    4      1..8    LBA low = log address, 4F/C2  82.0, 85.0, 84.0
+//   0xB0 SMART RETURN STATUS *   A1 or 85, FEAT DA    3 CK   0       LBA low 0, mid/high 4F/C2     82.0, 85.0
 //   0xF8 READ NATIVE MAX ADDRESS A1 or 85             3 CK   0       all 0                         82.10
 //   0x27 READ NATIVE MAX EXT     85, EXTEND=1         3 CK   0       all 0                         82.10 and 83.10
+//
+// * Only in a build with ATABOY_SAT_SMART_SAVES=1 (below). The shipping build
+//   refuses both rows, whatever the drive says: on ATA-3 drives they write.
 //
 // "A1 or 85" means the 16-byte form with EXTEND=0. "CK" means CK_COND must be
 // 1: those commands exist to return registers, and CK_COND is how SAT hands
@@ -69,7 +72,19 @@
 //     01b (their validity signature), and word 82 is neither 0000h nor FFFFh
 //     (both mean "not reported"; an 83 or 84 of 0000h or FFFFh already fails
 //     the signature);
-//   - SMART rows: word 82 bit 0 (SMART feature set supported);
+//   - SMART rows: word 82 bit 0 (SMART feature set supported) AND word 85
+//     bit 0 (SMART feature set enabled). A drive with SMART switched off
+//     aborts every SMART command but ENABLE OPERATIONS, which is refused
+//     here, so there is no point sending one. Seen on the ST380011A donor
+//     (2026-09-24): w82 346Bh, w85 3468h, SMART supported but disabled, and
+//     D1 and D5 came back ABRT (error 04h). Word 85 is valid only when bits
+//     15:14 of word 87 are 01b, as words 82..84 are with 83 and 84: Linux
+//     checks word 87 the same way before it reads word 85 (include/linux/
+//     ata.h, ata_id_hpa_enabled(): "87 covers 85-87"; checked 2026-09-24),
+//     and ATA/ATAPI-6 says so for words 85..87 (recalled, not re-read).
+//     Word 85 is not tested for 0000h or FFFFh: 0000h is a real answer
+//     (nothing enabled, so SMART refused), and a floating bus fails word
+//     87's signature;
 //   - SMART READ LOG additionally: word 84 bit 0 (SMART error logging
 //     supported, ATA/ATAPI-5 and -6). The error log is read with SMART READ
 //     LOG, so a drive that sets this bit implements the command. Word 84 bit 5
@@ -142,6 +157,9 @@ typedef struct {
     // id_captured.
     bool     id_captured;
     uint16_t id_w82, id_w83, id_w84;
+    // Words 85 (command sets and features enabled) and 87 (bits 15:14 = 01b
+    // when words 85..87 are valid), from the same IDENTIFY.
+    uint16_t id_w85, id_w87;
 } sat_input_t;
 
 // The ATA task file to issue for an allowed CDB. `device` never carries the
@@ -160,6 +178,10 @@ typedef struct {
 typedef struct {
     bool     allow;
     uint8_t  sense_key, asc, ascq;   // valid when !allow
+    // Allowed because of the drive's IDENTIFY words: the caller must check the
+    // drive is still the one they came from before sending (sat.c). Set
+    // exactly when the row needed a capability; false on every refusal.
+    bool     needs_identity;
 } sat_verdict_t;
 
 // Decide one command. On allow, *tf holds the task file to send; on refuse

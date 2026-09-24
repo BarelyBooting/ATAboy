@@ -39,10 +39,13 @@
 #define CAP_SMART_LOG  0x02u    // word 84 bit 0: SMART error logging (SMART READ LOG)
 #define CAP_HPA        0x04u    // word 82 bit 10: Host Protected Area feature set
 #define CAP_LBA48      0x08u    // word 83 bit 10: 48-bit Address feature set
+#define CAP_SMART_ON   0x10u    // word 85 bit 0: SMART feature set enabled (valid per word 87)
 
 // Nothing counts without a captured IDENTIFY whose words 82..84 are valid:
 // the 01b signature in bits 15:14 of words 83 and 84, and a word 82 that is
 // not 0000h or FFFFh. (83 and 84 of 0000h or FFFFh fail the signature.)
+// Word 85 (what is enabled) counts only when bits 15:14 of word 87 are 01b,
+// which is how ATA marks words 85..87 valid (sat_policy.h).
 static unsigned drive_caps(const sat_input_t *in) {
     if (!in->id_captured) return 0;
     if ((in->id_w83 & 0xC000u) != 0x4000u) return 0;
@@ -53,11 +56,12 @@ static unsigned drive_caps(const sat_input_t *in) {
     if (in->id_w84 & (1u << 0))  caps |= CAP_SMART_LOG;
     if (in->id_w82 & (1u << 10)) caps |= CAP_HPA;
     if (in->id_w83 & (1u << 10)) caps |= CAP_LBA48;
+    if ((in->id_w87 & 0xC000u) == 0x4000u && (in->id_w85 & (1u << 0))) caps |= CAP_SMART_ON;
     return caps;
 }
 
 static sat_verdict_t refuse(uint8_t sk, uint8_t asc) {
-    sat_verdict_t v = { false, sk, asc, 0x00 };
+    sat_verdict_t v = { false, sk, asc, 0x00, false };
     return v;
 }
 
@@ -191,7 +195,7 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
         if (lba3 | lba4 | lba5) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
         if (lba1 != SMART_LBA_MID || lba2 != SMART_LBA_HIGH) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
         if (dev & 0x0F) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);   // smart: low nibble reserved
-        need = CAP_SMART;       // smart: the drive says it has SMART
+        need = CAP_SMART | CAP_SMART_ON;    // smart: the drive has SMART, and it is enabled
         switch (feat) {
         case SMART_READ_DATA:
         case SMART_READ_THRESHOLDS:
@@ -205,7 +209,7 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
         case SMART_READ_LOG:
             // Any log address (LBA low); reading a log changes nothing.
             want_proto = SAT_PROTO_PIO_IN;
-            need = CAP_SMART | CAP_SMART_LOG;   // smart read log
+            need = CAP_SMART | CAP_SMART_ON | CAP_SMART_LOG;   // smart read log
             if (count == 0 || count > SAT_MAX_SECTORS) return refuse(SAT_SK_ILLEGAL_REQUEST, SAT_ASC_INVALID_FIELD);
             sectors = count;
             break;
@@ -291,7 +295,10 @@ sat_verdict_t sat_policy_check(const sat_input_t *in, sat_taskfile_t *tf) {
     tf->ck_cond = ck;
     tf->sectors = sectors;
 
-    sat_verdict_t ok = { true, 0, 0, 0 };
+    // A row that needed anything from IDENTIFY needs the drive to be the one
+    // that IDENTIFY came from: sat.c checks that before sending (review L-1:
+    // derived here, so the list of rows cannot drift from the policy's).
+    sat_verdict_t ok = { true, 0, 0, 0, need != 0 };
     return ok;
 }
 

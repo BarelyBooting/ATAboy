@@ -34,6 +34,9 @@ extern MockSio mock_sio;
 #define GPIO_OUT 1
 enum { GPIO_OVERRIDE_NORMAL = 0, GPIO_OVERRIDE_INVERT, GPIO_OVERRIDE_LOW, GPIO_OVERRIDE_HIGH };
 bool mock_intrq(void);
+// The IDE RESET- line (GPIO 23) is driven with gpio_put; the simulated drive
+// sees every change of it through this (test_read.cpp; a no-op elsewhere).
+void mock_reset_line(bool high);
 static inline void gpio_init_mask(uint32_t) {}
 static inline void gpio_set_dir_out_masked(uint32_t) {}
 static inline void gpio_init(unsigned) {}
@@ -44,6 +47,7 @@ static inline void gpio_disable_pulls(unsigned) {}
 static inline void gpio_set_inover(unsigned, unsigned) {}
 static inline void gpio_put(unsigned pin, bool v) {
     if (v) mock_gpio_out |= (1u << pin); else mock_gpio_out &= ~(1u << pin);
+    if (pin == 23) mock_reset_line(v);
 }
 static inline bool gpio_get(unsigned pin) { return pin == 28 ? mock_intrq() : false; }
 

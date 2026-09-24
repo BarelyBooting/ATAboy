@@ -37,28 +37,35 @@ void ide_id_words_forget(void) { mock_id_words_forgotten++; }
 uint32_t mock_gpio_out = 0;
 MockSio mock_sio;
 bool mock_intrq(void) { return false; }
+void mock_reset_line(bool) {}
 bool tud_msc_set_sense(uint8_t, uint8_t, uint8_t, uint8_t) { return true; }
 queue_t cdc_tx_queue, cdc_rx_queue;
 volatile bool cdc_connected = true, is_mounted = false, media_changed_waiting = false;
 config_t config;
 void config_defaults(void) {}
 void config_save(void) {}
-void ide_select_device(uint8_t) {}
-uint8_t ide_probe_devices(void) { return 0; }
-void ide_reset_drive(void) {}
-bool ide_wait_until_ready(uint32_t) { return true; }
-uint8_t ide_read_reg(uint8_t) { return 0x50; }
-void ide_set_iordy(bool) {}
-bool ide_identify(uint16_t *) { return false; }
-bool ide_set_geometry(uint8_t, uint8_t) { return true; }
-void ide_read_taskfile(uint8_t tf[8]) { for (int i = 0; i < 8; i++) tf[i] = 0; tf[7] = 0x50; }
-uint8_t ide_seek_read_one(uint32_t, bool) { return 0x50; }
-void ide_last_failure(ide_fail_t *out) { memset(out, 0, sizeof *out); }
-
 // usb.c's busy flag, as core 1 sees it: busy until a set time (mock clock).
 static uint64_t busy_until_ns = 0;
 static int busy_reads = 0;
 bool usb_msc_ide_busy(void) { busy_reads++; return mock_now_ns < busy_until_ns; }
+
+// Every stand-in that would put a cycle on the IDE bus counts itself, and
+// counts it again if the USB side still had the bus at that moment (review
+// L-5: core 1 must not drive the bus while a USB command runs on core 0).
+static int bus_uses = 0, bus_uses_while_busy = 0;
+static void bus_use() { bus_uses++; if (mock_now_ns < busy_until_ns) bus_uses_while_busy++; }
+void ide_select_device(uint8_t) {}
+uint8_t ide_probe_devices(void) { bus_use(); return 0; }
+void ide_reset_drive(void) { bus_use(); }
+bool ide_wait_until_ready(uint32_t) { bus_use(); return true; }
+uint8_t ide_read_reg(uint8_t) { bus_use(); return 0x50; }
+void ide_set_iordy(bool) {}
+bool ide_identify(uint16_t *) { bus_use(); return false; }
+bool ide_set_geometry(uint8_t, uint8_t) { bus_use(); return true; }
+void ide_read_taskfile(uint8_t tf[8]) { bus_use(); for (int i = 0; i < 8; i++) tf[i] = 0; tf[7] = 0x50; }
+uint8_t ide_seek_read_one(uint32_t, bool) { bus_use(); return 0x50; }
+static ide_fail_t stub_fail;
+void ide_last_failure(ide_fail_t *out) { *out = stub_fail; }
 
 static int failures = 0, checks = 0;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; \
@@ -247,6 +254,112 @@ static void test_unmount_forgets_identify() {
 #endif
 }
 
+// ---- 6. review L-5: core 1 waits for a running USB command ---------------
+// Auto Detect and every debug key that touches the bus wait for the USB side
+// to let go of it, up to IDE_BUS_WAIT_MS; Esc cancels; if it never lets go,
+// nothing is sent and the screen says so.
+static void test_bus_wait() {
+    const int dkeys[] = { 'i', 'I', 't', 'T', 'e', 'E', 's', 'S', 'r', 'R' };
+    // Each debug key, with a USB command running for another 5 s.
+    for (int k : dkeys) {
+        mock_now_ns += 1000000000ull;
+        tty.clear(); bus_uses = 0; bus_uses_while_busy = 0;
+        busy_until_ns = mock_now_ns + 5000000000ull;
+        current_screen = SCREEN_DEBUG;
+        feed({ { now_us() + 5500000, 27 } });            // Esc ends the seek test
+        uint64_t t0 = mock_now_ns;
+        debug_key(k);
+        CHECK(bus_uses > 0 && bus_uses_while_busy == 0, "debug %c: %d bus uses, %d while busy", k, bus_uses, bus_uses_while_busy);
+        CHECK(mock_now_ns - t0 >= 5000000000ull, "debug %c: ran after %llu ms", k, (unsigned long long)((mock_now_ns - t0) / 1000000));
+        CHECK(tty.find("Waiting for a USB command") != std::string::npos, "debug %c: no waiting message", k);
+    }
+    // Never lets go: nothing sent, and a message. (The Esc at 90 s only
+    // ends a wait that would otherwise never end.)
+    feed({ { now_us() + 90000000, 27 } });
+    tty.clear(); bus_uses = 0;
+    busy_until_ns = mock_now_ns + 1000000000000ull;
+    uint64_t t0 = mock_now_ns;
+    debug_key('t');
+    uint64_t ms = (mock_now_ns - t0) / 1000000;
+    CHECK(bus_uses == 0 && ms >= IDE_BUS_WAIT_MS && ms < IDE_BUS_WAIT_MS + 1000, "busy for ever: %d bus uses after %llu ms",
+          bus_uses, (unsigned long long)ms);
+    CHECK(tty.find("USB still busy") != std::string::npos, "busy for ever: no message");
+    // Esc while waiting cancels, nothing sent.
+    tty.clear(); bus_uses = 0;
+    feed({ { now_us() + 2000000, 27 } });
+    t0 = mock_now_ns;
+    debug_key('r');
+    CHECK(bus_uses == 0 && mock_now_ns - t0 < 3000000000ull && tty.find("Cancelled") != std::string::npos,
+          "Esc: %d bus uses after %llu ms", bus_uses, (unsigned long long)((mock_now_ns - t0) / 1000000));
+    // Other keys wait for nothing and send nothing.
+    int br = busy_reads; bus_uses = 0;
+    debug_key('x'); debug_key(KEY_ENTER);
+    CHECK(bus_uses == 0 && busy_reads == br, "unknown debug keys: %d bus uses, %d busy reads", bus_uses, busy_reads - br);
+    // Auto Detect: waits, then probes.
+    mock_now_ns += 1000000000ull;
+    tty.clear(); bus_uses = 0; bus_uses_while_busy = 0;
+    busy_until_ns = mock_now_ns + 5000000000ull;
+    current_screen = SCREEN_MAIN; show_detect_result = false;
+    feed({});
+    t0 = mock_now_ns;
+    bool overlay = run_auto_detect();
+    CHECK(bus_uses > 0 && bus_uses_while_busy == 0 && mock_now_ns - t0 >= 5000000000ull,
+          "auto detect: %d bus uses, %d while busy", bus_uses, bus_uses_while_busy);
+    CHECK(overlay && show_detect_result, "auto detect result box: overlay %d shown %d", overlay, show_detect_result);
+    show_detect_result = false;
+    // Auto Detect, never lets go: no probe, a message, and a key to go on.
+    tty.clear(); bus_uses = 0;
+    busy_until_ns = mock_now_ns + 1000000000000ull;
+    feed({ { now_us() + 61000000, 'x' } });
+    overlay = run_auto_detect();
+    CHECK(bus_uses == 0 && !overlay && !show_detect_result && tty.find("USB still busy") != std::string::npos,
+          "auto detect, busy for ever: %d bus uses, overlay %d", bus_uses, overlay);
+    busy_until_ns = 0;
+}
+
+// ---- 7. Debug E: how the reset went, in 68 columns --------------------------
+static void test_debug_errors_row() {
+    struct { bool reset, hw, failed; const char *tail; } cases[] = {
+        { false, false, false, "DH:A9  drained" },
+        { true,  false, false, "DH:A9  drained  reset" },
+        { true,  false, true,  "DH:A9  drained  reset FAILED" },
+        { true,  true,  false, "DH:A9  drained  HW reset" },
+        { true,  true,  true,  "DH:A9  drained  HW reset FAILED" },
+    };
+    for (auto &c : cases) {
+        memset(&stub_fail, 0, sizeof stub_fail);
+        stub_fail.kind = IDE_FAIL_TIMEOUT; stub_fail.command = 0x30; stub_fail.status = 0xD0;
+        stub_fail.tf[4] = 0xA9; stub_fail.drained = true;
+        stub_fail.reset = c.reset; stub_fail.hw_reset = c.hw; stub_fail.reset_failed = c.failed;
+        tty.clear();
+        run_debug_errors();
+        std::string want = std::string("ST:D0 ERR:00 SC:00 SN:00 CL:00 CH:00 ") + c.tail;
+        size_t at = tty.find(want);
+        CHECK(at != std::string::npos, "row for reset %d hw %d failed %d not found: want \"%s\"", c.reset, c.hw, c.failed, want.c_str());
+        // The row after it must not run on: the next byte is padding or the colour reset.
+        if (at != std::string::npos) {
+            char nx = tty[at + want.size()];
+            CHECK(nx == ' ' || nx == '\033', "row runs on after \"%s\": %d", c.tail, nx);
+        }
+        CHECK(want.size() <= 68, "row is %zu columns", want.size());
+    }
+    memset(&stub_fail, 0, sizeof stub_fail);
+}
+
+// ---- 8. the banner names the build ------------------------------------------
+static void test_banner() {
+    tty.clear();
+    draw_bios_frame();
+#if ATABOY_SAT && ATABOY_SAT_SMART_SAVES
+    CHECK(tty.find("\033[1;4H\033[37;1mATAboy Setup Utility v0.6f3p7 (fork+smartsaves) - (C) 2026 obsoletetech.us") != std::string::npos,
+          "SMART opt-in build: banner does not say so");
+#else
+    CHECK(tty.find("\033[1;10H\033[37;1mATAboy Setup Utility v0.6f3p7 (fork) - (C) 2026 obsoletetech.us") != std::string::npos,
+          "banner is not v0.6f3p7 (fork)");
+    CHECK(tty.find("smartsaves") == std::string::npos, "shipping build banner claims SMART saves");
+#endif
+}
+
 int main() {
     test_decisions();
     test_key_in_menus();
@@ -254,6 +367,9 @@ int main() {
     test_confirm();
     test_help_row();
     test_unmount_forgets_identify();
+    test_bus_wait();
+    test_debug_errors_row();
+    test_banner();
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;
 }

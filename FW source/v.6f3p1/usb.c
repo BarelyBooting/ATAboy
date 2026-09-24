@@ -30,8 +30,10 @@ static uint64_t total_sectors(void) {
 // WRITE(10), and ATA PASS-THROUGH through the SCSI callback. They run on
 // core 0 inside tud_task(). Unmounting (is_mounted = false, on core 1) stops
 // new commands from reaching the drive, but not one already running, which
-// can take ~41 s on a failing sector. Core 1 checks this before it reboots
-// into the ROM bootloader (menus.c, firmware update).
+// since 0.6f3p7 can take 30 s (IDE_CMD_TIMEOUT_MS) and then a soft and a
+// hardware reset, each allowed 31 s and more (ide.c). Core 1 checks this
+// before it reboots into the ROM bootloader (menus.c, firmware update), and
+// before Auto Detect and the debug commands use the bus (review L-5).
 //
 // Core 0 sets the flag and then reads is_mounted; core 1 clears is_mounted
 // and then reads the flag. A full barrier sits between the write and the
