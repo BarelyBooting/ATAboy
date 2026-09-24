@@ -114,6 +114,48 @@ MUTANTS = [
     ('WRITE(10) accepts a length that is not whole sectors', 'usb.c',
      '    if (offset != 0 || (bufsize % 512) != 0) {\n        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);\n        return -1;\n    }\n\n    uint64_t max = total_sectors();\n    if (max == 0) return -1;\n\n    uint32_t remaining = bufsize;\n    uint8_t *ptr = buffer;',
      '    if (offset != 0) {\n        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);\n        return -1;\n    }\n\n    uint64_t max = total_sectors();\n    if (max == 0) return -1;\n\n    uint32_t remaining = bufsize;\n    uint8_t *ptr = buffer;'),
+    # --- SAT stage 2: non-data path, register capture, sense delivery ---
+    ('SAT non-data: read the data the drive offers instead of aborting', 'ide.c',
+     '            if (st & 0x08) {                                    // DRQ on a non-data command\n'
+     '                sat_abort();',
+     '            if (st & 0x08) {                                    // DRQ on a non-data command\n'
+     '                ide_drain_sector();'),
+    ('SAT non-data: no abort on timeout', 'ide.c',
+     '            sat_abort();\n            return IDE_SAT_TIMEOUT;\n        }\n        busy_wait_us_32(10);\n    }\n}\n#endif',
+     '            return IDE_SAT_TIMEOUT;\n        }\n        busy_wait_us_32(10);\n    }\n}\n#endif'),
+    ('SAT non-data: ERR taken as success', 'ide.c',
+     'return (st & 0x21) ? IDE_SAT_ATA_ERROR : IDE_SAT_OK;',
+     'return IDE_SAT_OK;'),
+    ('SAT non-data: registers read while BSY', 'ide.c',
+     '        if (!(st & 0x80)) {                                     // other bits only valid with BSY=0\n'
+     '            sat_read_outputs(tf, st, regs);',
+     '        if (1) {\n'
+     '            sat_read_outputs(tf, st, regs);'),
+    ('SAT: HOB bytes never read for a 48-bit command', 'ide.c',
+     'if (tf->ext && !aborted) {', 'if (0) {'),
+    ('SAT: HOB selected even when the drive aborted the command', 'ide.c',
+     'if (tf->ext && !aborted) {', 'if (tf->ext) {'),
+    ('SAT: HOB left set in Device Control', 'ide.c',
+     '        ide_write_control(0x00);\n        r->hob = true;', '        r->hob = true;'),
+    ('SAT: no stale DRQ check before issuing', 'ide.c',
+     '    if (ide_read_reg(7) & 0x08) return false;   // stale DRQ\n', ''),
+    ('SAT PIO: only the error register kept on an error', 'ide.c',
+     'sat_read_outputs(tf, st, regs);             // before the drain changes anything',
+     'regs->error = ide_read_reg(1);'),
+    ('SAT: CK_COND success reported as GOOD, registers lost', 'sat.c',
+     '        if (tf.ck_cond) {', '        if (0) {'),
+    ('SAT descriptor: LBA mid carries LBA high', 'sat.c',
+     '    d[17] = r->lba_mid;', '    d[17] = r->lba_high;'),
+    ('SAT descriptor: EXTEND never set', 'sat.c',
+     '    d[10] = r->hob ? 0x01 : 0x00;   // EXTEND', '    d[10] = 0x00;'),
+    ('SAT descriptor: sent even when the sense is no longer ours', 'sat.c',
+     '    if (!ours || bufsize < SAT_SENSE_LEN) return fixed;', '    if (bufsize < SAT_SENSE_LEN) return fixed;'),
+    ('SAT descriptor: attached to a timeout (registers already reset)', 'sat.c',
+     '        sense_plain(lun, SCSI_SENSE_ABORTED_COMMAND, 0x00, 0x00);\n        return -1;\n    }\n}',
+     '        sense_with_regs(lun, SCSI_SENSE_ABORTED_COMMAND, 0x00, 0x00, &regs);\n        return -1;\n    }\n}'),
+    ('READ(10) leaves a pending SAT descriptor in place', 'usb.c',
+     '    (void)lun;\n#if ATABOY_SAT\n    sat_sense_forget();     // this command may set sense of its own\n#endif\n    if (!is_mounted) return -1;',
+     '    (void)lun;\n    if (!is_mounted) return -1;'),
 ]
 
 
