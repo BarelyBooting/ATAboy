@@ -50,6 +50,10 @@ void ide_last_failure(ide_fail_t *out) { *out = stub_fail; }
 #else
 #define SET_STUB_FAILURE() do {} while (0)
 #endif
+#ifdef IDE_MCHS_OK          // 0.6f3p8 on
+bool ide_recovery_pending(void) { return false; }
+int ide_manual_chs(uint8_t, uint8_t, uint8_t *st) { *st = 0x50; return IDE_MCHS_OK; }
+#endif
 
 static void save(const char *dir, const char *name) {
     std::string p = std::string(dir) + "/" + name + ".bin";
@@ -127,5 +131,45 @@ int main(int argc, char **argv) {
     SET_STUB_FAILURE();
     draw_bios_frame(); draw_debug_overlay(); run_debug_errors();
     save(dir, "debug-errors-failure");
+
+#ifdef IDE_MCHS_OK
+    // 0.6f3p8: manual CHS with no IDENTIFY (Ctrl+G). Only the new build has
+    // these; tui_compare.py lists them as new and checks them for cells in
+    // the terminal's default colours.
+    {
+        char f[3][6] = {"", "", ""};
+        reset_state();
+        draw_bios_frame(); update_main_menu(); draw_manual_chs(f, 0, "", false);
+        save(dir, "mchs-empty");
+        strcpy(f[0], "1045"); strcpy(f[1], "2");
+        reset_state();
+        draw_bios_frame(); update_main_menu(); draw_manual_chs(f, 2, "", false);
+        save(dir, "mchs-typing");
+        strcpy(f[1], "17"); strcpy(f[2], "40");
+        reset_state();
+        draw_bios_frame(); update_main_menu(); draw_manual_chs(f, 1, manual_chs_refusal(1), false);
+        save(dir, "mchs-refused-heads");
+        strcpy(f[1], "2");
+        reset_state();
+        draw_bios_frame(); update_main_menu();
+        draw_manual_chs(f, -1, "Y: reset Master, send 1045/2/40 (91h)   N: edit", true);
+        save(dir, "mchs-ask");
+        reset_state();
+        strcpy(hdd_model_raw, MCHS_MODEL); cur_cyls = 1045; cur_heads = 2; cur_spt = 40;
+        draw_bios_frame(); update_main_menu();
+        save(dir, "main-mchs-set");
+        reset_state();
+        show_detect_result = true; strcpy(hdd_status_text, "\033[91;1mManual CHS: drive refused geometry (ST:51)");
+        draw_bios_frame(); update_main_menu(); draw_error_box(hdd_status_text, false);
+        save(dir, "mchs-drive-refused");
+        reset_state();
+        current_screen = SCREEN_DEBUG;
+        memset(&stub_fail, 0, sizeof stub_fail);
+        stub_fail.kind = IDE_FAIL_MANUAL_CHS; stub_fail.command = 0x91; stub_fail.status = 0x51;
+        stub_fail.error = 0x04; stub_fail.tf[0] = 40; stub_fail.tf[4] = 0xA1;
+        draw_bios_frame(); draw_debug_overlay(); run_debug_errors();
+        save(dir, "debug-errors-mchs");
+    }
+#endif
     return 0;
 }

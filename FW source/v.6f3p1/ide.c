@@ -949,6 +949,113 @@ static bool chs_geometry_ok(void) {
     return ide_set_geometry(config.heads, config.spt);
 }
 
+bool ide_recovery_pending(void) { return rec.stage != REC_NONE; }
+
+// ---------------------------------------------------------------------------
+//  Manual CHS with no IDENTIFY (ide.h, ide_manual_chs)
+// ---------------------------------------------------------------------------
+// Runs on core 1, with nothing mounted, after menus.c has waited for any USB
+// command still running and checked no recovery is pending. Outside a host
+// command, so no budget cuts its waits (host.on is false).
+//
+// What is sent, and why each:
+//  - RESET-: a clean start, as a PC/AT's controller reset gives. The probe's
+//    50 ms and 2 s, the only timings proven on the project's own drives.
+//  - Status reads, to wait for BSY to clear. Not DRDY: some drives older
+//    than ATA do not set it until they have had INITIALIZE DEVICE PARAMETERS
+//    (the probe's own note). A status of FFh is a floating bus: no drive.
+//  - RECALIBRATE (0x10). Deliberately kept. It is in the IBM AT task file
+//    command set (the WD1003's RESTORE) that the CP3044's manual says it
+//    emulates, unlike IDENTIFY, which that command set never had; a PC/AT
+//    BIOS sends it to a drive of any typed-in geometry. Every other path in
+//    this firmware sends it after RESET- (probe, Debug R, and the recovery's
+//    hardware reset, which will send it to this drive during imaging if a
+//    read ever hangs), so leaving it out here would only mean the drive
+//    first sees it in the middle of a recovery. A drive that does not know
+//    it answers ERR; that ends it (the drive is idle, which is all 0x91
+//    needs). One that stays busy 10 s gets nothing more.
+//  - INITIALIZE DEVICE PARAMETERS (0x91), the operator's heads and sectors.
+// Both commands are believed ended only once the drive has visibly started
+// them (sat_watch_t: BSY or INTRQ seen) or has stayed idle IDE_RECAL_GRACE_MS,
+// so an ERR left by a RECALIBRATE the drive did not know is never read as
+// 0x91's answer.
+#define IDE_MCHS_IDP_MS 1000        // 0x91 to ready, as ide_set_geometry allows
+
+// Wait for a command written just now to end: BSY and DRQ clear, once it has
+// visibly started or the grace time is over. The last status read, and
+// whether it ended within limit_ms.
+static bool mchs_wait_end(sat_watch_t *w, uint32_t limit_ms, uint8_t *st) {
+    uint32_t t0 = ms_now();
+    for (;;) {
+        *st = sat_poll(w);
+        bool over = w->started || ms_passed(t0, IDE_RECAL_GRACE_MS);
+        if (over && !(*st & 0x88)) return true;
+        if (ms_passed(t0, limit_ms)) return false;
+        busy_wait_us_32(10);
+    }
+}
+
+int ide_manual_chs(uint8_t heads, uint8_t spt, uint8_t *status) {
+    uint8_t st = 0;
+    *status = 0;
+    if (heads < 1 || heads > 16 || spt < 1) return IDE_MCHS_BAD_ARGS;
+#if ATABOY_SAT
+    id_words.valid = false;         // this drive is never asked who it is
+#endif
+    recovery_forget();              // RESET- supersedes any recovery (none is pending: menus.c)
+    iordy_hold();
+    gpio_put(IDE_RESET, 0);
+    sleep_ms(IDE_HW_RESET_LOW_US / 1000);
+    gpio_put(IDE_RESET, 1);
+    chs_geometry_lost = true;       // RESET- drops any geometry the drive had
+    sleep_ms(2000);                 // as the probe
+    ide_write_control(0x00);        // nIEN=0
+
+    // Device 0 is selected after a reset and is the one to wait on (ATA);
+    // nothing is written to a busy master. FFh: no device 0 (for a slave,
+    // go on and look at it).
+    uint32_t t0 = ms_now();
+    while (((st = ide_read_reg(7)) & 0x80) && st != 0xFF) {
+        if (ms_passed(t0, IDE_MCHS_READY_MS)) { *status = st; return IDE_MCHS_BUSY; }
+        busy_wait_us_32(10);
+    }
+    ide_write_reg(6, dev_base);
+    busy_wait_us_32(50);            // let selection settle, as the probe
+    for (;;) {
+        st = ide_read_reg(7);
+        if (st == 0xFF) { *status = st; return IDE_MCHS_NO_DEVICE; }
+        if (!(st & 0x80)) break;
+        if (ms_passed(t0, IDE_MCHS_READY_MS)) { *status = st; return IDE_MCHS_BUSY; }
+        busy_wait_us_32(10);
+    }
+    iordy_release();                // past its power-on diagnostics
+
+    sat_watch_t w;
+    sat_watch_arm(&w);              // the status reads above released INTRQ
+    ide_write_reg(7, 0x10);
+    wait_after_command();
+    if (!mchs_wait_end(&w, IDE_RECAL_TIMEOUT_MS, &st)) {
+        record_failure(IDE_FAIL_MANUAL_CHS, 0x10, st, 0, 0, 0);
+        *status = st;
+        return IDE_MCHS_RECAL;
+    }
+
+    ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
+    ide_write_reg(2, spt);
+    sat_watch_arm(&w);
+    ide_write_reg(7, 0x91);
+    wait_after_command();
+    bool ended = mchs_wait_end(&w, IDE_MCHS_IDP_MS, &st);
+    bool ok = ended && (st & 0x40) && !(st & 0x01);
+    chs_geometry_lost = !ok;
+    *status = st;
+    if (!ok) {
+        record_failure(IDE_FAIL_MANUAL_CHS, 0x91, st, 0, 0, 0);
+        return IDE_MCHS_REFUSED;
+    }
+    return IDE_MCHS_OK;
+}
+
 // ---------------------------------------------------------------------------
 //  The least time a READ or WRITE SECTORS is sent with
 // ---------------------------------------------------------------------------

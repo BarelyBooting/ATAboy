@@ -13,6 +13,7 @@
 #include "ide.h"
 #include "config.h"
 #include "fwupdate.h"
+#include "manualchs.h"
 #include "pico/util/queue.h"
 
 // ---------------------------------------------------------------------------
@@ -226,9 +227,9 @@ static void print_help(const char *text) {
 // the unit for the shipping build (review L-2). That line is 11 characters
 // longer, so it starts further left to stay inside 80 columns.
 #if ATABOY_SAT && ATABOY_SAT_SMART_SAVES
-#define BANNER "\033[1;4H" FG_WHITE "ATAboy Setup Utility v0.6f3p7 (fork+smartsaves) - (C) 2026 obsoletetech.us"
+#define BANNER "\033[1;4H" FG_WHITE "ATAboy Setup Utility v0.6f3p8 (fork+smartsaves) - (C) 2026 obsoletetech.us"
 #else
-#define BANNER "\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p7 (fork) - (C) 2026 obsoletetech.us"
+#define BANNER "\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p8 (fork) - (C) 2026 obsoletetech.us"
 #endif
 
 static void draw_bios_frame(void) {
@@ -354,9 +355,11 @@ static void update_main_menu(void) {
             cdc_printf(FG_YELLOW " %-28s  " FG_WHITE, items[i]);
     }
 
-    cdc_printf("\033[19;3H ESC: Quit to Main Menu                         "
-               BOX_ARRU " " BOX_ARRD " " BOX_ARRR " " BOX_ARRL ": Select Item");
-    // Ctrl+F (firmware update) only works with nothing mounted, so only offer it then.
+    // Ctrl+G (manual CHS) and Ctrl+F (firmware update) only work with
+    // nothing mounted, so they are only offered then.
+    cdc_printf("\033[19;3H ESC: Quit to Main Menu%s"
+               BOX_ARRU " " BOX_ARRD " " BOX_ARRR " " BOX_ARRL ": Select Item",
+               is_mounted ? "                         " : "  Ctrl+G: Manual CHS     ");
     cdc_puts(is_mounted ? "\033[20;3H F10: Save Current Setup to EEPROM               Enter: Select"
                         : "\033[20;3H F10: Save Current Setup to EEPROM  Ctrl+F: Firmware Update  Enter: Select");
 
@@ -737,9 +740,13 @@ static void run_debug_errors(void) {
     } else {
         static const char *kinds[] = {"?", "not ready", "ERR", "timeout", "stale data", "no geometry",
                                       "no time", "bad end"};
-        debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
-                    f.command, kinds[f.kind < 8 ? f.kind : 0], (unsigned long)f.lba,
-                    (unsigned long)f.done, (unsigned long)f.count);
+        if (f.kind == IDE_FAIL_MANUAL_CHS)      // Ctrl+G: no sector was asked for
+            debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X, manual CHS: %s", f.command,
+                        f.command == 0x91 ? "drive refused geometry" : "RECALIBRATE did not end");
+        else
+            debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
+                        f.command, kinds[f.kind < 8 ? f.kind : 0], (unsigned long)f.lba,
+                        (unsigned long)f.done, (unsigned long)f.count);
         // "HW reset": the soft reset did not bring the drive back, so RESET-
         // was used as well (both devices on the cable). The longest row,
         // drained and "HW reset FAILED", is exactly the 68 columns there are.
@@ -1064,6 +1071,150 @@ static bool run_auto_detect(void) {
 }
 
 // ---------------------------------------------------------------------------
+//  Manual CHS with no IDENTIFY (main menu, Ctrl+G; decisions in manualchs.h)
+// ---------------------------------------------------------------------------
+// The operator types cylinders, heads and sectors per track into a box of its
+// own. Nothing reaches the drive until the entry is in range and Y is
+// pressed; Esc at any point before that leaves everything as it was. Then:
+// wait for a USB command still running (bus_free_wait), check again that no
+// reset is pending, and ide_manual_chs() sends RESET-, RECALIBRATE and 0x91
+// (ide.h), never IDENTIFY. Only a 0x91 the drive accepted sets the geometry;
+// otherwise the error box says why, the geometry is 0 (nothing to mount),
+// and Debug E has the registers. Nothing here saves to EEPROM (F10 still can,
+// on purpose, later).
+#define MCHS_COL   9                    // the box: 64 wide, as the picker
+#define MCHS_ROW   5
+#define MCHS_W     64
+#define MCHS_H     11
+#define MCHS_TITLE "Manual CHS (no IDENTIFY)"
+#define MCHS_MODEL "Manual CHS (no IDENTIFY)"   // Current HDD once the drive took it
+static const int mchs_field_col[3] = {18, 34, 50};
+
+// One line of the box's interior (62 columns), text centred, in `color`.
+static void mchs_line(int row, const char *color, const char *text) {
+    int len = visible_strlen(text);
+    if (len > MCHS_W - 2) len = MCHS_W - 2;
+    int pl = (MCHS_W - 2 - len) / 2, pr = MCHS_W - 2 - len - pl;
+    cdc_printf(SEL_RED "\033[%d;%dH" BOX_VH "%*s%s%s" SEL_RED "%*s" BOX_VH, row, MCHS_COL, pl, "", color, text, pr, "");
+}
+
+// fields: what was typed (digits, "" when empty). active: the field being
+// typed into, or -1 (nothing is being typed). msg: the message row, "" for
+// none; ask draws it as the Y/N question.
+static void draw_manual_chs(char fields[3][6], int active, const char *msg, bool ask) {
+    int c = MCHS_COL, r = MCHS_ROW;
+    for (int i = 0; i < MCHS_H; i++) cdc_printf("\033[%d;%dH\033[40m%*s", r+1+i, c+2, MCHS_W, "");
+    cdc_puts(SEL_RED);
+    cdc_printf("\033[%d;%dH", r, c);
+    cdc_puts(BOX_TL); emit_n(BOX_HH, MCHS_W - 2); cdc_puts(BOX_TR);
+    mchs_line(r+1, SEL_RED, MCHS_TITLE);
+    char who[64];
+    snprintf(who, sizeof(who), "%s drive. Nothing is sent to it until you press Y.",
+             config.dev_base == 0xB0 ? "Slave" : "Master");
+    mchs_line(r+2, SEL_RED, who);
+    cdc_printf("\033[%d;%dH", r+3, c);
+    cdc_puts(BOX_MLD); emit_n(BOX_HH, MCHS_W - 2); cdc_puts(BOX_MRD);
+    for (int i = 4; i <= 6; i++) mchs_line(r+i, SEL_RED, "");
+    static const char *labels[3] = {"CYLS", "HEADS", "SPT"};
+    static const char *ranges[3] = {"1-65535", "1-16", "1-255"};
+    for (int f = 0; f < 3; f++) {
+        cdc_printf(SEL_RED "\033[%d;%dH%s", r+4, mchs_field_col[f], labels[f]);
+        cdc_printf("\033[%d;%dH%s%-5s" SEL_RED, r+5, mchs_field_col[f],
+                   f == active ? "\033[103;30m" : "\033[40;37;1m", fields[f]);
+        cdc_printf(FG_YELLOW "\033[%d;%dH%s" SEL_RED, r+6, mchs_field_col[f], ranges[f]);
+    }
+    mchs_line(r+7, ask ? "\033[103;30m" : FG_YELLOW, msg);
+    cdc_printf("\033[%d;%dH", r+8, c);
+    cdc_puts(BOX_MLD); emit_n(BOX_HH, MCHS_W - 2); cdc_puts(BOX_MRD);
+    mchs_line(r+9, SEL_RED, "0-9: Digits   Enter/Tab: Next field   Esc: Cancel");
+    cdc_printf("\033[%d;%dH", r+10, c);
+    cdc_puts(BOX_BL); emit_n(BOX_HH, MCHS_W - 2); cdc_puts(BOX_BR);
+    cdc_puts(RESET);
+    if (active >= 0) cdc_printf("\033[%d;%dH", r+5, mchs_field_col[active] + (int)strlen(fields[active]));
+    cdc_flush();
+}
+
+// Ctrl+G on the main menu with nothing mounted opens the entry. True if it did.
+static bool manual_chs_key(int k) {
+    return manual_chs_key_opens(current_screen == SCREEN_MAIN, is_mounted, k);
+}
+
+// A reset a USB command started has not finished (ide.c, recovery): the next
+// USB command carries on with it, so nothing else may reset the drive now.
+// Debug R or Auto Detect end it, and so does the drive answering the next
+// USB command once mounted. True: refused, and the screen said so.
+static bool mchs_pending_refused(void) {
+    if (!ide_recovery_pending()) return false;
+    draw_confirm_box("Reset still pending, nothing sent. Press a key");
+    while (get_input() == -1) tight_loop_contents();
+    return true;
+}
+
+// The entry, from Ctrl+G to the drive's answer. True when the result box
+// should be drawn (core1_entry's trigger_overlay), as run_auto_detect.
+static bool run_manual_chs(void) {
+    needs_full_redraw = true;
+    if (mchs_pending_refused()) return false;
+    char fields[3][6] = {"", "", ""};
+    int active = 0;
+    const char *msg = "";
+    uint32_t v[3] = {0, 0, 0};
+    for (;;) {
+        draw_manual_chs(fields, active, msg, false);
+        int ch;
+        while ((ch = get_input()) == -1) tight_loop_contents();
+        int p = (int)strlen(fields[active]);
+        if (ch == KEY_ESC) return false;                      // nothing sent, nothing changed
+        if (ch >= '0' && ch <= '9') { if (p < 5) { fields[active][p] = (char)ch; fields[active][p+1] = '\0'; } continue; }
+        if ((ch == 8 || ch == 127) && p > 0) { fields[active][p-1] = '\0'; continue; }
+        if (ch != KEY_ENTER && ch != '\t') continue;
+        if (active < 2) { active++; continue; }
+        // Enter on the last field: all three are checked before anything else.
+        for (int f = 0; f < 3; f++) v[f] = (uint32_t)strtoul(fields[f], NULL, 10);
+        int bad = manual_chs_bad_field(v[0], v[1], v[2]);
+        if (bad >= 0) { msg = manual_chs_refusal(bad); active = bad; continue; }
+        char q[64];
+        snprintf(q, sizeof(q), "Y: reset %s, send %lu/%lu/%lu (91h)   N: edit",
+                 config.dev_base == 0xB0 ? "Slave" : "Master",
+                 (unsigned long)v[0], (unsigned long)v[1], (unsigned long)v[2]);
+        draw_manual_chs(fields, -1, q, true);
+        int k;
+        do { while ((k = get_input()) == -1) tight_loop_contents(); }
+        while (k != 'y' && k != 'Y' && k != 'n' && k != 'N' && k != KEY_ESC);
+        if (k == KEY_ESC) return false;
+        if (k == 'n' || k == 'N') { msg = ""; continue; }
+        break;
+    }
+    // Y. Nothing has been sent yet. A USB command still running, or a reset
+    // it has left pending, stops it here too.
+    if (!bus_free_wait(false) || mchs_pending_refused()) return false;
+    draw_manual_chs(fields, -1, "Resetting the drive, then 10h and 91h. Up to a minute.", false);
+    uint8_t st = 0;
+    int r = ide_manual_chs((uint8_t)v[1], (uint8_t)v[2], &st);
+    if (r == IDE_MCHS_OK) {
+        use_lba_mode = false; total_lba_sectors = 0;
+        cur_cyls = (uint16_t)v[0]; cur_heads = (uint8_t)v[1]; cur_spt = (uint8_t)v[2];
+        strcpy(hdd_model_raw, MCHS_MODEL);
+        sync_to_config();
+        return false;
+    }
+    // The drive was reset, so whatever geometry it had is gone: nothing is
+    // shown as set, and there is nothing to mount.
+    const char *why = r == IDE_MCHS_REFUSED  ? "drive refused geometry" :
+                      r == IDE_MCHS_RECAL    ? "RECALIBRATE did not end" :
+                      r == IDE_MCHS_NO_DEVICE ? "no drive answered" :
+                      r == IDE_MCHS_BUSY     ? "drive still busy" : "nothing sent";
+    snprintf(hdd_status_text, sizeof(hdd_status_text), "\033[91;1mManual CHS: %s (ST:%02X)", why, st);
+    hdd_model_raw[0] = '\0';
+    cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;
+    sync_to_config();
+    force_detect = false;
+    show_detect_result = true;
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
 //  Core 1 entry point
 // ---------------------------------------------------------------------------
 
@@ -1227,6 +1378,8 @@ void core1_entry(void) {
         // Ctrl+F on the main menu, nothing mounted: ask before rebooting into
         // the ROM bootloader for a firmware update.
         if (fwupdate_key(k)) { trigger_overlay = true; needs_full_redraw = true; continue; }
+        // Ctrl+G on the main menu, nothing mounted: manual CHS, no IDENTIFY.
+        if (manual_chs_key(k)) { if (run_manual_chs()) trigger_overlay = true; continue; }
 
         if (current_screen == SCREEN_MAIN) {
             if (k == KEY_UP) {

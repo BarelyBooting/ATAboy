@@ -19,6 +19,10 @@ with pyte (the emulator the console harness uses), and reports:
      erase turned off (GNU screen with bce off, issue #9), for old and new.
      Any such cell in the new build is a failure.
 
+A screen only the new build captures (a new feature's screen, which the old
+source cannot draw) is listed as NEW and checked for (2) only. A screen the
+old build has and the new one lacks is a failure.
+
 Note: pyte's ESC[2J only repaints cells that were written before, so on a
 fresh screen pyte shows the frame's interior in the default colours even
 with background-colour erase. That is why (1) sees the fill at all.
@@ -85,7 +89,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix='ataboy-tui-')
     old = build_and_capture(old_src, os.path.join(tmp, 'old'))
     new = build_and_capture(new_src, os.path.join(tmp, 'new'))
-    assert set(old) == set(new) and old, 'screen sets differ or are empty'
+    assert old and set(old) <= set(new), 'screens missing from the new build, or none at all'
     bad = 0
     print(f'{"screen":18} {"bytes old":>9} {"new":>6} {"blank->filled":>13} {"invisible":>9} {"expected":>8} {"other diffs":>11}  {"default-bg cells, bce off":>26}')
     for name in sorted(old):
@@ -114,6 +118,11 @@ def main():
             print(f'    row {y+1} col {x+1}: old {a[y][x]} new {b[y][x]}')
         if diff:
             bad += 1
+        if nb:
+            bad += 1
+    for name in sorted(set(new) - set(old)):
+        nb = sum(c.bg == 'default' for row in cells(render(new[name], NoBceScreen)) for c in row)
+        print(f'{name:18} {"NEW":>9} {len(new[name]):6} {"":13} {"":9} {"":8} {"":11}  {"new " + str(nb):>26}')
         if nb:
             bad += 1
     print('OK' if not bad else f'{bad} problem(s)')

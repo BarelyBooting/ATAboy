@@ -94,6 +94,8 @@ void    ide_host_cmd_leave(void);
 #define IDE_FAIL_NO_GEOMETRY 5  // CHS mode, and the drive would not take our geometry
 #define IDE_FAIL_NO_TIME    6   // the host command's time was used up; nothing sent
 #define IDE_FAIL_BAD_END    7   // SAT: the drive offered data it should not have; aborted
+#define IDE_FAIL_MANUAL_CHS 8   // manual CHS entry: RECALIBRATE never ended, or the drive
+                                // refused INITIALIZE DEVICE PARAMETERS (command says which)
 typedef struct {
     uint8_t  kind;          // IDE_FAIL_*
     uint8_t  command;       // ATA command that failed
@@ -119,6 +121,35 @@ typedef struct {
 
 // Copy of the last failure record (kind == IDE_FAIL_NONE if none yet).
 void    ide_last_failure(ide_fail_t *out);
+
+// A reset started for a USB command has not finished yet: the next USB
+// command carries on with it before anything else (ide.c, recovery).
+bool    ide_recovery_pending(void);
+
+// ---------------------------------------------------------------------------
+//  Manual CHS with no IDENTIFY (0.6f3p8; menus.c, main menu Ctrl+G)
+// ---------------------------------------------------------------------------
+// For a drive that must be given an explicit geometry without being asked
+// who it is (manualchs.h says why). Sends the selected drive what a PC/AT
+// BIOS with a typed-in drive type would, and nothing else:
+//   RESET- (the same 50 ms pulse and 2 s wait as Auto Detect's probe; it
+//   resets both drives on the cable), status reads until BSY clears, then
+//   RECALIBRATE (0x10), then INITIALIZE DEVICE PARAMETERS (0x91) with these
+//   heads and sectors. Never IDENTIFY, SET FEATURES or a soft reset.
+// It also forgets any IDENTIFY words held for the SAT policy, so nothing
+// later re-IDENTIFYs this drive to check them (ide_id_words_verify).
+// Returns IDE_MCHS_*; *status is the last status read (FFh: nothing there).
+#define IDE_MCHS_OK         0   // 0x91 accepted: ready, no ERR
+#define IDE_MCHS_NO_DEVICE  1   // status read FFh after the reset (floating bus); no command sent
+#define IDE_MCHS_BUSY       2   // still busy IDE_MCHS_READY_MS after the reset; no command sent
+#define IDE_MCHS_RECAL      3   // RECALIBRATE still busy after 10 s; 0x91 not sent (recorded)
+#define IDE_MCHS_REFUSED    4   // 0x91 ended with ERR, or not ready 1 s after it (recorded)
+#define IDE_MCHS_BAD_ARGS   5   // heads not 1..16 or sectors 0; nothing done at all
+// A 1990 Conner can take up to 40 s to spin up when its spin recovery
+// starts (CP3044 manual, section 3.3), longer than ATA's 31 s or the
+// probe's 10 s.
+#define IDE_MCHS_READY_MS   45000
+int     ide_manual_chs(uint8_t heads, uint8_t spt, uint8_t *status);
 
 // Read task file registers 1-7 into tf[1]..tf[7] (tf[0] unused).
 void    ide_read_taskfile(uint8_t tf[8]);

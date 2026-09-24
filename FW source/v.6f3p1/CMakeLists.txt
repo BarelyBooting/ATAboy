@@ -91,9 +91,9 @@ if(ATABOY_SAT AND ATABOY_SAT_SMART_SAVES)
     target_compile_definitions(ATAboy PRIVATE ATABOY_SAT_SMART_SAVES=1)
     # The opt-in build names itself, so picotool info tells it apart (review
     # L-2); the setup screen banner says so too (menus.c).
-    pico_set_program_version(ATAboy "0.6f3p7-palimpsest-smartsaves")
+    pico_set_program_version(ATAboy "0.6f3p8-palimpsest-smartsaves")
 else()
-    pico_set_program_version(ATAboy "0.6f3p7-palimpsest")
+    pico_set_program_version(ATAboy "0.6f3p8-palimpsest")
 endif()
 
 pico_add_extra_outputs(ATAboy)

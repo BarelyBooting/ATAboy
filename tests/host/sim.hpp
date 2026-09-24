@@ -34,6 +34,10 @@
 // INITIALIZE DEVICE PARAMETERS can take a while (t_idp), and a drive can stay
 // busy for a while after the last block of a read (busy_after), so that the
 // next command finds it not ready yet.
+// 0.6f3p8 (manual CHS, no IDENTIFY): every command byte is logged in order
+// (cmd_log). A drive older than ATA can leave DRDY clear until it has had
+// INITIALIZE DEVICE PARAMETERS (drdy_needs_idp: idle status 10h, not 50h),
+// and can abort RECALIBRATE (abort_recal).
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -115,6 +119,11 @@ struct SimDrive {
     // does not look at status after the last block of a read, so the next
     // command finds the drive busy.
     std::map<uint32_t, uint64_t> busy_after;
+    bool     drdy_needs_idp = false;        // DRDY only once 0x91 has set a geometry
+    bool     abort_recal = false;           // RECALIBRATE (0x10) ends at once with ABRT
+    std::vector<uint8_t> cmd_log;           // every command byte, in order
+    int      reg_writes = 0;                // any task file or Device Control write
+    uint8_t idle_status() const { return (drdy_needs_idp && !geo_valid) ? 0x10 : 0x50; }
 
     // SAT-path features. nsect is the size the drive reports now; a larger
     // native_max models a Host Protected Area (0 = no HPA, same as nsect).
@@ -240,8 +249,8 @@ struct SimDrive {
     void tick(uint64_t now) {
         if (phase == IN_RESET) {
             if (!(devctl & 0x04) && !reset_low && !wedged && now >= ready_at) {
-                phase = IDLE; status = 0x50; error = 0x01; hw_post = false;
                 geo_valid = false;              // SRST drops INITIALIZE DEVICE PARAMETERS
+                phase = IDLE; status = idle_status(); error = 0x01; hw_post = false;
             }
             return;
         }
@@ -261,7 +270,7 @@ struct SimDrive {
             else { phase = DRQ_OUT; widx = 0; status = 0x58; }
             intrq = true;
         }
-        if (phase == IDLE && (status & 0x80) && now >= ready_at) { status = 0x50; intrq = true; }
+        if (phase == IDLE && (status & 0x80) && now >= ready_at) { status = idle_status(); intrq = true; }
     }
 
     void fail_here(uint8_t err, bool offer) {
@@ -380,6 +389,7 @@ struct SimDrive {
     }
 
     void write_reg(int r, uint8_t v, uint64_t now) {
+        reg_writes++;
         tick(now);
         if (slave && master_present && !selected() && master_busy(now)) { violations++; return; }   // lost
         if (phase == IN_RESET) {
@@ -402,7 +412,7 @@ struct SimDrive {
     }
 
     void command(uint8_t c, uint64_t now) {
-        commands++; cmd_count[c]++;
+        commands++; cmd_count[c]++; cmd_log.push_back(c);
         if (busy_probe && !busy_probe()) cmds_while_not_busy++;
         if (status & 0x88) violations++;       // command written while BSY or DRQ
         status_at_cmd = status; cmd_at = now;
@@ -428,6 +438,7 @@ struct SimDrive {
             phase = IDLE; status = 0x80; ready_at = now + t_idp;
             break;
         case 0x10:
+            if (abort_recal) { abort_cmd(); break; }
             phase = IDLE; status = 0x80; ready_at = now + t_recal;
             break;
         case 0xEC:
@@ -518,6 +529,7 @@ struct SimDrive {
     }
 
     void write_control(uint8_t v, uint64_t now) {
+        reg_writes++;
         tick(now);
         if (v & 0x80) hob_selects++;
         if (v & 0x04) {

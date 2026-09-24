@@ -47,3 +47,9 @@ if [ -n "$smart" ]; then
         -o "$out/test_fwupdate_smart" "$here/test_fwupdate.cpp"
     "$out/test_fwupdate_smart"
 fi
+# Manual CHS with no IDENTIFY (0.6f3p8): menus.c and ide.c together against
+# the simulated drive (see test_manual_chs.cpp).
+${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation $defs \
+    -I "$here/mock" -I "$here" -I "$src" \
+    -o "$out/test_manual_chs" "$here/test_manual_chs.cpp"
+"$out/test_manual_chs"

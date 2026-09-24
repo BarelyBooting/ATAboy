@@ -69,6 +69,9 @@ void ide_read_taskfile(uint8_t tf[8]) { bus_use(); for (int i = 0; i < 8; i++) t
 uint8_t ide_seek_read_one(uint32_t, bool) { bus_use(); return 0x50; }
 static ide_fail_t stub_fail;
 void ide_last_failure(ide_fail_t *out) { *out = stub_fail; }
+// Manual CHS (Ctrl+G) runs against ide.c itself in test_manual_chs.cpp.
+bool ide_recovery_pending(void) { return false; }
+int ide_manual_chs(uint8_t, uint8_t, uint8_t *st) { bus_use(); *st = 0x50; return IDE_MCHS_OK; }
 
 static int failures = 0, checks = 0;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; \
@@ -147,6 +150,8 @@ static void test_escape_sequences() {
     CHECK(o.size() == 1 && o[0] == 0x06, "Ctrl+F through get_input: %zu keys, first %d", o.size(), o.empty() ? -2 : o[0]);
     o = run_input({ { now_us(), 12 } });
     CHECK(o.size() == 1 && o[0] == 12, "Ctrl+L through get_input");
+    o = run_input({ { now_us(), 0x07 } });
+    CHECK(o.size() == 1 && o[0] == MANUAL_CHS_KEY, "Ctrl+G through get_input");
 
     const char *seqs[] = {
         "\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D",          // arrows, CSI
@@ -176,6 +181,7 @@ static void test_escape_sequences() {
                     CHECK(k != FWUPDATE_KEY, "sequence %s (lost %d, split %x) gave the update key",
                           q.c_str() + 1, lost, mask);
                     CHECK(!fwupdate_key_opens_prompt(true, false, k), "sequence %s opened the prompt", q.c_str() + 1);
+                    CHECK(!manual_chs_key_opens(true, false, k), "sequence %s opened manual CHS", q.c_str() + 1);
                     if (k == 'B') seen_bare_B++;
                 }
             }
@@ -239,9 +245,14 @@ static void test_help_row() {
     update_main_menu();
     CHECK(tty.find("Ctrl+F: Firmware Update") != std::string::npos, "unmounted: not offered");
     CHECK(tty.find("B: Firmware") == std::string::npos, "old key still offered");
+    CHECK(tty.find("\033[19;3H ESC: Quit to Main Menu  Ctrl+G: Manual CHS     \xe2\x86\x91") != std::string::npos,
+          "unmounted: Ctrl+G not offered, or the arrows moved");
     is_mounted = true; tty.clear();
     update_main_menu();
     CHECK(tty.find("Firmware Update") == std::string::npos, "mounted: offered");
+    CHECK(tty.find("Manual CHS") == std::string::npos, "mounted: Ctrl+G offered");
+    CHECK(tty.find("\033[19;3H ESC: Quit to Main Menu                         \xe2\x86\x91") != std::string::npos,
+          "mounted: row 19 is not the 0.6f3p7 row");
     is_mounted = false;
 }
 
@@ -384,11 +395,11 @@ static void test_banner() {
     tty.clear();
     draw_bios_frame();
 #if ATABOY_SAT && ATABOY_SAT_SMART_SAVES
-    CHECK(tty.find("\033[1;4H\033[37;1mATAboy Setup Utility v0.6f3p7 (fork+smartsaves) - (C) 2026 obsoletetech.us") != std::string::npos,
+    CHECK(tty.find("\033[1;4H\033[37;1mATAboy Setup Utility v0.6f3p8 (fork+smartsaves) - (C) 2026 obsoletetech.us") != std::string::npos,
           "SMART opt-in build: banner does not say so");
 #else
-    CHECK(tty.find("\033[1;10H\033[37;1mATAboy Setup Utility v0.6f3p7 (fork) - (C) 2026 obsoletetech.us") != std::string::npos,
-          "banner is not v0.6f3p7 (fork)");
+    CHECK(tty.find("\033[1;10H\033[37;1mATAboy Setup Utility v0.6f3p8 (fork) - (C) 2026 obsoletetech.us") != std::string::npos,
+          "banner is not v0.6f3p8 (fork)");
     CHECK(tty.find("smartsaves") == std::string::npos, "shipping build banner claims SMART saves");
 #endif
 }
