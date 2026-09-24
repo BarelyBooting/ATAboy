@@ -1,7 +1,10 @@
 // A simulated ATA drive at register level, driven by the real ide.c through
 // the PIO stand-ins below. It models only what the firmware relies on:
 // BSY/DRDY/DRQ/ERR timing, PIO data in and out, soft reset, INITIALIZE
-// DEVICE PARAMETERS, and a few ways a sector can fail.
+// DEVICE PARAMETERS, and a few ways a sector can fail. For the SAT path it
+// also answers READ VERIFY (0x40), SMART (0xB0: D0, D1, D5, DA), READ NATIVE
+// MAX ADDRESS (0xF8) and its EXT form (0x27), and reads back the HOB bytes
+// when Device Control has HOB set.
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -44,6 +47,17 @@ struct SimDrive {
     int      reset_writes = 0;              // task-file writes while in SRST
     bool     reject_idp = false;            // ABRT INITIALIZE DEVICE PARAMETERS
 
+    // SAT-path features. nsect is the size the drive reports now; a larger
+    // native_max models a Host Protected Area (0 = no HPA, same as nsect).
+    uint64_t native_max = 0;
+    bool     hpa_feature = true;            // answers READ NATIVE MAX (0xF8)
+    bool     lba48 = true;                  // answers 48-bit commands (0x27)
+    bool     smart_supported = true;        // else every SMART command ABRTs
+    bool     smart_exceeded = false;        // SMART RETURN STATUS: threshold exceeded
+    uint8_t  hang_cmd = 0;                  // this command byte never finishes (0 = none)
+    bool     nondata_drq = false;           // a non-data command wrongly ends with DRQ
+    uint64_t t_nondata = 1000000;           // non-data command that touches no sector
+
     // registers
     uint8_t reg[8] = {0};
     uint8_t hob[8] = {0};           // previous value of regs 2..5 (LBA48)
@@ -51,7 +65,7 @@ struct SimDrive {
     uint8_t status_at_cmd = 0x50;
     uint64_t cmd_at = 0;
 
-    enum Phase { IDLE, BUSY_IN, DRQ_IN, ERR_DRQ, HUNG, BUSY_OUT, DRQ_OUT, BUSY_COMMIT, IN_RESET };
+    enum Phase { IDLE, BUSY_IN, DRQ_IN, ERR_DRQ, HUNG, BUSY_OUT, DRQ_OUT, BUSY_COMMIT, IN_RESET, BUSY_ND };
     Phase phase = IDLE;
     uint64_t ready_at = 0;
     uint32_t cur = 0, left = 0;
@@ -64,9 +78,12 @@ struct SimDrive {
     // keeps showing what it showed before the reset during that window.
     uint8_t  status_before_srst = 0x50;
     uint64_t srst_released_at = 0;
+    uint8_t  nd_status = 0x50;              // status a non-data command ends with
 
     // bookkeeping for the tests
     int srst = 0, init_params = 0, violations = 0, commands = 0;
+    int data_reads = 0;                     // data register reads, any phase
+    int hob_selects = 0;                    // Device Control writes with HOB set
     std::map<uint8_t, int> cmd_count;
 
     static uint8_t pattern(uint32_t lba, int i) {
@@ -101,6 +118,7 @@ struct SimDrive {
         if (reg[6] & 0x40 || cmd == 0x24) {
             reg[3] = lba & 0xFF; reg[4] = (lba >> 8) & 0xFF; reg[5] = (lba >> 16) & 0xFF;
             if (cmd != 0x24) reg[6] = (reg[6] & 0xF0) | ((lba >> 24) & 0x0F);
+            else { hob[3] = (lba >> 24) & 0xFF; hob[4] = 0; hob[5] = 0; }
         } else if (geo_valid) {
             uint32_t cyl = lba / (heads * spt), r = lba % (heads * spt);
             reg[4] = cyl & 0xFF; reg[5] = (cyl >> 8) & 0xFF;
@@ -118,6 +136,12 @@ struct SimDrive {
             return;
         }
         if (phase == BUSY_IN && now >= ready_at) resolve_sector();
+        if (phase == BUSY_ND && now >= ready_at) {
+            if (nondata_drq && !(nd_status & 0x01)) {
+                for (int i = 0; i < 256; i++) xfer[i] = 0xDEAD;
+                widx = 0; left = 1; phase = DRQ_IN; status = 0x58;
+            } else { phase = IDLE; status = nd_status; }
+        }
         if (phase == BUSY_OUT && now >= ready_at) { phase = DRQ_OUT; widx = 0; status = 0x58; }
         if (phase == BUSY_COMMIT && now >= ready_at) {
             if (left == 0) { phase = IDLE; status = 0x50; }
@@ -136,7 +160,17 @@ struct SimDrive {
         } else { phase = IDLE; status = 0x51; }
     }
 
+    // Synthetic sector numbers for SMART data, so the tests can check the bytes.
+    static uint32_t smart_sector(uint8_t feature, uint8_t log, uint32_t i) {
+        return 0xF0000000u | ((uint32_t)feature << 16) | ((uint32_t)log << 8) | i;
+    }
+
     void resolve_sector() {
+        if (cmd == 0xB0) {                  // SMART data: always readable
+            for (int i = 0; i < 256; i++) xfer[i] = byte_at(cur, 2 * i) | (byte_at(cur, 2 * i + 1) << 8);
+            widx = 0; phase = DRQ_IN; status = 0x58;
+            return;
+        }
         if (cur == 0xFFFFFFFFu || cur >= nsect) { fail_here(0x10, false); return; } // IDNF
         attempts[cur]++;
         auto b = bad.find(cur);
@@ -179,6 +213,7 @@ struct SimDrive {
     uint16_t read_reg(int r, uint64_t now) {
         if (r == 7) return read_status(now);
         if (r == 1) return error;
+        if ((devctl & 0x80) && r >= 2 && r <= 5) return hob[r];   // HOB: previous content
         return reg[r];
     }
 
@@ -196,6 +231,7 @@ struct SimDrive {
             command(v, now); return;
         }
         if (status & 0x88) violations++;       // task file written while BSY or DRQ
+        devctl &= ~0x80;                       // ATA: a register write clears HOB
         if (r >= 2 && r <= 5) hob[r] = reg[r];
         reg[r] = v;
     }
@@ -205,6 +241,7 @@ struct SimDrive {
         if (status & 0x88) violations++;       // command written while BSY or DRQ
         status_at_cmd = status; cmd_at = now;
         cmd = c; error = 0;
+        if (hang_cmd && c == hang_cmd) { phase = HUNG; status = 0x80; return; }
         switch (c) {
         case 0x20: case 0x21: case 0x24:
             left = reg[2] ? reg[2] : 256;
@@ -224,13 +261,88 @@ struct SimDrive {
         case 0x10:
             phase = IDLE; status = 0x80; ready_at = now + 1000;
             break;
+        case 0x40: verify(now); break;
+        case 0xB0: smart(now); break;
+        case 0xF8: case 0x27: native_max_cmd(c, now); break;
         default:
             phase = IDLE; status = 0x51; error = 0x04;   // ABRT
         }
     }
 
+    void abort_cmd() { phase = IDLE; status = 0x51; error = 0x04; }   // ABRT, at once
+
+    void end_nondata(uint64_t now, uint64_t t, uint8_t st) {
+        phase = BUSY_ND; status = 0x80; nd_status = st; ready_at = now + t;
+    }
+
+    // READ VERIFY SECTORS: reads each sector and returns no data. On a failure
+    // the registers name the failing sector, as for READ SECTORS.
+    void verify(uint64_t now) {
+        if (!(reg[6] & 0x40)) { abort_cmd(); return; }
+        uint32_t n = reg[2] ? reg[2] : 256;
+        uint32_t lba = addr_lba();
+        uint64_t t = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t s = lba + i;
+            uint8_t err = 0;
+            if (s >= nsect) err = 0x10;                                 // IDNF
+            else {
+                attempts[s]++;
+                t += sector_delay(s);
+                auto b = bad.find(s);
+                if (b != bad.end()) {
+                    Bad &bd = b->second;
+                    if (bd.mode == BAD_HANG) { phase = HUNG; status = 0x80; return; }
+                    if (bd.mode != BAD_MARGINAL) err = 0x40;             // UNC
+                    else if (bd.fails > 0) { bd.fails--; err = 0x40; }
+                }
+            }
+            if (err) {
+                set_addr_regs(s); reg[2] = (uint8_t)(n - i); error = err;
+                end_nondata(now, t + t_sector, 0x51);
+                return;
+            }
+        }
+        end_nondata(now, t + t_sector, 0x50);
+    }
+
+    void smart(uint64_t now) {
+        if (!smart_supported || reg[4] != 0x4F || reg[5] != 0xC2) { abort_cmd(); return; }
+        switch (reg[1]) {
+        case 0xD0: case 0xD1:
+            left = 1; cur = smart_sector(reg[1], 0, 0);
+            phase = BUSY_IN; status = 0x80; ready_at = now + t_sector;
+            break;
+        case 0xD5:
+            left = reg[2] ? reg[2] : 256; cur = smart_sector(0xD5, reg[3], 0);
+            phase = BUSY_IN; status = 0x80; ready_at = now + t_sector;
+            break;
+        case 0xDA:
+            reg[4] = smart_exceeded ? 0xF4 : 0x4F;
+            reg[5] = smart_exceeded ? 0x2C : 0xC2;
+            end_nondata(now, t_nondata, 0x50);
+            break;
+        default:
+            abort_cmd();
+        }
+    }
+
+    // READ NATIVE MAX ADDRESS (EXT): the last native LBA, low 24 bits in the
+    // LBA registers, the rest in the device nibble (0xF8) or the HOB bytes (0x27).
+    void native_max_cmd(uint8_t c, uint64_t now) {
+        if (!(reg[6] & 0x40) || (c == 0xF8 && !hpa_feature) || (c == 0x27 && !lba48)) { abort_cmd(); return; }
+        uint64_t last = (native_max ? native_max : nsect) - 1;
+        if (c == 0xF8 && last > 0x0FFFFFFFull) last = 0x0FFFFFFF;
+        reg[3] = (uint8_t)last; reg[4] = (uint8_t)(last >> 8); reg[5] = (uint8_t)(last >> 16);
+        if (c == 0xF8) reg[6] = (uint8_t)((reg[6] & 0xF0) | ((last >> 24) & 0x0F));
+        else { hob[3] = (uint8_t)(last >> 24); hob[4] = (uint8_t)(last >> 32); hob[5] = (uint8_t)(last >> 40); }
+        reg[2] = 0; hob[2] = 0;
+        end_nondata(now, t_nondata, 0x50);
+    }
+
     void write_control(uint8_t v, uint64_t now) {
         tick(now);
+        if (v & 0x80) hob_selects++;
         if (v & 0x04) {
             if (!(devctl & 0x04)) { srst++; status_before_srst = status; }
             phase = IN_RESET; status = 0x80;
@@ -244,6 +356,7 @@ struct SimDrive {
 
     uint16_t read_data(uint64_t now) {
         tick(now);
+        data_reads++;
         if (phase == DRQ_IN || phase == ERR_DRQ) {
             uint16_t w = xfer[widx++];
             if (widx == 256) {

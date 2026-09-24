@@ -28,9 +28,9 @@ config_t config;
 volatile bool is_mounted = false;
 volatile bool media_changed_waiting = false;
 
-static uint8_t last_key, last_asc;
-bool tud_msc_set_sense(uint8_t, uint8_t key, uint8_t asc, uint8_t) {
-    last_key = key; last_asc = asc; return true;
+static uint8_t last_key, last_asc, last_ascq;     // TinyUSB's stored sense
+bool tud_msc_set_sense(uint8_t, uint8_t key, uint8_t asc, uint8_t ascq) {
+    last_key = key; last_asc = asc; last_ascq = ascq; return true;
 }
 
 static int failures = 0, checks = 0;
@@ -100,6 +100,7 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     if (m == CHS) ide_set_geometry(config.heads, config.spt);
     is_mounted = true;
     media_changed_waiting = false;
+    last_key = last_asc = last_ascq = 0;           // no sense pending in TinyUSB
     sim.srst = 0; sim.init_params = 0; sim.violations = 0; sim.attempts.clear();
 }
 
@@ -500,6 +501,457 @@ static void test_host_offsets() {
     CHECK(r == 4096, "a normal read still works: r %d", r);
 }
 
+// ---- ATA PASS-THROUGH (SAT) ------------------------------------------------
+//
+// The host side below follows TinyUSB 0.18 (pico-sdk 2.2.0, msc_device.c) for
+// a command that is not READ(10)/WRITE(10): the CBW arrives in the endpoint
+// buffer, tud_msc_scsi_cb runs with the host's length cast to 16 bits (and is
+// skipped while sense is pending), and a negative return fails the command.
+// REQUEST SENSE is TinyUSB's own: 18 bytes of fixed sense from the stored
+// key/ASC/ASCQ, then tud_msc_request_sense_cb over that buffer, the result cut
+// to the host's allocation length, and the stored sense cleared.
+
+static uint8_t ep[CFG_TUD_MSC_EP_BUFSIZE];
+
+static std::vector<uint8_t> request_sense(uint8_t alloc) {
+    static uint8_t b[CFG_TUD_MSC_EP_BUFSIZE];
+    memset(b, 0, sizeof b);
+    b[0] = 0xF0; b[2] = last_key & 0x0F; b[7] = 10; b[12] = last_asc; b[13] = last_ascq;
+    int32_t n = 18;
+#if ATABOY_SAT
+    n = tud_msc_request_sense_cb(0, b, (uint16_t)sizeof b);
+#endif
+    last_key = last_asc = last_ascq = 0;
+    if (n > alloc) n = alloc;
+    return std::vector<uint8_t>(b, b + (n < 0 ? 0 : n));
+}
+
+struct SatResult {
+    bool called = false;          // the app callback ran
+    int32_t r = -1;               // what it returned
+    std::vector<uint8_t> data;    // data the host received
+    std::vector<uint8_t> sense;   // REQUEST SENSE result after a failure
+    bool ok() const { return r >= 0; }
+};
+
+static SatResult sat_cmd(const std::vector<uint8_t> &cdb, uint32_t xfer, bool dir_in,
+                         uint8_t alloc = 32, bool autosense = true) {
+    SatResult s;
+    uint8_t cb[16] = {0};
+    memcpy(cb, cdb.data(), cdb.size());
+    memset(ep, 0xA5, sizeof ep);
+    const uint8_t cbw[15] = { 0x55, 0x53, 0x42, 0x43, 0x78, 0x56, 0x34, 0x12,
+                              (uint8_t)xfer, (uint8_t)(xfer >> 8), (uint8_t)(xfer >> 16), (uint8_t)(xfer >> 24),
+                              (uint8_t)(dir_in ? 0x80 : 0x00), 0x00, (uint8_t)cdb.size() };
+    memcpy(ep, cbw, 15);
+    memcpy(ep + 15, cb, 16);
+    if (last_key == 0) { s.called = true; s.r = tud_msc_scsi_cb(0, cb, ep, (uint16_t)xfer); }
+    if (s.r > 0) s.data.assign(ep, ep + ((uint32_t)s.r < xfer ? (uint32_t)s.r : xfer));
+    if (s.r < 0 && autosense) s.sense = request_sense(alloc);
+    return s;
+}
+
+// CDB builders. b1 carries PROTOCOL (and EXTEND for the 16-byte form).
+static std::vector<uint8_t> pt12(uint8_t proto, uint8_t b2, uint8_t feat, uint8_t cnt,
+                                 uint32_t lba24, uint8_t dev, uint8_t cmd) {
+    return { 0xA1, (uint8_t)(proto << 1), b2, feat, cnt, (uint8_t)lba24, (uint8_t)(lba24 >> 8),
+             (uint8_t)(lba24 >> 16), dev, cmd, 0, 0 };
+}
+static std::vector<uint8_t> pt16(uint8_t proto, bool ext, uint8_t b2, uint8_t feat, uint8_t cnt,
+                                 uint64_t lba, uint8_t dev, uint8_t cmd) {
+    return { 0x85, (uint8_t)((proto << 1) | (ext ? 1 : 0)), b2, 0, feat, 0, cnt,
+             (uint8_t)(ext ? lba >> 24 : 0), (uint8_t)lba, (uint8_t)(ext ? lba >> 32 : 0), (uint8_t)(lba >> 8),
+             (uint8_t)(ext ? lba >> 40 : 0), (uint8_t)(lba >> 16), dev, cmd, 0 };
+}
+static std::vector<uint8_t> smart_status12(uint8_t b2 = 0x20) { return pt12(3, b2, 0xDA, 0, 0xC24F00, 0xA0, 0xB0); }
+static std::vector<uint8_t> native_max12() { return pt12(3, 0x20, 0, 0, 0, 0x40, 0xF8); }
+static std::vector<uint8_t> native_max_ext16() { return pt16(3, true, 0x20, 0, 0, 0, 0x40, 0x27); }
+static std::vector<uint8_t> verify12(uint8_t b2, uint8_t cnt, uint32_t lba28) {
+    return pt12(3, b2, 0, cnt, lba28 & 0xFFFFFF, (uint8_t)(0xE0 | ((lba28 >> 24) & 0x0F)), 0x40);
+}
+
+// The ATA Status Return descriptor, as sat.c documents it.
+static bool is_desc(const std::vector<uint8_t> &s) {
+    return s.size() >= 22 && s[0] == 0x72 && s[7] == 0x0E && s[8] == 0x09 && s[9] == 0x0C;
+}
+static uint32_t desc_lba28(const std::vector<uint8_t> &s) {
+    return s[15] | (s[17] << 8) | (s[19] << 16) | ((uint32_t)(s[20] & 0x0F) << 24);
+}
+static uint64_t desc_lba48(const std::vector<uint8_t> &s) {
+    return s[15] | ((uint64_t)s[17] << 8) | ((uint64_t)s[19] << 16) |
+           ((uint64_t)s[14] << 24) | ((uint64_t)s[16] << 32) | ((uint64_t)s[18] << 40);
+}
+static bool sense_is(const std::vector<uint8_t> &s, uint8_t key, uint8_t asc, uint8_t ascq) {
+    if (s.size() >= 4 && s[0] == 0x72) return s[1] == key && s[2] == asc && s[3] == ascq;
+    if (s.size() >= 14 && (s[0] & 0x7F) == 0x70) return (s[2] & 0x0F) == key && s[12] == asc && s[13] == ascq;
+    return false;
+}
+
+#if ATABOY_SAT
+static const char *mode_name(Mode m) { return m == LBA ? "LBA" : "CHS"; }
+static std::string name2(const char *what, Mode m) { return std::string(what) + ", " + mode_name(m); }
+
+// SMART RETURN STATUS: CK_COND, RECOVERED ERROR 00/1D, and 4F/C2 or F4/2C in
+// LBA mid/high. Allowed in CHS mode. Both byte-2 forms (hdparm 0x20, smartctl 0x2C).
+static void test_sat_smart_status(Mode m) {
+    std::string n = name2("SAT SMART RETURN STATUS", m);
+    setup(n.c_str(), m);
+    for (int exceeded = 0; exceeded < 2; exceeded++) {
+        sim.smart_exceeded = exceeded != 0;
+        std::vector<uint8_t> forms[] = { smart_status12(0x20), smart_status12(0x2C),
+                                         pt16(3, false, 0x2C, 0xDA, 0, 0xC24F00, 0x00, 0xB0) };
+        for (auto &cdb : forms) {
+            int cmds = sim.commands;
+            SatResult s = sat_cmd(cdb, 0, false);
+            CHECK(s.called && !s.ok(), "exceeded %d: r %d", exceeded, s.r);
+            CHECK(sim.commands == cmds + 1, "commands %d", sim.commands - cmds);
+            CHECK(is_desc(s.sense) && s.sense.size() == 22, "descriptor, size %zu", s.sense.size());
+            if (!is_desc(s.sense)) continue;
+            CHECK(sense_is(s.sense, 0x01, 0x00, 0x1D), "sense %02x/%02x/%02x", s.sense[1], s.sense[2], s.sense[3]);
+            CHECK(s.sense[17] == (exceeded ? 0xF4 : 0x4F) && s.sense[19] == (exceeded ? 0x2C : 0xC2),
+                  "exceeded %d: mid/high %02x/%02x", exceeded, s.sense[17], s.sense[19]);
+            CHECK(s.sense[21] == 0x50 && s.sense[11] == 0x00 && s.sense[10] == 0x00,
+                  "status %02x error %02x extend %02x", s.sense[21], s.sense[11], s.sense[10]);
+            CHECK((s.sense[20] & 0x10) == 0, "device %02x", s.sense[20]);
+        }
+    }
+    // CK_COND=0 is refused: the answer could not be returned.
+    int cmds = sim.commands;
+    SatResult s = sat_cmd(smart_status12(0x0C), 0, false);
+    CHECK(!s.ok() && sense_is(s.sense, 0x05, 0x24, 0x00) && s.sense.size() == 18 && sim.commands == cmds,
+          "CK_COND=0: r %d commands %d", s.r, sim.commands - cmds);
+    CHECK(sim.data_reads == 0 && sim.srst == 0 && sim.violations == 0 && sim.hob_selects == 0,
+          "data reads %d srst %d violations %d hob %d", sim.data_reads, sim.srst, sim.violations, sim.hob_selects);
+}
+
+// READ NATIVE MAX ADDRESS on a drive with a Host Protected Area. The numbers
+// are the ST380011A donor's: 156,250,000 sectors reported, 156,301,488 in the
+// model's specification.
+static void test_sat_native_max(Mode m) {
+    std::string n = name2("SAT READ NATIVE MAX, HPA", m);
+    setup(n.c_str(), m);
+    sim.nsect = 156250000; sim.native_max = 156301488;
+    SatResult s = sat_cmd(native_max12(), 0, false);
+    CHECK(!s.ok() && is_desc(s.sense) && sense_is(s.sense, 0x01, 0x00, 0x1D), "F8: r %d size %zu", s.r, s.sense.size());
+    if (is_desc(s.sense)) {
+        CHECK(desc_lba28(s.sense) == 156301487u, "F8 max LBA %u", desc_lba28(s.sense));
+        CHECK(s.sense[10] == 0 && s.sense[21] == 0x50 && (s.sense[20] & 0x40), "extend %u status %02x device %02x",
+              s.sense[10], s.sense[21], s.sense[20]);
+    }
+    CHECK(sim.hob_selects == 0, "28-bit command read HOB %d times", sim.hob_selects);
+    // the same drive through the 48-bit form
+    s = sat_cmd(native_max_ext16(), 0, false);
+    CHECK(!s.ok() && is_desc(s.sense) && sense_is(s.sense, 0x01, 0x00, 0x1D), "27: r %d", s.r);
+    if (is_desc(s.sense)) {
+        CHECK(desc_lba48(s.sense) == 156301487ull, "27 max LBA %llu", (unsigned long long)desc_lba48(s.sense));
+        CHECK(s.sense[10] == 0x01, "EXTEND %u", s.sense[10]);
+    }
+    // a native size past 2^32 only fits the 48-bit form
+    sim.native_max = 0x123456789ABull + 1;
+    s = sat_cmd(native_max_ext16(), 0, false);
+    CHECK(is_desc(s.sense) && desc_lba48(s.sense) == 0x123456789ABull, "48-bit max %llx",
+          is_desc(s.sense) ? (unsigned long long)desc_lba48(s.sense) : 0ull);
+    s = sat_cmd(native_max12(), 0, false);
+    CHECK(is_desc(s.sense) && desc_lba28(s.sense) == 0x0FFFFFFFu, "F8 caps at 0x0FFFFFFF: %x",
+          is_desc(s.sense) ? desc_lba28(s.sense) : 0u);
+    CHECK((sim.devctl & 0x80) == 0, "HOB left set in Device Control: %02x", sim.devctl);
+    CHECK(sim.hob_selects == 2, "HOB selects %d (one per 0x27)", sim.hob_selects);
+    CHECK(sim.data_reads == 0 && sim.srst == 0 && sim.violations == 0, "data reads %d srst %d violations %d",
+          sim.data_reads, sim.srst, sim.violations);
+    CHECK(sim.cmd_count[0xF9] == 0 && sim.cmd_count[0x37] == 0, "SET MAX issued");
+    // and a read afterwards still sees the current size, nothing changed
+    HostRead h = host_read10(1000, 8);
+    CHECK(h.ok && matches_medium(h, 1000), "read after the queries");
+}
+
+// A drive without 48-bit support aborts 0x27. The firmware must not then set
+// HOB in Device Control, which such a drive does not know.
+static void test_sat_native_max_ext_abort() {
+    setup("SAT READ NATIVE MAX EXT, drive without 48-bit", LBA);
+    sim.lba48 = false;
+    SatResult s = sat_cmd(native_max_ext16(), 0, false);
+    CHECK(!s.ok() && is_desc(s.sense) && sense_is(s.sense, 0x0B, 0x00, 0x00), "r %d size %zu", s.r, s.sense.size());
+    if (is_desc(s.sense))
+        CHECK(s.sense[11] == 0x04 && s.sense[21] == 0x51 && s.sense[10] == 0, "error %02x status %02x extend %u",
+              s.sense[11], s.sense[21], s.sense[10]);
+    CHECK(sim.hob_selects == 0, "HOB selected on an aborted 48-bit command");
+    sim.hpa_feature = false;
+    s = sat_cmd(native_max12(), 0, false);
+    CHECK(is_desc(s.sense) && sense_is(s.sense, 0x0B, 0x00, 0x00) && s.sense[11] == 0x04, "F8 unsupported");
+    CHECK(sim.srst == 0 && sim.data_reads == 0 && sim.violations == 0, "srst %d reads %d", sim.srst, sim.data_reads);
+    HostRead h = host_read10(10, 8);
+    CHECK(h.ok && matches_medium(h, 10), "usable afterwards");
+}
+
+// READ VERIFY: no data phase, GOOD with CK_COND=0, the failing LBA from the
+// drive's own registers on an error, IDNF past the end, and LBA mode only.
+static void test_sat_verify() {
+    setup("SAT READ VERIFY", LBA);
+    sim.nsect = 0x02000000;
+    SatResult s = sat_cmd(verify12(0x00, 8, 1000), 0, false);
+    CHECK(s.called && s.r == 0 && s.sense.empty() && last_key == 0, "good verify: r %d", s.r);
+    for (uint32_t l = 1000; l < 1008; l++) CHECK(sim.attempts[l] == 1, "lba %u attempts %d", l, sim.attempts[l]);
+    CHECK(sim.attempts[1008] == 0 && sim.attempts[999] == 0, "verified outside the range");
+    s = sat_cmd(verify12(0x20, 8, 1000), 0, false);
+    CHECK(!s.ok() && is_desc(s.sense) && sense_is(s.sense, 0x01, 0x00, 0x1D) && s.sense[21] == 0x50,
+          "CK_COND=1: r %d", s.r);
+    sim.attempts.clear();
+    s = sat_cmd(verify12(0x0C, 0, 2000), 0, false);       // count 0 = 256 sectors; T_DIR, BYTE_BLOCK set
+    CHECK(s.r == 0, "count 0: r %d sense %zu %02x %02x %02x", s.r, s.sense.size(), s.sense.size() > 13 ? s.sense[2] : 0, s.sense.size() > 13 ? s.sense[12] : 0, s.sense.size() > 13 ? s.sense[13] : 0);
+    CHECK(sim.attempts[2000] == 1 && sim.attempts[2255] == 1 && sim.attempts[2256] == 0, "count 0 is 256 sectors");
+
+    // a bad sector: UNC with its LBA, above 2^24 so the device nibble counts
+    const uint32_t bad = 0x01234567;
+    sim.bad[bad] = {BAD_ERR, 0};
+    int srst0 = sim.srst;
+    s = sat_cmd(verify12(0x00, 16, bad - 7), 0, false);
+    CHECK(!s.ok() && is_desc(s.sense) && sense_is(s.sense, 0x03, 0x11, 0x00), "bad: r %d", s.r);
+    if (is_desc(s.sense)) {
+        CHECK(desc_lba28(s.sense) == bad, "failing LBA %x, want %x", desc_lba28(s.sense), bad);
+        CHECK(s.sense[11] == 0x40 && (s.sense[21] & 0x81) == 0x01, "error %02x status %02x", s.sense[11], s.sense[21]);
+    }
+    CHECK(sim.srst == srst0, "no soft reset after an ATA error");
+    // one that ERRs with data on offer: still no data read
+    sim.bad[bad] = {BAD_ERR_DRQ, 0};
+    s = sat_cmd(verify12(0x20, 1, bad), 0, false);
+    CHECK(is_desc(s.sense) && desc_lba28(s.sense) == bad, "ERR+DRQ sector");
+    // past the end: IDNF at the first missing sector
+    s = sat_cmd(verify12(0x00, 8, sim.nsect - 4), 0, false);
+    CHECK(is_desc(s.sense) && sense_is(s.sense, 0x03, 0x14, 0x01) && desc_lba28(s.sense) == sim.nsect,
+          "past the end: %x", is_desc(s.sense) ? desc_lba28(s.sense) : 0u);
+    // PIO-in protocol on 0x40 is refused before the drive sees anything
+    int cmds = sim.commands;
+    s = sat_cmd(pt12(4, 0x0E, 0, 1, 1000, 0xE0, 0x40), 512, true);
+    CHECK(!s.ok() && sense_is(s.sense, 0x05, 0x24, 0x00) && sim.commands == cmds, "verify as PIO-in");
+    CHECK(sim.data_reads == 0 && sim.violations == 0, "data reads %d violations %d", sim.data_reads, sim.violations);
+    sim.bad.clear();
+    HostRead h = host_read10(1000, 16);
+    CHECK(h.ok && matches_medium(h, 1000), "usable afterwards");
+
+    setup("SAT READ VERIFY refused in CHS mode", CHS);
+    cmds = sim.commands;
+    s = sat_cmd(verify12(0x20, 1, 100), 0, false);
+    CHECK(!s.ok() && sense_is(s.sense, 0x05, 0x24, 0x00) && sim.commands == cmds, "CHS verify: r %d", s.r);
+}
+
+// The drive never ends the command: the path times out, aborts with a soft
+// reset, and in CHS mode puts the geometry back before anything else runs.
+static void test_sat_nondata_timeout(Mode m) {
+    std::string n = name2("SAT non-data timeout", m);
+    setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.hang_cmd = 0xB0;
+    uint64_t t0 = mock_now_ns;
+    SatResult s = sat_cmd(smart_status12(), 0, false);
+    uint64_t took = (mock_now_ns - t0) / 1000000;
+    CHECK(!s.ok() && sense_is(s.sense, 0x0B, 0x00, 0x00) && s.sense.size() == 18 && s.sense[0] == 0xF0,
+          "fixed sense, no descriptor: size %zu", s.sense.size());
+    CHECK(took >= 10000 && took < 12000, "gave up after %llu ms", (unsigned long long)took);
+    CHECK(sim.srst >= 1, "a hung command must be aborted");
+    if (m == CHS)
+        CHECK(sim.geo_valid && sim.heads == 5 && sim.spt == 34 && sim.init_params > 0,
+              "geometry %d %u x %u", sim.geo_valid, sim.heads, sim.spt);
+    CHECK(sim.data_reads == 0, "data reads %d", sim.data_reads);
+    sim.hang_cmd = 0;
+    HostRead h = host_read10(1234, 8);
+    CHECK(h.ok && matches_medium(h, 1234), "read after the abort");
+    // the same through READ NATIVE MAX EXT, and a verify that hangs on a sector
+    sim.hang_cmd = 0x27;
+    int srst0 = sim.srst;
+    s = sat_cmd(native_max_ext16(), 0, false);
+    CHECK(sense_is(s.sense, 0x0B, 0x00, 0x00) && s.sense.size() == 18 && sim.srst > srst0, "0x27 timeout");
+    sim.hang_cmd = 0;
+    if (m == LBA) {
+        sim.bad[3003] = {BAD_HANG, 0};
+        srst0 = sim.srst;
+        s = sat_cmd(verify12(0x20, 8, 3000), 0, false);
+        CHECK(sense_is(s.sense, 0x0B, 0x00, 0x00) && s.sense.size() == 18 && sim.srst > srst0, "verify hang");
+        sim.bad.clear();
+    }
+    HostRead g = host_read10(1234, 8);
+    CHECK(g.ok && matches_medium(g, 1234), "read after the second abort");
+    CHECK(sim.violations == 0 && sim.reset_writes == 0, "violations %d reset writes %d", sim.violations, sim.reset_writes);
+}
+
+// A drive that answers a non-data command with DRQ: the data is never read,
+// and a soft reset ends the command.
+static void test_sat_nondata_drq() {
+    setup("SAT non-data command ends with DRQ", LBA);
+    sim.nondata_drq = true;
+    SatResult s = sat_cmd(smart_status12(), 0, false);
+    CHECK(!s.ok() && sense_is(s.sense, 0x0B, 0x00, 0x00) && s.sense.size() == 18, "sense size %zu", s.sense.size());
+    CHECK(sim.data_reads == 0, "data register read %d times", sim.data_reads);
+    CHECK(sim.srst >= 1, "must abort");
+    sim.nondata_drq = false;
+    HostRead h = host_read10(500, 8);
+    CHECK(h.ok && matches_medium(h, 500) && !contains_flawed(h), "usable, nothing stranded");
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+}
+
+// A drive still offering data from an earlier command: no SAT command is
+// issued over it, whichever path.
+static void test_sat_stale_drq(Mode m) {
+    std::string n = name2("SAT refuses to issue over stale DRQ", m);
+    setup(n.c_str(), m);
+    for (int i = 0; i < 256; i++) sim.xfer[i] = 0xDEAD;
+    sim.widx = 0; sim.phase = SimDrive::DRQ_IN; sim.status = 0x58; sim.left = 1;
+    int cmds = sim.commands;
+    SatResult a = sat_cmd(smart_status12(), 0, false);
+    SatResult b = sat_cmd(native_max12(), 0, false);
+    SatResult c = sat_cmd(pt12(4, 0x0E, 0xD0, 1, 0xC24F00, 0xA0, 0xB0), 512, true);
+    CHECK(sense_is(a.sense, 0x02, 0x04, 0x00) && sense_is(b.sense, 0x02, 0x04, 0x00) && sense_is(c.sense, 0x02, 0x04, 0x00),
+          "not ready: %zu %zu %zu", a.sense.size(), b.sense.size(), c.sense.size());
+    CHECK(sim.commands == cmds, "%d commands issued over stale DRQ", sim.commands - cmds);
+    CHECK(sim.data_reads == 0 && sim.srst == 0, "data reads %d srst %d", sim.data_reads, sim.srst);
+    HostRead h = host_read10(300, 4);       // the READ(10) guard clears it
+    CHECK(!h.ok && !contains_flawed(h), "READ(10) guard");
+    request_sense(18);                      // the host's auto-sense for that failure
+    SatResult d = sat_cmd(smart_status12(), 0, false);
+    CHECK(is_desc(d.sense) && sense_is(d.sense, 0x01, 0x00, 0x1D), "SAT works once cleared");
+}
+
+// SMART READ DATA / THRESHOLDS / LOG: PIO data-in, the drive's bytes exactly.
+static void test_sat_smart_data(Mode m) {
+    std::string n = name2("SAT SMART READ DATA / THRESHOLDS / LOG", m);
+    setup(n.c_str(), m);
+    auto same = [](const SatResult &s, uint32_t first, uint32_t count) {
+        if (s.data.size() != count * 512) return false;
+        for (uint32_t i = 0; i < s.data.size(); i++)
+            if (s.data[i] != sim.byte_at(first + i / 512, (int)(i % 512))) return false;
+        return true;
+    };
+    // smartread.ps1: A1 08 0E D0 01 00 4F C2 A0 B0 00 00
+    SatResult s = sat_cmd(pt12(4, 0x0E, 0xD0, 1, 0xC24F00, 0xA0, 0xB0), 512, true);
+    CHECK(s.r == 512 && same(s, SimDrive::smart_sector(0xD0, 0, 0), 1), "READ DATA: r %d", s.r);
+    s = sat_cmd(pt16(4, false, 0x0E, 0xD1, 1, 0xC24F00, 0x00, 0xB0), 512, true);
+    CHECK(s.r == 512 && same(s, SimDrive::smart_sector(0xD1, 0, 0), 1), "READ THRESHOLDS: r %d", s.r);
+    s = sat_cmd(pt16(4, false, 0x0E, 0xD5, 3, 0xC24F06, 0xA0, 0xB0), 3 * 512, true);
+    CHECK(s.r == 3 * 512 && same(s, SimDrive::smart_sector(0xD5, 0x06, 0), 3), "READ LOG 06h x3: r %d", s.r);
+    s = sat_cmd(pt12(4, 0x0E, 0xD5, 8, 0xC24F80, 0xA0, 0xB0), 8 * 512, true);
+    CHECK(s.r == 8 * 512 && same(s, SimDrive::smart_sector(0xD5, 0x80, 0), 8), "READ LOG 80h x8: r %d", s.r);
+    CHECK(sim.srst == 0 && sim.violations == 0, "srst %d violations %d", sim.srst, sim.violations);
+    // a drive without SMART: ABRT, with the registers
+    sim.smart_supported = false;
+    s = sat_cmd(pt12(4, 0x0E, 0xD0, 1, 0xC24F00, 0xA0, 0xB0), 512, true);
+    CHECK(!s.ok() && is_desc(s.sense) && sense_is(s.sense, 0x0B, 0x00, 0x00), "no SMART: r %d", s.r);
+    if (is_desc(s.sense)) CHECK(s.sense[11] == 0x04 && s.sense[21] == 0x51, "error %02x status %02x", s.sense[11], s.sense[21]);
+    // SMART ENABLE (D8) is never sent
+    int cmds = sim.commands;
+    s = sat_cmd(pt12(3, 0x20, 0xD8, 0, 0xC24F00, 0xA0, 0xB0), 0, false);
+    CHECK(!s.ok() && sense_is(s.sense, 0x05, 0x24, 0x00) && sim.commands == cmds, "D8 refused");
+}
+
+// Stage 1 reads now carry the drive's registers when they fail, including
+// the 48-bit LBA through HOB for READ SECTORS EXT.
+static void test_sat_read_error_registers() {
+    setup("SAT READ SECTORS (EXT) error registers", LBA);
+    sim.nsect = 0x20000000;
+    const uint32_t bad = 0x12345662;
+    sim.bad[bad] = {BAD_ERR, 0};
+    SatResult s = sat_cmd(pt16(4, true, 0x0E, 0, 4, bad - 2, 0x40, 0x24), 4 * 512, true);
+    CHECK(!s.ok() && s.data.empty() && is_desc(s.sense) && sense_is(s.sense, 0x03, 0x11, 0x00), "EXT: r %d", s.r);
+    if (is_desc(s.sense)) {
+        CHECK(desc_lba48(s.sense) == bad, "EXT failing LBA %llx", (unsigned long long)desc_lba48(s.sense));
+        CHECK(s.sense[10] == 0x01 && s.sense[11] == 0x40, "extend %u error %02x", s.sense[10], s.sense[11]);
+    }
+    CHECK((sim.devctl & 0x80) == 0 && sim.hob_selects == 1, "devctl %02x hob selects %d", sim.devctl, sim.hob_selects);
+    const uint32_t bad28 = 0x00ABCDE1;
+    sim.bad[bad28] = {BAD_ERR_DRQ, 0};
+    s = sat_cmd(pt12(4, 0x0E, 0, 4, (bad28 - 1) & 0xFFFFFF, 0xE0, 0x20), 4 * 512, true);
+    CHECK(is_desc(s.sense) && desc_lba28(s.sense) == bad28 && s.sense[10] == 0, "28-bit failing LBA %x",
+          is_desc(s.sense) ? desc_lba28(s.sense) : 0u);
+    CHECK(sim.srst == 0 && sim.violations == 0, "srst %d violations %d", sim.srst, sim.violations);
+    sim.bad.clear();
+    s = sat_cmd(pt12(4, 0x0E, 0, 2, 100, 0xE0, 0x20), 1024, true);
+    CHECK(s.r == 1024 && s.sense.empty(), "good read: r %d", s.r);
+}
+
+// How the descriptor reaches the host, and when it must not.
+static void test_sat_sense_delivery() {
+    setup("SAT sense delivery", LBA);
+    // A host that asks for 18 bytes gets the first 18 of the descriptor.
+    SatResult s = sat_cmd(smart_status12(), 0, false, 18);
+    CHECK(s.sense.size() == 18 && s.sense[0] == 0x72 && s.sense[8] == 0x09 && s.sense[17] == 0x4F,
+          "18-byte allocation: size %zu", s.sense.size());
+    // Delivered once: the next REQUEST SENSE has nothing.
+    std::vector<uint8_t> again = request_sense(32);
+    CHECK(again.size() == 18 && again[0] == 0xF0 && (again[2] & 0x0F) == 0, "second REQUEST SENSE %zu", again.size());
+
+    // A READ(10) between the SAT command and REQUEST SENSE sets its own sense
+    // (the same 3/11/00 a failed verify sets): the host must get the READ(10)'s
+    // fixed sense, never the SAT registers paired with it.
+    sim.bad[4000] = {BAD_ERR, 0};
+    s = sat_cmd(verify12(0x00, 1, 4000), 0, false, 32, false);
+    CHECK(!s.ok() && last_key == 0x03 && last_asc == 0x11, "verify fails");
+    static uint8_t b[4096];
+    int32_t r = tud_msc_read10_cb(0, 4000, 0, b, 512);
+    CHECK(r < 0 && last_key == 0x03, "READ(10) fails: r %d key %u", r, last_key);
+    std::vector<uint8_t> rs = request_sense(32);
+    CHECK(rs.size() == 18 && rs[0] == 0xF0 && (rs[2] & 0x0F) == 0x03, "READ(10) sense, fixed: size %zu", rs.size());
+    // ...and a READ(10) that succeeds in between also drops it
+    s = sat_cmd(verify12(0x20, 1, 10), 0, false, 32, false);
+    CHECK(!s.ok() && last_key == 0x01, "CK_COND verify");
+    r = tud_msc_read10_cb(0, 20, 0, b, 512);
+    CHECK(r == 512, "READ(10) ok: r %d", r);
+    rs = request_sense(32);
+    CHECK(rs.size() == 18 && rs[0] == 0xF0 && (rs[2] & 0x0F) == 0x01, "stale descriptor after READ(10): size %zu", rs.size());
+    // Sense replaced by something else (unit attention, say): fixed sense.
+    s = sat_cmd(smart_status12(), 0, false, 32, false);
+    tud_msc_set_sense(0, 0x06, 0x28, 0x00);
+    rs = request_sense(32);
+    CHECK(rs.size() == 18 && (rs[2] & 0x0F) == 0x06, "replaced sense: size %zu key %u", rs.size(), rs.size() > 2 ? rs[2] & 0x0F : 0);
+    // Refusals are plain fixed sense.
+    s = sat_cmd(pt12(3, 0x20, 0, 0, 0, 0x40, 0xF9), 0, false);
+    CHECK(s.sense.size() == 18 && sense_is(s.sense, 0x05, 0x24, 0x00), "refusal: size %zu", s.sense.size());
+    // With sense pending, TinyUSB does not call the callback at all.
+    s = sat_cmd(smart_status12(), 0, false, 32, false);
+    int cmds = sim.commands;
+    SatResult t = sat_cmd(smart_status12(), 0, false, 32, false);
+    CHECK(!t.called && sim.commands == cmds, "callback ran with sense pending");
+    request_sense(32);
+}
+
+// Mutating and out-of-list commands are refused and reach nothing.
+static void test_sat_refusals_touch_nothing() {
+    setup("SAT refusals touch nothing", LBA);
+    struct { const char *name; std::vector<uint8_t> cdb; uint32_t xfer; bool in; } list[] = {
+        { "SET MAX ADDRESS",          pt12(3, 0x20, 0, 0, 0, 0x40, 0xF9), 0, false },
+        { "SET MAX ADDRESS EXT",      pt16(3, true, 0x20, 0, 0, 0, 0x40, 0x37), 0, false },
+        { "DCO IDENTIFY",             pt12(4, 0x0E, 0xC2, 1, 0, 0xA0, 0xB1), 512, true },
+        { "DCO FREEZE LOCK",          pt12(3, 0x20, 0xC1, 0, 0, 0xA0, 0xB1), 0, false },
+        { "SMART ENABLE",             pt12(3, 0x20, 0xD8, 0, 0xC24F00, 0xA0, 0xB0), 0, false },
+        { "SMART EXECUTE OFF-LINE",   pt12(3, 0x20, 0xD4, 0, 0xC24F01, 0xA0, 0xB0), 0, false },
+        { "SECURITY FREEZE LOCK",     pt12(3, 0x20, 0, 0, 0, 0xA0, 0xF5), 0, false },
+        { "WRITE SECTORS as non-data",pt12(3, 0x20, 0, 1, 0, 0xE0, 0x30), 0, false },
+        { "READ NATIVE MAX, CK_COND=0", pt12(3, 0x00, 0, 0, 0, 0x40, 0xF8), 0, false },
+        { "READ VERIFY, data-in CBW", verify12(0x20, 1, 0), 512, true },
+    };
+    for (auto &e : list) {
+        int cmds = sim.commands;
+        SatResult s = sat_cmd(e.cdb, e.xfer, e.in);
+        CHECK(!s.ok() && s.sense.size() == 18 && sense_is(s.sense, 0x05, 0x24, 0x00) && sim.commands == cmds,
+              "%s: r %d commands %d", e.name, s.r, sim.commands - cmds);
+    }
+    CHECK(sim.data_reads == 0 && sim.violations == 0, "data reads %d", sim.data_reads);
+}
+#else
+static const char *mode_name(Mode m) { return m == LBA ? "LBA" : "CHS"; }
+
+// With SAT built out, both pass-through opcodes are unknown commands and
+// nothing reaches the drive.
+static void test_no_sat() {
+    setup("SAT off: pass-through refused", LBA);
+    int cmds = sim.commands;
+    SatResult a = sat_cmd(smart_status12(), 0, false);
+    SatResult b = sat_cmd(pt12(4, 0x0E, 0, 1, 0, 0, 0xEC), 512, true);
+    SatResult c = sat_cmd(native_max_ext16(), 0, false);
+    CHECK(sense_is(a.sense, 0x05, 0x20, 0x00) && sense_is(b.sense, 0x05, 0x20, 0x00) &&
+          sense_is(c.sense, 0x05, 0x20, 0x00), "sense sizes %zu %zu %zu", a.sense.size(), b.sense.size(), c.sense.size());
+    CHECK(sim.commands == cmds && a.sense.size() == 18, "commands %d", sim.commands - cmds);
+    (void)mode_name(LBA); (void)is_desc; (void)desc_lba28; (void)desc_lba48; (void)verify12; (void)native_max12;
+}
+#endif
+
 int main() {
     test_clean_reads(LBA);
     test_clean_reads(CHS);
@@ -528,6 +980,26 @@ int main() {
     test_slave_after_reset(LBA);
     test_slave_after_reset(CHS);
     test_host_offsets();
+#if ATABOY_SAT
+    test_sat_smart_status(LBA);
+    test_sat_smart_status(CHS);
+    test_sat_native_max(LBA);
+    test_sat_native_max(CHS);
+    test_sat_native_max_ext_abort();
+    test_sat_verify();
+    test_sat_nondata_timeout(LBA);
+    test_sat_nondata_timeout(CHS);
+    test_sat_nondata_drq();
+    test_sat_stale_drq(LBA);
+    test_sat_stale_drq(CHS);
+    test_sat_smart_data(LBA);
+    test_sat_smart_data(CHS);
+    test_sat_read_error_registers();
+    test_sat_sense_delivery();
+    test_sat_refusals_touch_nothing();
+#else
+    test_no_sat();
+#endif
     std::printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;
 }

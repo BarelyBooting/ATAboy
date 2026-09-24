@@ -53,7 +53,12 @@ enum {
     SCSI_SENSE_NONE = 0x00, SCSI_SENSE_NOT_READY = 0x02, SCSI_SENSE_MEDIUM_ERROR = 0x03,
     SCSI_SENSE_ILLEGAL_REQUEST = 0x05, SCSI_SENSE_UNIT_ATTENTION = 0x06,
     SCSI_SENSE_HARDWARE_ERROR = 0x04, SCSI_SENSE_ABORTED_COMMAND = 0x0B,   // used by sat.c
+    SCSI_SENSE_RECOVERED_ERROR = 0x01,
 };
+// TinyUSB's fixed-format sense (msc.h), 18 bytes; sat.c only takes its size.
+typedef struct { uint8_t bytes[18]; } scsi_sense_fixed_resp_t;
+// TinyUSB calls this after building the fixed sense for REQUEST SENSE.
+int32_t tud_msc_request_sense_cb(uint8_t lun, void *buffer, uint16_t bufsize);
 // sat.c is C11; the host tests build it as C++.
 #ifdef __cplusplus
 #define _Static_assert static_assert
