@@ -28,6 +28,12 @@
 //
 // State: the drive must be mounted (else NOT READY), and reads are allowed only
 // when it was set up in LBA mode. IDENTIFY works in either mode.
+//
+// SAT reads are NOT clipped to the configured geometry (unlike READ(10)).
+// They address the drive, and the drive's own IDNF is what stops a read past
+// its end; that failure is passed on, and nothing on the SAT path zero-fills
+// or returns data the drive did not send. A geometry smaller than the drive
+// therefore cannot hide sectors from a tool that sized itself by IDENTIFY.
 
 #ifndef SAT_POLICY_H
 #define SAT_POLICY_H
