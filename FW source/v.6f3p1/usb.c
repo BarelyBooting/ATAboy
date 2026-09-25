@@ -116,6 +116,54 @@ static void host_cmd_leave(uint32_t lba, int32_t r) {
     else rw_cmd.next_lba = lba + (uint32_t)r / 512;
 }
 
+// ---------------------------------------------------------------------------
+//  Fixed-format sense with ILI and INFORMATION (0.6f3p9, READ LONG)
+// ---------------------------------------------------------------------------
+// tud_msc_set_sense() only keeps key, ASC and ASCQ. TinyUSB (pico-sdk 2.2.0,
+// msc_device.c) answers REQUEST SENSE itself with 18 bytes of fixed sense,
+// VALID already set, then calls tud_msc_request_sense_cb() with them. READ
+// LONG's length refusal needs ILI and the INFORMATION field as well (SBC), so
+// they wait here and the callback adds them, only if the sense TinyUSB is
+// about to send is still the one set with them (as sat.c does for its
+// descriptor). Forgotten when the next command starts.
+static struct {
+    bool    valid;
+    uint8_t lun, key, asc, ascq;
+    uint32_t info;
+} sense_ili;
+
+static void usb_sense_forget(void) { sense_ili.valid = false; }
+
+static void sense_ili_set(uint8_t lun, uint8_t key, uint8_t asc, uint8_t ascq, uint32_t info) {
+    sense_ili.lun = lun; sense_ili.key = key; sense_ili.asc = asc; sense_ili.ascq = ascq;
+    sense_ili.info = info;
+    sense_ili.valid = true;
+    tud_msc_set_sense(lun, key, asc, ascq);
+}
+
+// Called by the REQUEST SENSE callback (sat.c in a SAT build, below in one
+// without) over TinyUSB's 18 bytes of fixed sense.
+void usb_sense_ili_apply(uint8_t lun, uint8_t *b, uint16_t bufsize) {
+    if (!sense_ili.valid) return;
+    bool ours = sense_ili.lun == lun && (b[2] & 0x0F) == sense_ili.key &&
+                b[12] == sense_ili.asc && b[13] == sense_ili.ascq;
+    sense_ili.valid = false;        // one delivery: TinyUSB clears its sense next
+    if (!ours || bufsize < 18) return;
+    b[0] |= 0x80;                   // VALID: the INFORMATION field means something
+    b[2] |= 0x20;                   // ILI
+    b[3] = (uint8_t)(sense_ili.info >> 24);
+    b[4] = (uint8_t)(sense_ili.info >> 16);
+    b[5] = (uint8_t)(sense_ili.info >> 8);
+    b[6] = (uint8_t)sense_ili.info;
+}
+
+#if !ATABOY_SAT
+int32_t tud_msc_request_sense_cb(uint8_t lun, void *buffer, uint16_t bufsize) {
+    usb_sense_ili_apply(lun, (uint8_t *)buffer, bufsize);
+    return 18;                      // TinyUSB's fixed sense, as built
+}
+#endif
+
 void tud_msc_read10_complete_cb(uint8_t lun) { (void)lun; rw_cmd.open = false; }
 void tud_msc_write10_complete_cb(uint8_t lun) { (void)lun; rw_cmd.open = false; }
 void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
@@ -177,6 +225,7 @@ static int32_t read10(uint8_t lun, uint32_t lba, uint32_t offset,
 #if ATABOY_SAT
     sat_sense_forget();     // this command may set sense of its own
 #endif
+    usb_sense_forget();
     if (!is_mounted) return -1;
 
     // TinyUSB derives the block size from the host's CBW (length / count)
@@ -284,6 +333,7 @@ static int32_t write10(uint8_t lun, uint32_t lba, uint32_t offset,
 #if ATABOY_SAT
     sat_sense_forget();     // this command may set sense of its own
 #endif
+    usb_sense_forget();
     if (!is_mounted || config.drive_write_protected) return -1;
 
     // TinyUSB derives the block size from the host's CBW (length / count)
@@ -414,6 +464,63 @@ static int32_t read_buffer(uint8_t lun, uint8_t const cdb[16], uint8_t *buf, uin
 }
 
 // ---------------------------------------------------------------------------
+//  READ LONG(10) -> ATA READ LONG WITHOUT RETRIES (0.6f3p9)
+// ---------------------------------------------------------------------------
+// CDB 3Eh: byte 1 bit 1 CORRCT, bit 2 PBLOCK; bytes 2-5 LBA; bytes 7-8 BYTE
+// TRANSFER LENGTH (both big-endian). One sector: its 512 bytes, then the ECC
+// bytes the drive's IDENTIFY word 22 counts (ide.c, ide_read_long). Checked in
+// this order, and nothing is sent to the drive for any refusal:
+//   not mounted                              NOT READY 2/04/00
+//   CORRCT or PBLOCK set                     ILLEGAL REQUEST 5/24/00 (only
+//                                            uncorrected data is ever asked for)
+//   geometry from Ctrl+G (no IDENTIFY)       ILLEGAL REQUEST 5/24/00
+//   no IDENTIFY word 22, or it is not 1..64  ILLEGAL REQUEST 5/20/00 (the drive
+//                                            does not say it has READ LONG)
+//   48-bit mount (no 48-bit READ LONG)       ILLEGAL REQUEST 5/20/00
+//   BYTE TRANSFER LENGTH 0                   GOOD, no data (SBC: not an error)
+//   BYTE TRANSFER LENGTH not 512 + word 22   ILLEGAL REQUEST 5/24/00 with ILI,
+//                                            INFORMATION = requested - actual
+//   host transfer length under 512 + word 22 ILLEGAL REQUEST 5/24/00
+//   LBA at or past the end of the mount      ILLEGAL REQUEST 5/21/00 (as READ(10))
+// Then the drive:
+//   the data and ECC bytes                   GOOD, 512 + word 22 bytes
+//   ERR from the drive                       MEDIUM ERROR 3/11/00 (as READ(10))
+//   not sent (a reset still pending, no      NOT READY 2/04/00 (as SAT)
+//     time, not ready, no geometry)
+//   no data in time, or not exactly 512 +    ABORTED COMMAND 0B/00/00 (as SAT)
+//     word 22 bytes on offer
+static int32_t read_long10(uint8_t lun, uint8_t const cdb[16], uint8_t *buf, uint16_t host_bufsize) {
+#if ATABOY_SAT
+    sat_sense_forget();
+#endif
+    if (!is_mounted) { tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x04, 0x00); return -1; }
+    if (cdb[1] & 0x06) { tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00); return -1; }
+    if (ide_manual_chs_active()) { tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00); return -1; }
+    uint16_t w22 = 0;
+    if (!ide_read_long_word22(&w22) || w22 < 1 || w22 > IDE_LONG_ECC_MAX ||
+        (config.use_lba_mode && config.lba_sectors > 0x0FFFFFFF)) {
+        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
+        return -1;
+    }
+    uint32_t lba = ((uint32_t)cdb[2] << 24) | ((uint32_t)cdb[3] << 16) | ((uint32_t)cdb[4] << 8) | cdb[5];
+    uint32_t len = ((uint32_t)cdb[7] << 8) | cdb[8];
+    uint32_t want = 512u + w22;
+    if (len == 0) return 0;
+    if (len != want) {
+        sense_ili_set(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00, len - want);   // two's complement if short
+        return -1;
+    }
+    if (host_bufsize < want) { tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00); return -1; }
+    if ((uint64_t)lba >= total_sectors()) { tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x21, 0x00); return -1; }
+    switch (ide_read_long(lba, (uint8_t)w22, buf)) {
+    case IDE_LONG_OK:       return (int32_t)want;
+    case IDE_LONG_ERR:      tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00); return -1;
+    case IDE_LONG_NOT_SENT: tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x04, 0x00); return -1;
+    default:                tud_msc_set_sense(lun, SCSI_SENSE_ABORTED_COMMAND, 0x00, 0x00); return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  SCSI — Mode Sense + misc
 // ---------------------------------------------------------------------------
 
@@ -425,10 +532,9 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
     // the buffer overwrote RAM past it - TinyUSB's own USB state, is_mounted,
     // the current geometry. Newer TinyUSB clamps this; clamp here as well so
     // the firmware is safe whichever TinyUSB it is built against.
-#if ATABOY_SAT
-    uint16_t host_bufsize = bufsize;    // sat.c checks it against the CBW
-#endif
+    uint16_t host_bufsize = bufsize;    // sat.c checks it against the CBW; READ LONG too
     if (bufsize > CFG_TUD_MSC_EP_BUFSIZE) bufsize = CFG_TUD_MSC_EP_BUFSIZE;
+    usb_sense_forget();                 // this command may set sense of its own
     uint8_t opcode = scsi_cmd[0];
     uint8_t *buf = (uint8_t *)buffer;
 
@@ -489,6 +595,16 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
         sat_sense_forget();
 #endif
         return read_buffer(lun, scsi_cmd, buf, bufsize);
+
+    case 0x3E:  // READ LONG(10) -> ATA READ LONG WITHOUT RETRIES
+    {
+        msc_busy_begin();
+        host_cmd_enter(false, false, 0);        // one callback, one command
+        int32_t r = read_long10(lun, scsi_cmd, buf, host_bufsize);
+        host_cmd_leave(0, r);
+        msc_busy_end();
+        return r;
+    }
 
 #if ATABOY_SAT
     case 0xA1:  // ATA PASS-THROUGH (12)

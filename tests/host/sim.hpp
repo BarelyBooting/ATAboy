@@ -44,6 +44,12 @@
 // 0.6f3p9: IDENTIFY answers word 49 (id_w49; bit 11 is IORDY supported).
 // 0.6f3p9: the flawed data offered with an ERR can differ per sector
 // (vary_flawed), and what was last offered is kept (offered).
+// 0.6f3p9: READ LONG (22h, 23h): one sector, 256 data words, then ecc_bytes
+// single transfers each carrying one ECC byte in bits 7:0 (bits 15:8 read
+// A5h here, so a host that keeps the wrong half is seen). The ECC is not
+// checked, so a sector that fails READ SECTORS reads here with good status;
+// long_err makes READ LONG itself end with ERR (and data, long_err_drq).
+// IDENTIFY answers word 22 (id_w22, ECC bytes on READ LONG).
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -131,6 +137,13 @@ struct SimDrive {
     uint16_t id_w49 = 0x0200;               // IDENTIFY word 49: LBA; bit 11 (IORDY) clear
     bool     vary_flawed = false;           // flawed data differs per sector, not DEADh
     std::vector<uint8_t> offered;           // the last flawed block offered with ERR
+    // READ LONG (0.6f3p9).
+    uint16_t id_w22 = 0;                    // IDENTIFY word 22 (0: not given)
+    int      ecc_bytes = 4;                 // ECC bytes this drive really transfers
+    uint8_t  long_err = 0;                  // READ LONG ends with ERR, this error register
+    bool     long_err_drq = false;          // ...offering the block (data and ECC) with it
+    int      long_bad_count = 0;            // READ LONG sent with a sector count other than 1
+    uint32_t long_lba = 0xFFFFFFFFu;        // the sector the last READ LONG named
     std::vector<uint8_t> cmd_log;           // every command byte, in order
     int      reg_writes = 0;                // any task file or Device Control write
     uint8_t idle_status() const { return (drdy_needs_idp && !geo_valid) ? 0x10 : 0x50; }
@@ -226,6 +239,9 @@ struct SimDrive {
     }
 
     static uint8_t flawed_at(uint32_t lba, int i) { return pattern(lba ^ 0x80000000u, i); }
+    bool is_long() const { return cmd == 0x22 || cmd == 0x23; }
+    int block_len() const { return is_long() ? 256 + ecc_bytes : 256; }
+    static uint8_t ecc_at(uint32_t lba, int i) { return pattern(lba ^ 0x5A5A5A5Au, 1000 + i); }
 
     // ---- register decode --------------------------------------------------
     uint32_t addr_lba() const {
@@ -320,6 +336,7 @@ struct SimDrive {
             char b = model[0] ? *model++ : ' ';
             xfer[27 + i] = (uint16_t)(((uint8_t)a << 8) | (uint8_t)b);
         }
+        xfer[22] = id_w22;                                  // ECC bytes on READ LONG
         xfer[49] = id_w49;                                  // LBA (bit 9), IORDY (bit 11)
         xfer[60] = (uint16_t)nsect; xfer[61] = (uint16_t)(nsect >> 16);
         xfer[82] = id_w82; xfer[83] = id_w83; xfer[84] = id_w84;
@@ -342,6 +359,14 @@ struct SimDrive {
         }
         if (cur == 0xFFFFFFFFu || cur >= nsect) { fail_here(0x10, false); return; } // IDNF
         attempts[cur]++;
+        if (is_long()) {                    // no ECC check: data as it is, unless told to fail
+            auto h = bad.find(cur);
+            if (h != bad.end() && h->second.mode == BAD_HANG) { phase = HUNG; status = 0x80; return; }
+            if (long_err) { fail_here(long_err, long_err_drq); more_after_drain = false; return; }
+            for (int i = 0; i < 256; i++) xfer[i] = byte_at(cur, 2 * i) | (byte_at(cur, 2 * i + 1) << 8);
+            widx = 0; phase = DRQ_IN; status = 0x58;
+            return;
+        }
         auto b = bad.find(cur);
         if (b != bad.end()) {
             Bad &bd = b->second;
@@ -441,6 +466,13 @@ struct SimDrive {
             left = reg[2] ? reg[2] : 256;
             cur = addr_lba();
             phase = BUSY_IN; status = 0x80; ready_at = now + sector_delay(cur);
+            break;
+        case 0x22: case 0x23:               // READ LONG: one sector
+            if (reg[2] != 1) long_bad_count++;
+            left = 1;
+            cur = addr_lba();
+            long_lba = cur;
+            phase = BUSY_IN; status = 0x80; ready_at = now + t_sector + (pause.count(cur) ? pause[cur] : 0);
             break;
         case 0x30: case 0x34:
             left = reg[2] ? reg[2] : 256;
@@ -597,8 +629,10 @@ struct SimDrive {
         data_reads++;
         if (cmd == 0xEC) id_data_reads++;
         if (phase == DRQ_IN || phase == ERR_DRQ) {
-            uint16_t w = xfer[widx++];
-            if (widx == 256) {
+            // READ LONG: the ECC bytes follow the data, one per transfer, bits 7:0.
+            uint16_t w = widx < 256 ? xfer[widx] : (uint16_t)(0xA500 | ecc_at(cur, widx - 256));
+            widx++;
+            if (widx == block_len()) {
                 if (phase == ERR_DRQ) {
                     phase = IDLE; status = more_after_drain ? 0x59 : 0x51;
                     if (more_after_drain) { phase = ERR_DRQ; widx = 0; }

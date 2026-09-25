@@ -994,6 +994,7 @@ static void menu_unmount(void) {
 #if ATABOY_SAT
     ide_id_words_forget();          // only SAT builds keep the words
 #endif
+    ide_read_long_forget();         // word 22 (READ LONG), kept in every build
 }
 
 // Y at the prompt: reboot into the RP2350 ROM bootloader (USB drive and

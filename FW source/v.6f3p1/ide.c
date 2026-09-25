@@ -47,6 +47,26 @@ bool ide_manual_chs_active(void) { return manual_chs_active; }
 
 void ide_select_device(uint8_t base) { dev_base = base; }
 
+// IDENTIFY word 22 for READ LONG (0.6f3p9, ide.h), in every build. Set only
+// by the firmware's own IDENTIFY (ide_identify: detection, auto-mount, the
+// debug screen), on core 1 while nothing is mounted; cleared by a probe, a
+// failed IDENTIFY, Ctrl+G and unmount, also on core 1. usb.c reads it on
+// core 0 only while mounted. Kept apart from the SAT words so that a build
+// with ATABOY_SAT=0 has it too.
+static struct {
+    bool     valid;
+    uint8_t  dev_base;          // the device it came from
+    uint16_t w22;
+} long_words;
+
+void ide_read_long_forget(void) { long_words.valid = false; }
+
+bool ide_read_long_word22(uint16_t *w22) {
+    if (!long_words.valid || long_words.dev_base != dev_base || manual_chs_active) return false;
+    *w22 = long_words.w22;
+    return true;
+}
+
 #if ATABOY_SAT
 // IDENTIFY words 82..85 and 87 kept for the SAT policy (ide.h, ide_id_words).
 // Who writes them, on which core:
@@ -468,6 +488,7 @@ uint8_t ide_probe_devices(void) {
 #if ATABOY_SAT
     id_words.valid = false;     // a new detection: nothing is known until IDENTIFY answers
 #endif
+    long_words.valid = false;   // likewise word 22 (READ LONG)
     recovery_forget();          // the probe's own reset supersedes any recovery still waiting
     iordy_hold();
 
@@ -609,6 +630,9 @@ bool ide_identify(uint16_t *buf) {
     bool ok = identify_once(buf);
     // A drive that answered IDENTIFY is no longer one set up without it.
     if (ok) manual_chs_active = false;
+    // Word 22 for READ LONG; a failed IDENTIFY forgets it, as below.
+    long_words.valid = ok;
+    if (ok) { long_words.dev_base = dev_base; long_words.w22 = buf[22]; }
 #if ATABOY_SAT
     // Keep what this drive says it supports, for the SAT policy. A failed
     // IDENTIFY forgets it: whatever answered before may not be this drive.
@@ -1079,6 +1103,7 @@ int ide_manual_chs(uint8_t heads, uint8_t spt, uint8_t *status) {
 #if ATABOY_SAT
     id_words.valid = false;         // this drive is never asked who it is
 #endif
+    long_words.valid = false;       // no word 22 either: no READ LONG
     recovery_forget();              // RESET- supersedes any recovery (none is pending: menus.c)
     iordy_hold();
     gpio_put(IDE_RESET, 0);
@@ -1492,6 +1517,173 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     record_failure(fail_kind, cmd, st, lba + s, s, count);
     soft_reset_restore();
     return -1;
+}
+
+// ---------------------------------------------------------------------------
+//  READ LONG WITHOUT RETRIES (0.6f3p9, ide.h)
+// ---------------------------------------------------------------------------
+// Sent only when the host asks for it with SCSI READ LONG(10) (usb.c), which
+// has checked that the drive's own IDENTIFY word 22 gives the ECC byte count,
+// that the geometry did not come from Ctrl+G, that the mount is not 48-bit
+// and that the sector is inside it. One sector (count 1), and never the form
+// with retries (22h): the point is to see a sector as the drive has it, not
+// to make the drive work harder at a bad one. The drive does not check the
+// ECC on READ LONG, so a sector that fails READ SECTORS with UNC normally
+// reads here with good status.
+//
+// How the ECC bytes come across. ATA-1 (X3.221-1994) says the ECC bytes of
+// READ LONG are transferred 8 bits wide, and ATA-3 (X3T13 2008D rev 7b) that
+// the vendor specific bytes are 16-bit transfers with the byte in bits 7:0.
+// Either way that is one read of the data register per byte, low byte valid,
+// and that is what this does: 256 word reads for the data, then `ecc` reads,
+// keeping bits 7:0 of each. Those readings are from memory of the standards,
+// not checked against their text for this change, and no drive has been
+// tried yet (FORK-README item 26). ATA asks for PIO mode 0 timing on these
+// bytes; mode 0 is the only timing this bus runs (ataboy.pio).
+//
+// Before each ECC byte, Alternate Status (no side effects) must show DRQ with
+// BSY clear, so a drive that has fewer bytes than word 22 says is never read
+// past the end of its data. One that has more is still offering data at the
+// end. Both are a bad end: recorded, and a drive still offering data is soft
+// reset, as the SAT path does, so nothing is left for the next command.
+// Everything else (the time budget, the recovery gate, the least time a
+// command is sent with, the ready and stale-data checks, the CHS geometry,
+// wall-clock waits, the failure record, reset on a timeout, no reset on ERR)
+// is as in ide_read_sectors_partial() for a read of one sector.
+#define IDE_LONG_END_MS 1000        // after the last byte, for BSY to drop (as SAT_END_TIMEOUT_MS)
+
+// Read `n` single transfers from the data register while the drive offers
+// them, keeping bits 7:0 of each in out (out may be null: discard). Returns
+// how many were read; fewer than n when DRQ went away (st: the status seen).
+static uint32_t read_long_ecc(uint8_t *out, uint32_t n, uint8_t *st) {
+    for (uint32_t i = 0; i < n; i++) {
+        *st = ide_read_alt_status();
+        if ((*st & 0x88) != 0x08) return i;             // BSY, or no DRQ: nothing more on offer
+        uint16_t w;
+        set_address(0);
+        xcvr_read();
+        sio_hw->gpio_clr = (1 << IDE_CS0);
+        ide_pio_read(1, &w);
+        sio_hw->gpio_set = (1 << IDE_CS0);
+        bus_idle();
+        if (out) out[i] = (uint8_t)(w & 0xFF);
+    }
+    return n;
+}
+
+int ide_read_long(uint32_t lba, uint8_t ecc, uint8_t *buf) {
+    uint8_t st = 0;
+    const uint8_t cmd = 0x23;                               // READ LONG WITHOUT RETRIES
+    if (ecc < 1 || ecc > IDE_LONG_ECC_MAX) return IDE_LONG_NOT_SENT;
+    if (config.use_lba_mode && config.lba_sectors > 0x0FFFFFFF) return IDE_LONG_NOT_SENT;   // no 48-bit form
+    if (!recovery_gate()) return IDE_LONG_NOT_SENT;
+    if (!time_to_send(lba, 1)) return IDE_LONG_NOT_SENT;
+    if (!ide_wait_until_ready(work_ms(5000))) {
+        record_failure(IDE_FAIL_NOT_READY, 0, ide_read_reg(7), lba, 0, 1);
+        return IDE_LONG_NOT_SENT;
+    }
+    st = ide_read_reg(7);
+    if (st & 0x08) {                                        // stale data, as for a read
+        record_failure(IDE_FAIL_STALE_DRQ, 0, st, lba, 0, 1);
+        soft_reset_restore();
+        return IDE_LONG_NOT_SENT;
+    }
+    if (!chs_geometry_ok()) {
+        record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, 1);
+        return IDE_LONG_NOT_SENT;
+    }
+    if (!time_to_send(lba, 1)) return IDE_LONG_NOT_SENT;
+
+    // The address exactly as ide_read_sectors_partial() sends one sector.
+    if (config.use_lba_mode) {
+        ide_write_reg(2, 1);
+        ide_write_reg(3, lba & 0xFF);
+        ide_write_reg(4, (lba >> 8) & 0xFF);
+        ide_write_reg(5, (lba >> 16) & 0xFF);
+        ide_write_reg(6, (dev_base | 0x40) | ((lba >> 24) & 0x0F));
+    } else {
+        uint32_t tmp  = lba / config.spt;
+        uint8_t  sec  = (lba % config.spt) + 1;             // 1-based
+        uint8_t  head = tmp % config.heads;
+        uint16_t cyl  = tmp / config.heads;
+        ide_write_reg(2, 1);
+        ide_write_reg(3, sec);
+        ide_write_reg(4, cyl & 0xFF);
+        ide_write_reg(5, (cyl >> 8) & 0xFF);
+        ide_write_reg(6, dev_base | (head & 0x0F));
+    }
+    ide_write_reg(7, cmd);
+    wait_after_command();
+    uint32_t start = ms_now();                              // as a read: the whole command,
+    uint32_t limit = work_ms(IDE_CMD_TIMEOUT_MS);           // or what the host command has left
+
+    for (;;) {
+        if (ms_passed(start, limit)) goto long_timeout;     // no DRQ in time
+        if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
+        st = ide_read_reg(7);
+        if (st & 0x80) { busy_wait_us_32(10); continue; }  // BSY: other bits not valid yet
+        if (st & 0x01) goto long_err;
+        if (st & 0x08) break;
+        busy_wait_us_32(10);
+    }
+
+    {
+        uint16_t words[256];
+        set_address(0);
+        xcvr_read();
+        sio_hw->gpio_clr = (1 << IDE_CS0);
+        ide_pio_read(256, words);
+        sio_hw->gpio_set = (1 << IDE_CS0);
+        bus_idle();
+        for (int i = 0; i < 256; i++) {
+            buf[2 * i]     = (uint8_t)(words[i] & 0xFF);
+            buf[2 * i + 1] = (uint8_t)(words[i] >> 8);
+        }
+    }
+    if (read_long_ecc(buf + 512, ecc, &st) < ecc) goto long_bad_end;   // fewer bytes than word 22
+
+    // The drive should now end the command: BSY and DRQ clear.
+    {
+        uint32_t end_start = ms_now();
+        uint32_t end_limit = recovery_ms(IDE_LONG_END_MS);
+        for (;;) {
+            st = ide_read_reg(7);
+            if (!(st & 0x80)) {
+                if (st & 0x08) goto long_bad_end;           // more bytes than word 22
+                if (st & 0x01) goto long_err;
+                return IDE_LONG_OK;
+            }
+            // Still busy: as a read leaves it, the next command waits for ready.
+            if (ms_passed(end_start, end_limit)) return IDE_LONG_OK;
+            busy_wait_us_32(10);
+        }
+    }
+
+long_err:
+    // ERR: the drive has ended the command, so no reset unless it is not idle
+    // after (as a read). Data offered with it is read and thrown away: the
+    // salvage capture is only for READ SECTORS (issue #13 path).
+    record_failure(IDE_FAIL_ERR, cmd, st, lba, 0, 1);
+    if (st & 0x08) {
+        ide_drain_sector();
+        (void)read_long_ecc(0, ecc, &st);
+        last_fail.drained = true;
+    }
+    if (!idle_after_error(2000)) soft_reset_restore();
+    return IDE_LONG_ERR;
+
+long_bad_end:
+    // The drive did not offer exactly 512 + word 22 bytes. A drive still
+    // offering data is reset (st has DRQ); one that stopped short and is idle
+    // needs nothing.
+    record_failure(IDE_FAIL_BAD_END, cmd, st, lba, 0, 1);
+    if ((st & 0x08) || !idle_after_error(2000)) soft_reset_restore();
+    return IDE_LONG_ABORTED;
+
+long_timeout:
+    record_failure(IDE_FAIL_TIMEOUT, cmd, st, lba, 0, 1);
+    soft_reset_restore();
+    return IDE_LONG_ABORTED;
 }
 
 // ---------------------------------------------------------------------------

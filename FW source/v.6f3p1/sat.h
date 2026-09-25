@@ -13,4 +13,9 @@ int32_t sat_scsi(uint8_t lun, uint8_t const cdb[16], void *buffer, uint16_t host
 // REQUEST SENSE can never pair that command's sense with SAT registers.
 void sat_sense_forget(void);
 
+// usb.c: add ILI and INFORMATION to TinyUSB's fixed sense when the sense
+// being reported is READ LONG's length refusal (0.6f3p9). The REQUEST SENSE
+// callback, which a SAT build has here in sat.c, calls it first.
+void usb_sense_ili_apply(uint8_t lun, uint8_t *b, uint16_t bufsize);
+
 #endif

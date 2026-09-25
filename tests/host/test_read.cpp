@@ -605,10 +605,9 @@ static std::vector<uint8_t> request_sense(uint8_t alloc) {
     static uint8_t b[CFG_TUD_MSC_EP_BUFSIZE];
     memset(b, 0, sizeof b);
     b[0] = 0xF0; b[2] = last_key & 0x0F; b[7] = 10; b[12] = last_asc; b[13] = last_ascq;
-    int32_t n = 18;
-#if ATABOY_SAT
-    n = tud_msc_request_sense_cb(0, b, (uint16_t)sizeof b);
-#endif
+    // Every build has the callback since 0.6f3p9 (usb.c without SAT: READ
+    // LONG's ILI; sat.c with it: that and the ATA Status Return descriptor).
+    int32_t n = tud_msc_request_sense_cb(0, b, (uint16_t)sizeof b);
     last_key = last_asc = last_ascq = 0;
     if (n > alloc) n = alloc;
     return std::vector<uint8_t>(b, b + (n < 0 ? 0 : n));
@@ -2917,6 +2916,327 @@ static void test_read_buffer_cdb() {
     CHECK(q.held(), "READ BUFFER touched the drive");
 }
 
+// ---------------------------------------------------------------------------
+//  0.6f3p9: READ LONG
+// ---------------------------------------------------------------------------
+
+static std::vector<uint8_t> rlong_cdb(uint32_t lba, uint32_t len, uint8_t b1 = 0) {
+    return { 0x3E, b1, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+             0, (uint8_t)(len >> 8), (uint8_t)len, 0 };
+}
+static uint32_t be32_at(const std::vector<uint8_t> &d, size_t o) {
+    return ((uint32_t)d[o] << 24) | (d[o + 1] << 16) | (d[o + 2] << 8) | d[o + 3];
+}
+// Fixed sense with ILI, VALID and INFORMATION as SBC has it for READ LONG.
+static bool sense_has_ili(const std::vector<uint8_t> &s, uint32_t info) {
+    return s.size() == 18 && (s[0] & 0x80) && (s[0] & 0x7F) == 0x70 && (s[2] & 0x20) &&
+           sense_is(s, 0x05, 0x24, 0x00) && be32_at(s, 3) == info;
+}
+static SatResult read_long_cmd(uint32_t lba, uint32_t len, uint8_t b1 = 0, uint32_t xfer = 0, bool autosense = true) {
+    return sat_cmd(rlong_cdb(lba, len, b1), xfer ? xfer : len, true, 18, autosense);
+}
+static void long_setup(const char *name, Mode m, uint16_t w22 = 4, int ecc = 4) {
+    setup(name, m);
+    sim.id_w22 = w22; sim.ecc_bytes = ecc;
+    uint16_t id[256];
+    CHECK(ide_identify(id) && id[22] == w22, "detection");  // as detection does, now with word 22
+    sim.srst = 0; sim.violations = 0; sim.data_reads = 0; sim.id_data_reads = 0;
+}
+static bool long_data_right(const SatResult &s, uint32_t lba, int ecc) {
+    if (s.r != 512 + ecc || s.data.size() != (size_t)(512 + ecc)) return false;
+    for (int i = 0; i < 512; i++) if (s.data[i] != sim.byte_at(lba, i)) return false;
+    for (int i = 0; i < ecc; i++) if (s.data[512 + i] != SimDrive::ecc_at(lba, i)) return false;
+    return true;
+}
+
+// D: READ LONG(10) reads one sector's data and ECC bytes with 23h, count 1,
+// addressed as READ(10) would address it.
+static void test_read_long_ok(Mode m) {
+    long_setup(m == LBA ? "READ LONG: data and ECC, LBA" : "READ LONG: data and ECC, CHS", m);
+    sim.busy_probe = [] { return usb_msc_ide_busy(); };     // core 1 stays off the bus meanwhile
+    const uint32_t lbas[] = { 0, 1, 16, 17, 169, 170, 5003, 99999, 166599 };
+    for (uint32_t lba : lbas) {
+        int reads = sim.data_reads, n = sim.commands;
+        SatResult s = read_long_cmd(lba, 516);
+        CHECK(long_data_right(s, lba, 4), "lba %u: r %d", lba, s.r);
+        CHECK(sim.commands == n + 1 && sim.cmd_log.back() == 0x23 && sim.long_lba == lba && sim.long_bad_count == 0,
+              "lba %u: %d commands, last %02X, drive read %u", lba, sim.commands - n, sim.cmd_log.back(), sim.long_lba);
+        CHECK(sim.data_reads == reads + 256 + 4, "lba %u: %d data reads", lba, sim.data_reads - reads);
+        CHECK(((sim.reg[6] & 0x40) != 0) == (m == LBA), "lba %u: device register %02X", lba, sim.reg[6]);
+    }
+    CHECK(sim.violations == 0 && sim.srst == 0, "violations %d srst %d", sim.violations, sim.srst);
+    CHECK(sim.cmds_while_not_busy == 0 && !usb_msc_ide_busy(), "%d commands with the busy flag clear", sim.cmds_while_not_busy);
+    sim.busy_probe = nullptr;
+    // The ECC is not checked on READ LONG: a sector READ(10) cannot read, reads.
+    sim.bad[5003] = {BAD_ERR, 0};
+    SatResult s = read_long_cmd(5003, 516);
+    CHECK(long_data_right(s, 5003, 4), "unreadable sector: r %d", s.r);
+    HostRead h = host_read10(5003, 1);
+    CHECK(!h.ok, "READ(10) of it worked");
+    sim.bad.clear();
+    // A READ(10) after it is fine: nothing left over.
+    h = host_read10(1000, 8);
+    CHECK(h.ok && matches_medium(h, 1000) && sim.violations == 0, "READ(10) after READ LONG");
+    // Word 22 at its ends.
+    long_setup("READ LONG: word 22 = 1", m, 1, 1);
+    CHECK(long_data_right(read_long_cmd(777, 513), 777, 1), "1 ECC byte");
+    long_setup("READ LONG: word 22 = 64", m, 64, 64);
+    CHECK(long_data_right(read_long_cmd(777, 576), 777, 64), "64 ECC bytes");
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+}
+
+// CHS: after a reset dropped the geometry, READ LONG sends it again first,
+// as a read does, and refuses if the drive will not take it.
+static void test_read_long_chs_geometry() {
+    long_setup("READ LONG: CHS geometry lost", CHS);
+    chs_geometry_lost = true; sim.geo_valid = false;
+    size_t n = sim.cmd_log.size();
+    SatResult s = read_long_cmd(4321, 516);
+    CHECK(long_data_right(s, 4321, 4) && sim.long_lba == 4321, "r %d, drive read %u", s.r, sim.long_lba);
+    CHECK(std::vector<uint8_t>(sim.cmd_log.begin() + (long)n, sim.cmd_log.end()) == (std::vector<uint8_t>{ 0x91, 0x23 }),
+          "not 91h then 23h: %zu commands", sim.cmd_log.size() - n);
+    chs_geometry_lost = true; sim.geo_valid = false; sim.reject_idp = true;
+    n = sim.cmd_log.size();
+    s = read_long_cmd(4321, 516);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x02, 0x04, 0x00) && f.kind == IDE_FAIL_NO_GEOMETRY,
+          "geometry refused: r %d record %u", s.r, f.kind);
+    CHECK(std::vector<uint8_t>(sim.cmd_log.begin() + (long)n, sim.cmd_log.end()) == std::vector<uint8_t>{ 0x91 },
+          "23h sent without a geometry");
+}
+
+// Every refusal is decided before anything reaches the drive.
+static void test_read_long_refused() {
+    long_setup("READ LONG: length must be 512 + word 22", LBA);
+    Quiet q;
+    const uint32_t lens[] = { 1, 511, 512, 515, 517, 520, 576, 1024, 65535 };
+    for (uint32_t len : lens) {
+        SatResult s = read_long_cmd(100, len, 0, 1024);
+        CHECK(s.r < 0 && s.data.empty() && sense_has_ili(s.sense, len - 516u), "length %u: r %d, info %08X",
+              len, s.r, s.sense.size() >= 7 ? be32_at(s.sense, 3) : 0);
+    }
+    // Zero: nothing to read, not an error (SBC).
+    SatResult z = read_long_cmd(100, 0, 0, 0);
+    CHECK(z.r == 0 && z.sense.empty(), "length 0: r %d", z.r);
+    // CORRCT (and PBLOCK): only uncorrected data is ever asked for.
+    SatResult c = read_long_cmd(100, 516, 0x02);
+    CHECK(c.r < 0 && sense_is(c.sense, 0x05, 0x24, 0x00) && no_ili(c.sense), "CORRCT: r %d", c.r);
+    c = read_long_cmd(100, 516, 0x04);
+    CHECK(c.r < 0 && sense_is(c.sense, 0x05, 0x24, 0x00), "PBLOCK: r %d", c.r);
+    // Past the end, as READ(10) refuses it.
+    uint32_t end = (uint32_t)config.lba_sectors;
+    const uint32_t outside[] = { end, end + 1, 0xFFFFFFFFu };
+    for (uint32_t lba : outside) {
+        SatResult s = read_long_cmd(lba, 516);
+        CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x21, 0x00), "lba %u: r %d", lba, s.r);
+    }
+    // The host's transfer length must hold the answer.
+    SatResult t = read_long_cmd(100, 516, 0, 515);
+    CHECK(t.r < 0 && sense_is(t.sense, 0x05, 0x24, 0x00) && no_ili(t.sense), "host length 515: r %d", t.r);
+    // Unmounted.
+    is_mounted = false;
+    SatResult u = read_long_cmd(100, 516);
+    CHECK(u.r < 0 && sense_is(u.sense, 0x02, 0x04, 0x00), "unmounted: r %d", u.r);
+    is_mounted = true;
+    CHECK(q.held(), "a refusal reached the drive");
+    CHECK(long_data_right(read_long_cmd(end - 1, 516), end - 1, 4), "the last sector");
+
+    // Word 22 not usable: 5/20/00.
+    struct { const char *name; uint16_t w22; } w[] = { { "word 22 = 0", 0 }, { "word 22 = 65", 65 }, { "word 22 = FFFFh", 0xFFFF } };
+    for (auto &e : w) {
+        long_setup(e.name, LBA, e.w22, e.w22 <= 64 ? e.w22 : 4);
+        Quiet q2;
+        for (uint32_t len : { 512u, 516u, 512u + e.w22 }) {
+            SatResult s = read_long_cmd(100, len & 0xFFFF);
+            CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x20, 0x00) && no_ili(s.sense), "%s, length %u: r %d", e.name, len, s.r);
+        }
+        CHECK(q2.held(), "%s: reached the drive", e.name);
+    }
+    long_setup("READ LONG: no IDENTIFY words", LBA);
+    Quiet q3;
+    ide_read_long_forget();                         // as unmount does
+    SatResult s = read_long_cmd(100, 516);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x20, 0x00), "forgotten: r %d", s.r);
+    CHECK(q3.held(), "reached the drive");
+    uint16_t id[256];
+    // A later IDENTIFY that fails forgets them too.
+    long_setup("READ LONG: IDENTIFY failed since", LBA);
+    sim.identify_ok = false;
+    CHECK(!ide_identify(id), "IDENTIFY answered");
+    Quiet q4;
+    s = read_long_cmd(100, 516);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x20, 0x00) && q4.held(), "after a failed IDENTIFY: r %d", s.r);
+    // Words from another device than the one in use.
+    long_setup("READ LONG: other device selected", LBA);
+    ide_select_device(0xB0);
+    Quiet q5;
+    s = read_long_cmd(100, 516);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x20, 0x00) && q5.held(), "other device: r %d", s.r);
+    ide_select_device(0xA0);
+    // A probe (Auto Detect) forgets them until its own IDENTIFY answers.
+    long_setup("READ LONG: after a probe with no IDENTIFY yet", LBA);
+    ide_probe_devices();
+    Quiet q7;
+    s = read_long_cmd(100, 516);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x20, 0x00) && q7.held(), "after the probe: r %d", s.r);
+    // A 48-bit mount: there is no 48-bit READ LONG.
+    long_setup("READ LONG: LBA48 mount", LBA);
+    config.lba_sectors = 0x10000000ull;
+    Quiet q6;
+    s = read_long_cmd(100, 516);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x20, 0x00) && q6.held(), "LBA48: r %d", s.r);
+    // ide.c does not rely on usb.c for these.
+    uint8_t lb[600];
+    CHECK(ide_read_long(100, 4, lb) == IDE_LONG_NOT_SENT && q6.held(), "ide.c: sent on an LBA48 mount");
+    config.lba_sectors = sim.nsect;
+    CHECK(ide_read_long(100, 0, lb) == IDE_LONG_NOT_SENT && ide_read_long(100, 65, lb) == IDE_LONG_NOT_SENT && q6.held(),
+          "ide.c: sent with 0 or 65 ECC bytes");
+    config.lba_sectors = 0x0FFFFFFFull;             // the largest 28-bit mount is fine
+    CHECK(long_data_right(read_long_cmd(100, 516), 100, 4), "28-bit mount of FFFFFFFh sectors");
+}
+
+// Ctrl+G: no IDENTIFY, so no READ LONG, 5/24/00, nothing sent; still refused
+// after words were held before it.
+static void test_read_long_manual_chs() {
+    long_setup("READ LONG: refused after Ctrl+G", CHS);
+    CHECK(long_data_right(read_long_cmd(100, 516), 100, 4), "before Ctrl+G");
+    is_mounted = false;
+    uint8_t st = 0;
+    CHECK(ide_manual_chs(10, 17, &st) == IDE_MCHS_OK && ide_manual_chs_active(), "Ctrl+G: st %02X", st);
+    is_mounted = true;
+    Quiet q;
+    for (uint32_t len : { 516u, 512u, 520u }) {
+        SatResult s = read_long_cmd(100, len);
+        CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x24, 0x00) && no_ili(s.sense), "length %u after Ctrl+G: r %d", len, s.r);
+    }
+    CHECK(q.held(), "reached the drive after Ctrl+G");
+    HostRead h = host_read10(100, 8);
+    CHECK(h.ok && matches_medium(h, 100), "READ(10) after Ctrl+G");
+}
+
+// What the drive can do wrong, and what the host is told.
+static void test_read_long_drive_errors() {
+    long_setup("READ LONG: ERR from the drive", LBA);
+    sim.vary_flawed = true;
+    ide_salvage_t before; ide_salvage_get(&before);
+    sim.long_err = 0x10;                            // IDNF, no data
+    SatResult s = read_long_cmd(2000, 516);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(s.r < 0 && s.data.empty() && sense_is(s.sense, 0x03, 0x11, 0x00), "ERR: r %d", s.r);
+    CHECK(f.kind == IDE_FAIL_ERR && f.command == 0x23 && f.lba == 2000 && f.count == 1 && f.done == 0 && f.error == 0x10 &&
+          !f.drained && !f.reset, "record kind %u cmd %02X lba %u err %02X", f.kind, f.command, f.lba, f.error);
+    CHECK(sim.srst == 0, "reset after ERR");
+    // ERR with the block on offer: read and thrown away, all of it.
+    sim.long_err = 0x01; sim.long_err_drq = true;   // AMNF
+    int reads = sim.data_reads;
+    s = read_long_cmd(2001, 516);
+    ide_last_failure(&f);
+    ide_salvage_t after; ide_salvage_get(&after);
+    CHECK(s.r < 0 && s.data.empty() && sense_is(s.sense, 0x03, 0x11, 0x00), "ERR+DRQ: r %d", s.r);
+    CHECK(f.kind == IDE_FAIL_ERR && f.drained && !f.salvaged && sim.data_reads == reads + 256 + 4,
+          "drained %d, %d data reads", f.drained, sim.data_reads - reads);
+    CHECK(memcmp(&before, &after, sizeof before) == 0, "READ LONG changed the salvage capture");
+    CHECK(sim.violations == 0 && sim.srst == 0, "violations %d srst %d", sim.violations, sim.srst);
+    sim.long_err = 0; sim.long_err_drq = false;
+    HostRead h = host_read10(2000, 8);
+    CHECK(h.ok && matches_medium(h, 2000), "READ(10) after");
+
+    // No data in time: reset, ABORTED COMMAND, inside the host's time.
+    long_setup("READ LONG: the drive hangs", LBA);
+    sim.bad[2002] = {BAD_HANG, 0};
+    s = read_long_cmd(2002, 516);
+    ide_last_failure(&f);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x0B, 0x00, 0x00), "hang: r %d", s.r);
+    CHECK(f.kind == IDE_FAIL_TIMEOUT && f.command == 0x23 && f.lba == 2002 && f.reset && sim.srst == 1,
+          "record kind %u reset %d srst %d", f.kind, f.reset, sim.srst);
+    keep_timing("READ LONG hangs, SRST works");
+    sim.bad.clear();
+    h = host_read10(2000, 8);
+    CHECK(h.ok && matches_medium(h, 2000), "READ(10) after the reset");
+
+    // More ECC bytes than word 22 says: the drive still offers data at the
+    // end. Recorded, reset, and nothing left for the next command.
+    long_setup("READ LONG: more ECC bytes than word 22", LBA, 4, 6);
+    s = read_long_cmd(2003, 516);
+    ide_last_failure(&f);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x0B, 0x00, 0x00), "more: r %d", s.r);
+    CHECK(f.kind == IDE_FAIL_BAD_END && f.command == 0x23 && sim.srst == 1 && sim.violations == 0,
+          "record kind %u srst %d violations %d", f.kind, sim.srst, sim.violations);
+    h = host_read10(2000, 8);
+    CHECK(h.ok && matches_medium(h, 2000), "READ(10) after");
+    // Fewer: never read past what the drive offers; it is idle, no reset.
+    long_setup("READ LONG: fewer ECC bytes than word 22", LBA, 4, 2);
+    reads = sim.data_reads;
+    s = read_long_cmd(2004, 516);
+    ide_last_failure(&f);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x0B, 0x00, 0x00), "fewer: r %d", s.r);
+    CHECK(f.kind == IDE_FAIL_BAD_END && sim.violations == 0 && sim.srst == 0 && sim.data_reads == reads + 256 + 2,
+          "record kind %u violations %d srst %d reads %d", f.kind, sim.violations, sim.srst, sim.data_reads - reads);
+    h = host_read10(2000, 8);
+    CHECK(h.ok && matches_medium(h, 2000), "READ(10) after");
+}
+
+// ILI and INFORMATION go with READ LONG's own refusal and nothing else. The
+// sense TinyUSB holds can change without a command of ours in between (it
+// fails some commands itself, and a USB reset clears it), so the pending ILI
+// is only added while the sense is still the one it was set with, and a new
+// command forgets it.
+static void test_read_long_ili_delivery() {
+    long_setup("READ LONG: ILI only on its own sense", LBA);
+    SatResult s = read_long_cmd(100, 520, 0, 1024, false);          // no REQUEST SENSE yet
+    CHECK(s.r < 0 && last_key == 0x05, "r %d", s.r);
+    tud_msc_set_sense(0, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);      // TinyUSB set its own sense
+    std::vector<uint8_t> sn = request_sense(18);
+    CHECK(sense_is(sn, 0x03, 0x11, 0x00) && no_ili(sn) && be32_at(sn, 3) == 0, "ILI on another sense");
+    // A USB reset clears TinyUSB's sense (no REQUEST SENSE); the next command
+    // that fails with the same key and code must not get the old ILI.
+    s = read_long_cmd(100, 520, 0, 1024, false);
+    last_key = last_asc = last_ascq = 0;                            // TinyUSB's sense gone with the reset
+    SatResult b = sat_cmd(rbuf_cdb(0x00), 544, true, 18);          // READ BUFFER, bad mode: 5/24/00
+    CHECK(b.r < 0 && sense_is(b.sense, 0x05, 0x24, 0x00) && no_ili(b.sense) && be32_at(b.sense, 3) == 0,
+          "READ BUFFER's refusal carried READ LONG's ILI");
+    // And delivered once only.
+    s = read_long_cmd(100, 508, 0, 1024, false);
+    sn = request_sense(18);
+    CHECK(sense_has_ili(sn, (uint32_t)-8), "first delivery: info %08X", sn.size() >= 7 ? be32_at(sn, 3) : 0);
+    tud_msc_set_sense(0, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
+    sn = request_sense(18);
+    CHECK(no_ili(sn), "delivered twice");
+}
+
+// A reset an earlier command left pending is carried on first; READ LONG is
+// not sent while the drive is not back (NOT READY), as a read is not.
+static void test_read_long_recovery_pending() {
+    long_setup("READ LONG: a reset still pending", LBA);
+    sim.t_reset = 28000000000ull;                   // back 28 s after SRST, inside its 31 s
+    sim.bad[5003] = {BAD_HANG, 0};
+    HostRead h = host_read10(5000, 8);
+    CHECK(!h.ok && rec.stage == REC_SRST, "stage %u", rec.stage);
+    sim.bad.clear();
+    int n = sim.cmd_count[0x23];
+    SatResult s = read_long_cmd(100, 516);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x02, 0x04, 0x00) && sim.cmd_count[0x23] == n, "pending: r %d", s.r);
+    mock_now_ns += 10000000000ull;
+    s = read_long_cmd(100, 516);
+    CHECK(long_data_right(s, 100, 4) && rec.stage == REC_NONE, "once back: r %d", s.r);
+
+    long_setup("READ LONG: the recovery ends without the drive", LBA);
+    sim.srst_wedges = true;
+    sim.t_hw_reset = (IDE_SRST_TIMEOUT_MS + 1000) * 1000000ull;
+    sim.bad[5003] = {BAD_HANG, 0};
+    h = host_read10(5000, 8);                       // SRST, still busy: pending
+    sim.bad.clear();
+    mock_now_ns = sim.srst_at + (IDE_SRST_TIMEOUT_MS - 1) * 1000000ull;
+    h = host_read10(5000, 8);                       // the SRST's 31 s over: RESET-, pending
+    CHECK(!h.ok && sim.hw_resets == 1 && rec.stage == REC_HW, "hw %d stage %u", sim.hw_resets, rec.stage);
+    mock_now_ns = ((uint64_t)rec.since + IDE_SRST_TIMEOUT_MS - 100) * 1000000ull;
+    n = sim.cmd_count[0x23];
+    s = read_long_cmd(100, 516);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x02, 0x04, 0x00) && sim.cmd_count[0x23] == n, "sent to a drive whose reset failed: r %d", s.r);
+    CHECK(!f.pending && f.reset_failed, "record: pending %d, reset failed %d", f.pending, f.reset_failed);
+}
+
 int main() {
     // The budget is a design number, not only what the helpers measure
     // against: 10 s under the 30 s that Linux and the project's tools give a
@@ -3011,6 +3331,15 @@ int main() {
     test_salvage_capture(CHS);
     test_salvage_lba48();
     test_read_buffer_cdb();
+    // 0.6f3p9: READ LONG
+    test_read_long_ok(LBA);
+    test_read_long_ok(CHS);
+    test_read_long_chs_geometry();
+    test_read_long_refused();
+    test_read_long_manual_chs();
+    test_read_long_drive_errors();
+    test_read_long_ili_delivery();
+    test_read_long_recovery_pending();
 #if ATABOY_SAT
     test_sat_smart_status(LBA);
     test_sat_smart_status(CHS);

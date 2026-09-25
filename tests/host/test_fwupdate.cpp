@@ -76,6 +76,9 @@ bool ide_manual_chs_active(void) { return false; }
 // 0.6f3p9: the salvage capture (Debug E).
 static ide_salvage_t stub_salvage;
 void ide_salvage_get(ide_salvage_t *out) { *out = stub_salvage; }
+// 0.6f3p9: READ LONG's word 22, forgotten at unmount.
+int mock_long_forgotten = 0;
+void ide_read_long_forget(void) { mock_long_forgotten++; }
 
 static int failures = 0, checks = 0;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; \
@@ -271,6 +274,11 @@ static void test_unmount_forgets_identify() {
 #else
     CHECK(mock_id_words_forgotten == 0, "SAT=0 keeps no IDENTIFY words, forgotten %d times", mock_id_words_forgotten);
 #endif
+    // 0.6f3p9: READ LONG's word 22 is kept in every build, and forgotten too.
+    mock_long_forgotten = 0;
+    is_mounted = true;
+    menu_unmount();
+    CHECK(mock_long_forgotten == 1, "word 22 forgotten %d times", mock_long_forgotten);
 }
 
 // ---- 6. review L-5 and L-1: core 1 and a running USB command ---------------

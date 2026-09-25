@@ -148,6 +148,32 @@ typedef struct {
 } ide_salvage_t;
 void    ide_salvage_get(ide_salvage_t *out);
 
+// ---------------------------------------------------------------------------
+//  READ LONG (0.6f3p9)
+// ---------------------------------------------------------------------------
+// IDENTIFY word 22 (ECC bytes on READ LONG) of the drive in use, from the
+// firmware's own IDENTIFY at detection. False when there is nothing to trust:
+// no IDENTIFY since power-up or since the last probe, the last one failed,
+// Ctrl+G (which never sends IDENTIFY) has run since, the drive was unmounted
+// (ide_read_long_forget), or another device is selected now. In every build.
+bool    ide_read_long_word22(uint16_t *w22);
+void    ide_read_long_forget(void);
+
+// READ LONG WITHOUT RETRIES (23h), one sector, addressed as a READ(10) of
+// that sector would be (LBA28, or CHS through the mounted geometry, with the
+// geometry sent again first if a reset dropped it). buf gets 512 data bytes
+// and then `ecc` ECC bytes. Same time budget, recovery, waits and failure
+// record as ide_read_sectors_partial(). Never used with LBA48 addressing
+// (there is no 48-bit READ LONG), and only with 1 <= ecc <= IDE_LONG_ECC_MAX.
+#define IDE_LONG_ECC_MAX    64
+#define IDE_LONG_OK         0
+#define IDE_LONG_NOT_SENT   1   // nothing sent: bad arguments, a reset still pending,
+                                // no time, not ready, stale data, no geometry
+#define IDE_LONG_ERR        2   // the drive ended it with ERR (recorded)
+#define IDE_LONG_ABORTED    3   // no data in time, or the drive offered more or fewer
+                                // bytes than word 22 says (recorded; reset if needed)
+int     ide_read_long(uint32_t lba, uint8_t ecc, uint8_t *buf);
+
 // A reset started for a USB command has not finished yet: the next USB
 // command carries on with it before anything else (ide.c, recovery).
 bool    ide_recovery_pending(void);

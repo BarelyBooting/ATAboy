@@ -106,6 +106,7 @@ static void sense_with_regs(uint8_t lun, uint8_t key, uint8_t asc, uint8_t ascq,
 int32_t tud_msc_request_sense_cb(uint8_t lun, void *buffer, uint16_t bufsize) {
     uint8_t *b = (uint8_t *)buffer;
     const int32_t fixed = (int32_t)sizeof(scsi_sense_fixed_resp_t);   // what TinyUSB just built
+    usb_sense_ili_apply(lun, b, bufsize);  // READ LONG's ILI (usb.c); never set with a descriptor
     if (!pending.valid) return fixed;
     // Only if the sense being reported is still ours. Anything that set sense
     // since (a failed READ(10), say) wins, and the descriptor is dropped.
