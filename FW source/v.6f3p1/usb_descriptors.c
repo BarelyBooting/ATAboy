@@ -1,4 +1,5 @@
 #include "tusb.h"
+#include "pico/unique_id.h"
 #include <string.h>
 
 #define USB_VID   0xCafe
@@ -59,12 +60,24 @@ char const *string_desc_arr[] = {
     (const char[]){0x09, 0x04},   // 0: English
     "Obsolete Tech",               // 1: Manufacturer
     "ATAboy",                      // 2: Product
-    "654321",                      // 3: Serial
+    "",                            // 3: Serial, this unit's own (usb_serial below)
     "ATAboy CDC",                  // 4: CDC Interface
     "ATAboy Storage",              // 5: MSC Interface
 };
 
 static uint16_t _desc_str[32];
+
+// The serial number (string 3). Upstream sent the constant "654321", so every
+// ATAboy looked like the same device, and a host with two of them attached
+// could mix up which disk or COM port was which. Since 0.6f3p9 it is the
+// RP2350's unique board id as 16 hex digits (pico_unique_id, read from the
+// chip at boot), different on every unit and the same across power cycles.
+static char usb_serial[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
+
+static const char *usb_serial_string(void) {
+    pico_get_unique_board_id_string(usb_serial, sizeof usb_serial);
+    return usb_serial;
+}
 
 uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     (void)langid;
@@ -75,7 +88,7 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
         chr_count = 1;
     } else {
         if (!(index < sizeof(string_desc_arr) / sizeof(string_desc_arr[0]))) return NULL;
-        const char *str = string_desc_arr[index];
+        const char *str = index == 3 ? usb_serial_string() : string_desc_arr[index];
         chr_count = strlen(str);
         if (chr_count > 31) chr_count = 31;
         for (uint8_t i = 0; i < chr_count; i++) _desc_str[1 + i] = str[i];

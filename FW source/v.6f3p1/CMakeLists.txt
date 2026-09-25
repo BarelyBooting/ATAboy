@@ -58,6 +58,7 @@ target_link_libraries(ATAboy
         pico_stdlib
         pico_bootrom
         pico_multicore
+        pico_unique_id
         hardware_flash
         hardware_sync
         hardware_pio
@@ -91,9 +92,9 @@ if(ATABOY_SAT AND ATABOY_SAT_SMART_SAVES)
     target_compile_definitions(ATAboy PRIVATE ATABOY_SAT_SMART_SAVES=1)
     # The opt-in build names itself, so picotool info tells it apart (review
     # L-2); the setup screen banner says so too (menus.c).
-    pico_set_program_version(ATAboy "0.6f3p8-palimpsest-smartsaves")
+    pico_set_program_version(ATAboy "0.6f3p9-palimpsest-smartsaves")
 else()
-    pico_set_program_version(ATAboy "0.6f3p8-palimpsest")
+    pico_set_program_version(ATAboy "0.6f3p9-palimpsest")
 endif()
 
 pico_add_extra_outputs(ATAboy)

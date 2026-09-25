@@ -227,9 +227,9 @@ static void print_help(const char *text) {
 // the unit for the shipping build (review L-2). That line is 11 characters
 // longer, so it starts further left to stay inside 80 columns.
 #if ATABOY_SAT && ATABOY_SAT_SMART_SAVES
-#define BANNER "\033[1;4H" FG_WHITE "ATAboy Setup Utility v0.6f3p8 (fork+smartsaves) - (C) 2026 obsoletetech.us"
+#define BANNER "\033[1;4H" FG_WHITE "ATAboy Setup Utility v0.6f3p9 (fork+smartsaves) - (C) 2026 obsoletetech.us"
 #else
-#define BANNER "\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p8 (fork) - (C) 2026 obsoletetech.us"
+#define BANNER "\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p9 (fork) - (C) 2026 obsoletetech.us"
 #endif
 
 static void draw_bios_frame(void) {

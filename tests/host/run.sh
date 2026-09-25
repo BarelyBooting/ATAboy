@@ -53,3 +53,9 @@ ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indenta
     -I "$here/mock" -I "$here" -I "$src" \
     -o "$out/test_manual_chs" "$here/test_manual_chs.cpp"
 "$out/test_manual_chs"
+# The USB serial number is the board's own (0.6f3p9): usb_descriptors.c with
+# a stand-in board id (see test_usb_desc.cpp).
+${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function $defs \
+    -I "$here/mock" -I "$here" -I "$src" \
+    -o "$out/test_usb_desc" "$here/test_usb_desc.cpp"
+"$out/test_usb_desc"

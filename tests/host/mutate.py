@@ -642,6 +642,16 @@ MUTANTS = [
     ('write proceeds with a recovery pending (review T19)', 'ide.c',
      '    if (!recovery_gate()) return -1;                       // as for a read (review M-1)',
      '    (void)recovery_gate();'),
+    # --- 0.6f3p9, A: the USB serial number is the board's own (test_usb_desc) ---
+    ('serial: the upstream constant again', 'usb_descriptors.c',
+     '        const char *str = index == 3 ? usb_serial_string() : string_desc_arr[index];',
+     '        const char *str = index == 3 ? "654321" : string_desc_arr[index];'),
+    ('serial: string 3 not replaced by the board id', 'usb_descriptors.c',
+     '        const char *str = index == 3 ? usb_serial_string() : string_desc_arr[index];',
+     '        const char *str = string_desc_arr[index];'),
+    ('serial: board id cut to half its digits', 'usb_descriptors.c',
+     '    pico_get_unique_board_id_string(usb_serial, sizeof usb_serial);',
+     '    pico_get_unique_board_id_string(usb_serial, PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1);'),
     # L-2: nothing through SAT to a drive set up by Ctrl+G.
     ('L-2: SAT not told about Ctrl+G', 'sat.c',
      '    in.manual_chs = ide_manual_chs_active();', '    in.manual_chs = false;'),
@@ -666,7 +676,8 @@ MUTANTS = [
 # twice each (with and without the SMART opt-in). This list said two programs
 # while run.sh ran three from 0a6cb06 on; a surviving mutant would then have
 # been reported as "not run" instead of SURVIVED (fixed in 0.6f3p7).
-PROGRAMS = ['test_read', 'test_read_shipping', 'test_fwupdate', 'test_fwupdate_smart', 'test_manual_chs']
+PROGRAMS = ['test_read', 'test_read_shipping', 'test_fwupdate', 'test_fwupdate_smart', 'test_manual_chs',
+            'test_usb_desc']
 
 
 def run_tests(srcdir, outdir):

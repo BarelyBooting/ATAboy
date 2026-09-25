@@ -396,11 +396,11 @@ static void test_banner() {
     tty.clear();
     draw_bios_frame();
 #if ATABOY_SAT && ATABOY_SAT_SMART_SAVES
-    CHECK(tty.find("\033[1;4H\033[37;1mATAboy Setup Utility v0.6f3p8 (fork+smartsaves) - (C) 2026 obsoletetech.us") != std::string::npos,
+    CHECK(tty.find("\033[1;4H\033[37;1mATAboy Setup Utility v0.6f3p9 (fork+smartsaves) - (C) 2026 obsoletetech.us") != std::string::npos,
           "SMART opt-in build: banner does not say so");
 #else
-    CHECK(tty.find("\033[1;10H\033[37;1mATAboy Setup Utility v0.6f3p8 (fork) - (C) 2026 obsoletetech.us") != std::string::npos,
-          "banner is not v0.6f3p8 (fork)");
+    CHECK(tty.find("\033[1;10H\033[37;1mATAboy Setup Utility v0.6f3p9 (fork) - (C) 2026 obsoletetech.us") != std::string::npos,
+          "banner is not v0.6f3p9 (fork)");
     CHECK(tty.find("smartsaves") == std::string::npos, "shipping build banner claims SMART saves");
 #endif
 }
