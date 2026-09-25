@@ -694,6 +694,75 @@ static void test_core1() {
     core1_entry();
 }
 
+// ---- 9. 0.6f3p9: the IORDY advisory --------------------------------------------
+// Auto Detect against the simulated drive, Esc out of the picker, then the
+// main and Features screens. The note shows only with IORDY on in Features
+// and IDENTIFY word 49 bit 11 clear; the commands sent are the same either way.
+static std::vector<uint8_t> iordy_detect(const char *name, bool iordy_on, uint16_t w49, bool *picker, bool *main_s, bool *feat) {
+    fresh(name);
+    sim.identify_ok = true;
+    sim.id_w49 = w49;
+    config.iordy_enabled = iordy_on;
+    keys("\x1b");
+    tty.clear();
+    run_auto_detect();
+    *picker = has(IORDY_NOTE);
+    tty.clear(); update_main_menu(); *main_s = has(IORDY_NOTE);
+    tty.clear(); update_features_menu(); *feat = has(IORDY_NOTE);
+    return sim.cmd_log;
+}
+
+static void test_iordy_note() {
+    struct { const char *name; bool on; uint16_t w49; bool want; } rows[] = {
+        { "IORDY on, word 49 = 0000h (pre-ATA-2)",    true,  0x0000, true },
+        { "IORDY on, word 49 = 0200h (LBA only)",     true,  0x0200, true },
+        { "IORDY on, word 49 bit 10 only",            true,  0x0600, true },
+        { "IORDY on, word 49 bit 11 (IORDY)",         true,  0x0800, false },
+        { "IORDY on, word 49 = 0F00h",                true,  0x0F00, false },
+        { "IORDY off, word 49 = 0000h",               false, 0x0000, false },
+        { "IORDY off, word 49 = 0A00h",               false, 0x0A00, false },
+    };
+    std::vector<uint8_t> first;
+    for (auto &r : rows) {
+        bool pk = false, mn = false, ft = false;
+        std::vector<uint8_t> log = iordy_detect(r.name, r.on, r.w49, &pk, &mn, &ft);
+        CHECK(pk == r.want && mn == r.want && ft == r.want, "picker %d main %d features %d, want %d", pk, mn, ft, r.want);
+        if (first.empty()) first = log;
+        CHECK(log == first && log == (std::vector<uint8_t>{ 0x10, 0xEC }), "commands differ: %zu", log.size());
+        CHECK(config.iordy_enabled == r.on, "the setting changed");
+    }
+    bool pk, mn, ft;
+    // Switched off in Features afterwards: gone at the next redraw.
+    iordy_detect("IORDY switched off after detection", true, 0x0000, &pk, &mn, &ft);
+    CHECK(mn, "not shown to begin with");
+    config.iordy_enabled = false;
+    tty.clear(); update_main_menu();
+    CHECK(!has(IORDY_NOTE), "still shown with IORDY off");
+    config.iordy_enabled = true;
+    tty.clear(); update_main_menu();
+    CHECK(has(IORDY_NOTE), "not shown again with IORDY on");
+    // Ctrl+G (no IDENTIFY): nothing is known about the drive's IORDY.
+    ctrl_g();
+    tty.clear(); update_main_menu();
+    CHECK(!has(IORDY_NOTE) && cur_cyls == C, "shown after Ctrl+G");
+    // A detection whose IDENTIFY fails forgets the last one's word 49.
+    iordy_detect("IDENTIFY fails at the next detection", true, 0x0000, &pk, &mn, &ft);
+    sim.identify_ok = false;
+    keys("\r");
+    run_auto_detect();
+    tty.clear(); update_main_menu();
+    CHECK(!has(IORDY_NOTE), "word 49 of the earlier detection kept");
+    // Auto Mount at power-up sends its own IDENTIFY: its word 49 counts.
+    fresh("auto-mount");
+    sim.identify_ok = true; sim.id_w49 = 0x0000;
+    config.iordy_enabled = true; config.auto_mount = true;
+    config.use_lba_mode = true; config.lba_sectors = sim.nsect;
+    try_auto_mount();
+    tty.clear(); update_main_menu();
+    CHECK(is_mounted && has(IORDY_NOTE), "auto-mount: mounted %d", is_mounted);
+    is_mounted = false;
+}
+
 int main() {
     ide_hw_init();                                  // the bus idle, as at power-up
     test_power_up();                                // first: the state as the program starts
@@ -712,6 +781,7 @@ int main() {
     test_mchs_iordy_held();
     test_mchs_flag();
     test_save_setup();
+    test_iordy_note();
     test_core1();                                   // does not return
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;

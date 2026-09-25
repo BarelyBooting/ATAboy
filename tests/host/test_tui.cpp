@@ -72,6 +72,17 @@ static void reset_state() {
     hdd_model_raw[0] = 0; hdd_status_text[0] = 0;
     cur_cyls = cur_heads = cur_spt = 0; total_lba_sectors = 0; use_lba_mode = false;
     show_detect_result = false; current_screen = SCREEN_MAIN;
+#ifdef IORDY_NOTE
+    id_w49_known = false; id_w49 = 0;
+#endif
+}
+
+// The IDENTIFY words the geometry picker reads: a 40 GB LBA drive.
+static uint16_t picker_id[256];
+static void picker_identify(uint16_t w49) {
+    memset(picker_id, 0, sizeof picker_id);
+    picker_id[1] = 16383; picker_id[3] = 16; picker_id[6] = 63; picker_id[49] = w49;
+    picker_id[60] = (uint16_t)80293248; picker_id[61] = (uint16_t)(80293248 >> 16);
 }
 
 int main(int argc, char **argv) {
@@ -135,6 +146,13 @@ int main(int argc, char **argv) {
     draw_bios_frame(); draw_debug_overlay(); run_debug_errors();
     save(dir, "debug-errors-failure");
 
+    // The geometry picker after Auto Detect, IORDY off (both builds).
+    reset_state();
+    strcpy(hdd_model_raw, "Maxtor 2F040L0");
+    picker_identify(0x0200);
+    draw_bios_frame(); update_main_menu(); draw_selection_menu(picker_id, 2);
+    save(dir, "picker");
+
 #ifdef IDE_MCHS_OK
     // 0.6f3p8: manual CHS with no IDENTIFY (Ctrl+G). Only the new build has
     // these; tui_compare.py lists them as new and checks them for cells in
@@ -173,6 +191,40 @@ int main(int argc, char **argv) {
         draw_bios_frame(); draw_debug_overlay(); run_debug_errors();
         save(dir, "debug-errors-mchs");
     }
+#endif
+#ifdef IORDY_NOTE
+    // 0.6f3p9: IORDY on, and a drive whose IDENTIFY word 49 does not have
+    // bit 11 (IORDY supported). New in this build: the note on the picker,
+    // the main screen and the Features screen.
+    reset_state();
+    strcpy(hdd_model_raw, "Maxtor 2F040L0");
+    config.iordy_enabled = true;
+    picker_identify(0x0200);
+    draw_bios_frame(); update_main_menu(); draw_selection_menu(picker_id, 2);
+    save(dir, "picker-iordy-note");
+    reset_state();
+    strcpy(hdd_model_raw, "WDC AC280"); cur_cyls = 980; cur_heads = 10; cur_spt = 17;
+    config.iordy_enabled = true; id_w49_known = true; id_w49 = 0x0000;
+    draw_bios_frame(); update_main_menu();
+    save(dir, "main-iordy-note");
+    reset_state();
+    strcpy(hdd_model_raw, "WDC AC280"); cur_cyls = 980; cur_heads = 10; cur_spt = 17;
+    config.iordy_enabled = true; id_w49_known = true; id_w49 = 0x0000;
+    current_screen = SCREEN_FEATURES; config.feat_selected = 2;
+    draw_bios_frame(); update_features_menu();
+    save(dir, "features-iordy-note");
+    // ...and not shown: the drive declares IORDY (bit 11), or IORDY is off.
+    reset_state();
+    strcpy(hdd_model_raw, "WDC AC280"); cur_cyls = 980; cur_heads = 10; cur_spt = 17;
+    config.iordy_enabled = true; id_w49_known = true; id_w49 = 0x0A00;
+    draw_bios_frame(); update_main_menu();
+    save(dir, "main-iordy-declared");
+    reset_state();
+    strcpy(hdd_model_raw, "Maxtor 2F040L0");
+    config.iordy_enabled = true;
+    picker_identify(0x0A00);
+    draw_bios_frame(); update_main_menu(); draw_selection_menu(picker_id, 2);
+    save(dir, "picker-iordy-declared");
 #endif
 #ifdef SAVE_REFUSED_MCHS
     // F10 with Auto Mount on and a Ctrl+G geometry: not saved (review of

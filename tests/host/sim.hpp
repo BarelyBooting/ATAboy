@@ -41,6 +41,7 @@
 // Review of 0.6f3p8: a drive older than LBA takes no notice of the LBA bit
 // in the device register and reads the address registers as CHS
 // (lba_ignored), so an LBA address names some other sector, with good status.
+// 0.6f3p9: IDENTIFY answers word 49 (id_w49; bit 11 is IORDY supported).
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -125,6 +126,7 @@ struct SimDrive {
     bool     drdy_needs_idp = false;        // DRDY only once 0x91 has set a geometry
     bool     abort_recal = false;           // RECALIBRATE (0x10) ends at once with ABRT
     bool     lba_ignored = false;           // the LBA bit means nothing: every address is CHS
+    uint16_t id_w49 = 0x0200;               // IDENTIFY word 49: LBA; bit 11 (IORDY) clear
     std::vector<uint8_t> cmd_log;           // every command byte, in order
     int      reg_writes = 0;                // any task file or Device Control write
     uint8_t idle_status() const { return (drdy_needs_idp && !geo_valid) ? 0x10 : 0x50; }
@@ -309,7 +311,7 @@ struct SimDrive {
             char b = model[0] ? *model++ : ' ';
             xfer[27 + i] = (uint16_t)(((uint8_t)a << 8) | (uint8_t)b);
         }
-        xfer[49] = 0x0200;                                  // LBA
+        xfer[49] = id_w49;                                  // LBA (bit 9), IORDY (bit 11)
         xfer[60] = (uint16_t)nsect; xfer[61] = (uint16_t)(nsect >> 16);
         xfer[82] = id_w82; xfer[83] = id_w83; xfer[84] = id_w84;
         xfer[85] = id_w85; xfer[87] = id_w87;

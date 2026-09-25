@@ -108,6 +108,12 @@ static bool show_detect_result = false;
 static bool force_detect = false;
 static int  confirm_type = 0;
 
+// IDENTIFY word 49 of the drive Auto Detect or auto-mount last identified
+// (0.6f3p9, IORDY advisory below). Auto Detect forgets it when it starts,
+// and Ctrl+G, which never sends IDENTIFY, forgets it too.
+static bool     id_w49_known = false;
+static uint16_t id_w49 = 0;
+
 #define RESET       "\033[0m"
 #define BG_BLUE     "\033[44m"
 #define FG_WHITE    "\033[37;1m"
@@ -181,6 +187,32 @@ static void get_large_geometry(uint16_t n_cyl, uint8_t n_hd, uint8_t n_spt,
     while (heads < 255 && (total / heads) > 65535) heads++;
     *l_hd = heads;
     *l_cyl = (uint16_t)(total / heads);
+}
+
+// ---------------------------------------------------------------------------
+//  IORDY advisory (0.6f3p9)
+// ---------------------------------------------------------------------------
+// IDENTIFY word 49 bit 11 set means the drive says it supports IORDY. With
+// IORDY switched on in Features and a drive whose IDENTIFY does not say so,
+// one line says so: on the geometry picker, and on the main and Features
+// screens while that drive is the one detected. Display only: the setting is
+// not changed, and nothing is sent to the drive for it. A drive older than
+// ATA-2 has 0000h in word 49, so the line says the drive does not declare
+// IORDY, not that it cannot do it.
+#define IORDY_NOTE      "IORDY on; drive does not declare IORDY"
+#define IORDY_NOTE_LEN  38          // strlen(IORDY_NOTE): the left panel's width, cols 2 to 39
+#define IORDY_NOTE_ROW  16
+
+static bool iordy_note_due(bool known, uint16_t w49) {
+    return known && config.iordy_enabled && !(w49 & 0x0800);
+}
+
+// The note at (col, row) in yellow, or the same cells blank in the frame's
+// colours, so a redraw after IORDY is switched off clears it.
+static void draw_iordy_note(int col, int row) {
+    cdc_printf("\033[%d;%dH", row, col);
+    if (iordy_note_due(id_w49_known, id_w49)) cdc_puts(FG_YELLOW IORDY_NOTE RESET BG_BLUE FG_WHITE);
+    else cdc_printf(BG_BLUE FG_WHITE "%*s", IORDY_NOTE_LEN, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +395,7 @@ static void update_main_menu(void) {
     cdc_puts(is_mounted ? "\033[20;3H F10: Save Current Setup to EEPROM               Enter: Select"
                         : "\033[20;3H F10: Save Current Setup to EEPROM  Ctrl+F: Firmware Update  Enter: Select");
 
+    draw_iordy_note(2, IORDY_NOTE_ROW);
     draw_hdd_status();
 }
 
@@ -405,6 +438,7 @@ static void update_features_menu(void) {
                BOX_ARRU " " BOX_ARRD ": Select Item");
     cdc_puts("\033[20;3H F10: Save Current Setup to EEPROM               Enter: Select");
 
+    draw_iordy_note(2, IORDY_NOTE_ROW);
     draw_hdd_status();
 }
 
@@ -606,7 +640,10 @@ static void draw_selection_menu_ex(uint16_t *id, int selected_idx, bool force_mo
     cdc_puts(BOX_MLD); emit_n(BOX_HH, 62); cdc_puts(BOX_MRD);
 
     cdc_printf("\033[%d;%dH" BOX_VH "  " BOX_ARRU " " BOX_ARRD ": Mode    TAB: Change CHS     Enter: Select    Esc: Quit " BOX_VH, start_row+11, start_col);
-    cdc_printf("\033[%d;%dH" BOX_VH "  \033[33m   LBA Recommended for modern drives; NORMAL for legacy.    \033[0m" SEL_RED BOX_VH, start_row+12, start_col);
+    if (iordy_note_due(true, id[49]))     // 12 + 38 + 12: the 62 columns inside
+        cdc_printf("\033[%d;%dH" BOX_VH "            \033[33m" IORDY_NOTE "\033[0m" SEL_RED "            " BOX_VH, start_row+12, start_col);
+    else
+        cdc_printf("\033[%d;%dH" BOX_VH "  \033[33m   LBA Recommended for modern drives; NORMAL for legacy.    \033[0m" SEL_RED BOX_VH, start_row+12, start_col);
 
     // Row 13: bottom
     cdc_printf("\033[%d;%dH", start_row+13, start_col);
@@ -910,6 +947,7 @@ static void try_auto_mount(void) {
 
     uint16_t id_buf[256];
     if (!ide_identify(id_buf)) return;
+    id_w49 = id_buf[49]; id_w49_known = true;   // IORDY advisory
 
     // Fill model string for display
     for (int i = 0; i < 20; i++) {
@@ -1001,11 +1039,13 @@ static bool run_auto_detect(void) {
     // The EEPROM is not touched; F10 still saves only what is set.
     cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;
     sync_to_config();
+    id_w49_known = false;           // IORDY advisory: only this detection's IDENTIFY counts
     if (found) {
         ide_select_device(found);
         config.dev_base = found;
         if (ide_identify(id_buf)) detected = true;
     }
+    if (detected) { id_w49 = id_buf[49]; id_w49_known = true; }
     if (!detected) ide_select_device(config.dev_base);
     if (detected) {
             for (int i = 0; i < 20; i++) {
@@ -1203,6 +1243,7 @@ static bool run_manual_chs(void) {
     // it has left pending, stops it here too.
     if (!bus_free_wait(false) || mchs_pending_refused()) return false;
     draw_manual_chs(fields, -1, "Resetting the drive, then 10h and 91h. Up to a minute.", false);
+    id_w49_known = false;           // no IDENTIFY: nothing to say about IORDY
     uint8_t st = 0;
     int r = ide_manual_chs((uint8_t)v[1], (uint8_t)v[2], &st);
     if (r == IDE_MCHS_OK) {
