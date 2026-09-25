@@ -49,7 +49,11 @@
 // A5h here, so a host that keeps the wrong half is seen). The ECC is not
 // checked, so a sector that fails READ SECTORS reads here with good status;
 // long_err makes READ LONG itself end with ERR (and data, long_err_drq).
-// IDENTIFY answers word 22 (id_w22, ECC bytes on READ LONG).
+// IDENTIFY answers word 22 (id_w22). As ATA-3 has it (2.1.7, 7.7.12), the
+// drive sends 4 vendor specific bytes whatever word 22 says, since nobody
+// sends it SET FEATURES; ecc_bytes is only for a drive that deviates. Review
+// of 0.6f3p9: a drive can answer READ LONG with ABRT (long_unsupported), and
+// DRQ can stay up a while after the last byte (drq_linger).
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -139,7 +143,11 @@ struct SimDrive {
     std::vector<uint8_t> offered;           // the last flawed block offered with ERR
     // READ LONG (0.6f3p9).
     uint16_t id_w22 = 0;                    // IDENTIFY word 22 (0: not given)
-    int      ecc_bytes = 4;                 // ECC bytes this drive really transfers
+    int      ecc_bytes = 4;                 // vendor specific bytes it sends (ATA-3 default 4)
+    bool     long_unsupported = false;      // READ LONG answered at once with ABRT
+    uint64_t drq_linger = 0;                // DRQ stays this long (ns) after the last byte
+    uint64_t linger_until = 0;
+    bool     lingering = false;
     uint8_t  long_err = 0;                  // READ LONG ends with ERR, this error register
     bool     long_err_drq = false;          // ...offering the block (data and ECC) with it
     int      long_bad_count = 0;            // READ LONG sent with a sector count other than 1
@@ -275,6 +283,7 @@ struct SimDrive {
 
     // advance the state machine to 'now'
     void tick(uint64_t now) {
+        if (lingering && now >= linger_until) { lingering = false; if (phase == IDLE && status == 0x58) status = 0x50; }
         if (phase == IN_RESET) {
             if (!(devctl & 0x04) && !reset_low && !wedged && now >= ready_at) {
                 geo_valid = false;              // SRST drops INITIALIZE DEVICE PARAMETERS
@@ -468,6 +477,7 @@ struct SimDrive {
             phase = BUSY_IN; status = 0x80; ready_at = now + sector_delay(cur);
             break;
         case 0x22: case 0x23:               // READ LONG: one sector
+            if (long_unsupported) { abort_cmd(); break; }
             if (reg[2] != 1) long_bad_count++;
             left = 1;
             cur = addr_lba();
@@ -641,6 +651,7 @@ struct SimDrive {
                     if (left == 0) {
                         phase = IDLE; status = (df_cmd && cmd == df_cmd) ? 0x70 : 0x50;
                         if (busy_after.count(cur - 1)) { status = 0x80; ready_at = now + busy_after[cur - 1]; }
+                        if (is_long() && drq_linger) { status = 0x58; lingering = true; linger_until = now + drq_linger; }
                     }
                     else { phase = BUSY_IN; status = 0x80; ready_at = now + sector_delay(cur); }
                 }

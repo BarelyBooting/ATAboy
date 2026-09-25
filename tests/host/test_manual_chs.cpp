@@ -752,6 +752,19 @@ static void test_iordy_note() {
     run_auto_detect();
     tty.clear(); update_main_menu();
     CHECK(!has(IORDY_NOTE), "word 49 of the earlier detection kept");
+    // The F: Force picker has no IDENTIFY, only zeros: no line (review of
+    // 0.6f3p9, LOW-4). The same word 49 from a real IDENTIFY does show it.
+    // (Heads and sectors are not zero here: the picker divides by the heads
+    // in get_large_geometry, which traps on a PC. On the RP2350 a division by
+    // zero gives 0, so the F: Force picker's all-zero words do not trap.)
+    uint16_t zeros[256];
+    memset(zeros, 0, sizeof zeros);
+    zeros[1] = 1045; zeros[3] = 2; zeros[6] = 40;
+    config.iordy_enabled = true;
+    tty.clear(); draw_selection_menu_ex(zeros, 3, true);
+    CHECK(!has(IORDY_NOTE), "shown on the F: Force picker");
+    tty.clear(); draw_selection_menu_ex(zeros, 3, false);
+    CHECK(has(IORDY_NOTE), "not shown for a real IDENTIFY with word 49 = 0");
     // Auto Mount at power-up sends its own IDENTIFY: its word 49 counts.
     fresh("auto-mount");
     sim.identify_ok = true; sim.id_w49 = 0x0000;

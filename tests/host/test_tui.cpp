@@ -61,7 +61,7 @@ bool ide_manual_chs_active(void) { return true; }
 static ide_salvage_t stub_salvage;
 void ide_salvage_get(ide_salvage_t *out) { *out = stub_salvage; }
 #endif
-#ifdef IDE_LONG_ECC_MAX     // 0.6f3p9: READ LONG's word 22, forgotten at unmount
+#ifdef IDE_LONG_ECC_BYTES   // 0.6f3p9: READ LONG's word 22, forgotten at unmount
 void ide_read_long_forget(void) {}
 #endif
 

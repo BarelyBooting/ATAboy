@@ -467,28 +467,48 @@ static int32_t read_buffer(uint8_t lun, uint8_t const cdb[16], uint8_t *buf, uin
 //  READ LONG(10) -> ATA READ LONG WITHOUT RETRIES (0.6f3p9)
 // ---------------------------------------------------------------------------
 // CDB 3Eh: byte 1 bit 1 CORRCT, bit 2 PBLOCK; bytes 2-5 LBA; bytes 7-8 BYTE
-// TRANSFER LENGTH (both big-endian). One sector: its 512 bytes, then the ECC
-// bytes the drive's IDENTIFY word 22 counts (ide.c, ide_read_long). Checked in
-// this order, and nothing is sent to the drive for any refusal:
+// TRANSFER LENGTH (both big-endian). One sector: its 512 bytes, then the 4
+// vendor specific (ECC) bytes a drive sends without SET FEATURES (ide.h,
+// IDE_LONG_ECC_BYTES; ATA-3 sections 2.1.7, 7.7.12, 7.16). IDENTIFY word 22
+// does not set the length: it counts the bytes a drive would send after a
+// SET FEATURES this firmware never sends. Checked in this order, and nothing
+// is sent to the drive for any refusal:
 //   not mounted                              NOT READY 2/04/00
 //   CORRCT or PBLOCK set                     ILLEGAL REQUEST 5/24/00 (only
 //                                            uncorrected data is ever asked for)
 //   geometry from Ctrl+G (no IDENTIFY)       ILLEGAL REQUEST 5/24/00
-//   no IDENTIFY word 22, or it is not 1..64  ILLEGAL REQUEST 5/20/00 (the drive
-//                                            does not say it has READ LONG)
-//   48-bit mount (no 48-bit READ LONG)       ILLEGAL REQUEST 5/20/00
+//   no IDENTIFY from detection, or a 48-bit  ILLEGAL REQUEST 5/20/00
+//     mount (no 48-bit READ LONG)
 //   BYTE TRANSFER LENGTH 0                   GOOD, no data (SBC: not an error)
-//   BYTE TRANSFER LENGTH not 512 + word 22   ILLEGAL REQUEST 5/24/00 with ILI,
-//                                            INFORMATION = requested - actual
-//   host transfer length under 512 + word 22 ILLEGAL REQUEST 5/24/00
+//   not a data-in CBW                        ILLEGAL REQUEST 5/24/00
+//   BYTE TRANSFER LENGTH not 516             ILLEGAL REQUEST 5/24/00 with ILI,
+//                                            INFORMATION = requested - 516
+//   host transfer length under 516           ILLEGAL REQUEST 5/24/00
 //   LBA at or past the end of the mount      ILLEGAL REQUEST 5/21/00 (as READ(10))
 // Then the drive:
-//   the data and ECC bytes                   GOOD, 512 + word 22 bytes
-//   ERR from the drive                       MEDIUM ERROR 3/11/00 (as READ(10))
+//   the data and ECC bytes                   GOOD, 516 bytes
+//   ERR with ABRT alone (not supported)      ILLEGAL REQUEST 5/20/00
+//   any other ERR (UNC, IDNF, AMNF, ...)     MEDIUM ERROR 3/11/00 (as READ(10))
 //   not sent (a reset still pending, no      NOT READY 2/04/00 (as SAT)
 //     time, not ready, no geometry)
-//   no data in time, or not exactly 512 +    ABORTED COMMAND 0B/00/00 (as SAT)
-//     word 22 bytes on offer
+//   no data in time, or not exactly 516      ABORTED COMMAND 0B/00/00 (as SAT)
+//     bytes on offer
+
+// Is the CBW TinyUSB received into this buffer still there, for this command,
+// data-in? On the data-in path TinyUSB 0.18 has not written to the buffer
+// since (sat.c has the details); on the data-out path it holds the host's
+// data instead, and READ LONG must not go to the drive for a command whose
+// data would never reach the host (review of 0.6f3p9, LOW-1). The same checks
+// as sat_cbw_parse() (sat_policy.c), which a build with ATABOY_SAT=0 lacks:
+// signature, LUN, all 16 CB bytes, the length, and direction exactly 80h. The
+// same limit too: a data-out payload that copies a valid data-in CBW passes.
+static bool cbw_is_data_in(const uint8_t *img, uint8_t lun, uint8_t const cdb[16], uint16_t host_bufsize) {
+    if (img[0] != 0x55 || img[1] != 0x53 || img[2] != 0x42 || img[3] != 0x43) return false;
+    uint32_t len = (uint32_t)img[8] | ((uint32_t)img[9] << 8) | ((uint32_t)img[10] << 16) | ((uint32_t)img[11] << 24);
+    if (img[13] != lun || memcmp(img + 15, cdb, 16) != 0) return false;
+    if ((uint16_t)len != host_bufsize) return false;
+    return img[12] == 0x80;
+}
 static int32_t read_long10(uint8_t lun, uint8_t const cdb[16], uint8_t *buf, uint16_t host_bufsize) {
 #if ATABOY_SAT
     sat_sense_forget();
@@ -496,24 +516,29 @@ static int32_t read_long10(uint8_t lun, uint8_t const cdb[16], uint8_t *buf, uin
     if (!is_mounted) { tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x04, 0x00); return -1; }
     if (cdb[1] & 0x06) { tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00); return -1; }
     if (ide_manual_chs_active()) { tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00); return -1; }
-    uint16_t w22 = 0;
-    if (!ide_read_long_word22(&w22) || w22 < 1 || w22 > IDE_LONG_ECC_MAX ||
+    uint16_t w22 = 0;               // held only to show the drive answered IDENTIFY
+    if (!ide_read_long_word22(&w22) ||
         (config.use_lba_mode && config.lba_sectors > 0x0FFFFFFF)) {
         tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
         return -1;
     }
     uint32_t lba = ((uint32_t)cdb[2] << 24) | ((uint32_t)cdb[3] << 16) | ((uint32_t)cdb[4] << 8) | cdb[5];
     uint32_t len = ((uint32_t)cdb[7] << 8) | cdb[8];
-    uint32_t want = 512u + w22;
+    uint32_t want = 512u + IDE_LONG_ECC_BYTES;
     if (len == 0) return 0;
+    if (!cbw_is_data_in(buf, lun, cdb, host_bufsize)) {
+        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
+        return -1;
+    }
     if (len != want) {
         sense_ili_set(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00, len - want);   // two's complement if short
         return -1;
     }
     if (host_bufsize < want) { tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00); return -1; }
     if ((uint64_t)lba >= total_sectors()) { tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x21, 0x00); return -1; }
-    switch (ide_read_long(lba, (uint8_t)w22, buf)) {
+    switch (ide_read_long(lba, buf)) {
     case IDE_LONG_OK:       return (int32_t)want;
+    case IDE_LONG_ABRT:     tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00); return -1;
     case IDE_LONG_ERR:      tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00); return -1;
     case IDE_LONG_NOT_SENT: tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x04, 0x00); return -1;
     default:                tud_msc_set_sense(lun, SCSI_SENSE_ABORTED_COMMAND, 0x00, 0x00); return -1;

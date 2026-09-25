@@ -2977,12 +2977,17 @@ static void test_read_long_ok(Mode m) {
     // A READ(10) after it is fine: nothing left over.
     h = host_read10(1000, 8);
     CHECK(h.ok && matches_medium(h, 1000) && sim.violations == 0, "READ(10) after READ LONG");
-    // Word 22 at its ends.
-    long_setup("READ LONG: word 22 = 1", m, 1, 1);
-    CHECK(long_data_right(read_long_cmd(777, 513), 777, 1), "1 ECC byte");
-    long_setup("READ LONG: word 22 = 64", m, 64, 64);
-    CHECK(long_data_right(read_long_cmd(777, 576), 777, 64), "64 ECC bytes");
-    CHECK(sim.violations == 0, "violations %d", sim.violations);
+    // Word 22 does not set the length (review of 0.6f3p9, M-1): with no SET
+    // FEATURES a drive sends 4 vendor specific bytes whatever it says there
+    // (ATA-3 2.1.7, 7.7.12). The Maxtor 2F040L0 says 57, the WDAC280 4.
+    const uint16_t words22[] = { 57, 4, 0, 1, 64, 65, 0xFFFF };
+    for (uint16_t w22 : words22) {
+        long_setup("READ LONG: 516 bytes whatever word 22 says", m, w22, 4);
+        CHECK(long_data_right(read_long_cmd(777, 516), 777, 4) && sim.violations == 0 && sim.srst == 0,
+              "word 22 = %u: not 516 good bytes", w22);
+        SatResult x = read_long_cmd(777, 512 + w22 == 516 ? 520 : (512 + w22) & 0xFFFF, 0, 1024);
+        CHECK(x.r < 0 && x.data.empty(), "word 22 = %u: 512 + word 22 accepted", w22);
+    }
 }
 
 // CHS: after a reset dropped the geometry, READ LONG sends it again first,
@@ -3007,7 +3012,7 @@ static void test_read_long_chs_geometry() {
 
 // Every refusal is decided before anything reaches the drive.
 static void test_read_long_refused() {
-    long_setup("READ LONG: length must be 512 + word 22", LBA);
+    long_setup("READ LONG: length must be 516", LBA);
     Quiet q;
     const uint32_t lens[] = { 1, 511, 512, 515, 517, 520, 576, 1024, 65535 };
     for (uint32_t len : lens) {
@@ -3041,16 +3046,33 @@ static void test_read_long_refused() {
     CHECK(q.held(), "a refusal reached the drive");
     CHECK(long_data_right(read_long_cmd(end - 1, 516), end - 1, 4), "the last sector");
 
-    // Word 22 not usable: 5/20/00.
-    struct { const char *name; uint16_t w22; } w[] = { { "word 22 = 0", 0 }, { "word 22 = 65", 65 }, { "word 22 = FFFFh", 0xFFFF } };
-    for (auto &e : w) {
-        long_setup(e.name, LBA, e.w22, e.w22 <= 64 ? e.w22 : 4);
-        Quiet q2;
-        for (uint32_t len : { 512u, 516u, 512u + e.w22 }) {
-            SatResult s = read_long_cmd(100, len & 0xFFFF);
-            CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x20, 0x00) && no_ili(s.sense), "%s, length %u: r %d", e.name, len, s.r);
-        }
-        CHECK(q2.held(), "%s: reached the drive", e.name);
+    // Word 22 of 57: 512 + 57 is refused with the INFORMATION a tool needs to
+    // find 516 (requested - 516 = 53).
+    long_setup("READ LONG: word 22 = 57, 569 asked for", LBA, 57, 4);
+    Quiet q2;
+    SatResult w57 = read_long_cmd(100, 569, 0, 1024);
+    CHECK(w57.r < 0 && sense_has_ili(w57.sense, 53) && q2.held(), "569: r %d", w57.r);
+    // Not a data-in CBW (review of 0.6f3p9, LOW-1): the data would never reach
+    // the host, so the drive gets nothing.
+    SatResult o = sat_cmd(rlong_cdb(100, 516), 516, false, 18);
+    CHECK(o.r < 0 && sense_is(o.sense, 0x05, 0x24, 0x00) && no_ili(o.sense) && q2.held(), "data-out CBW: r %d", o.r);
+    o = sat_cmd(rlong_cdb(100, 569), 1024, false, 18);
+    CHECK(o.r < 0 && sense_is(o.sense, 0x05, 0x24, 0x00) && q2.held(), "data-out CBW, wrong length: r %d", o.r);
+    // A data-in CBW image in the buffer that is not this command's: its
+    // length is not the one TinyUSB passed (a data-out payload carrying a
+    // copy of another CBW, say). Nothing sent.
+    {
+        uint8_t cb[16] = {0};
+        std::vector<uint8_t> cdb = rlong_cdb(100, 516);
+        memcpy(cb, cdb.data(), cdb.size());
+        memset(ep, 0, sizeof ep);
+        const uint8_t cbw[15] = { 0x55, 0x53, 0x42, 0x43, 1, 2, 3, 4, 0x00, 0x04, 0x00, 0x00, 0x80, 0x00, 10 };
+        memcpy(ep, cbw, 15);
+        memcpy(ep + 15, cb, 16);
+        int32_t r = tud_msc_scsi_cb(0, cb, ep, 516);   // the CBW image says 1024
+        tud_msc_scsi_complete_cb(0, cb);
+        std::vector<uint8_t> sn = request_sense(18);
+        CHECK(r < 0 && sense_is(sn, 0x05, 0x24, 0x00) && q2.held(), "CBW of another length: r %d", r);
     }
     long_setup("READ LONG: no IDENTIFY words", LBA);
     Quiet q3;
@@ -3087,10 +3109,7 @@ static void test_read_long_refused() {
     CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x20, 0x00) && q6.held(), "LBA48: r %d", s.r);
     // ide.c does not rely on usb.c for these.
     uint8_t lb[600];
-    CHECK(ide_read_long(100, 4, lb) == IDE_LONG_NOT_SENT && q6.held(), "ide.c: sent on an LBA48 mount");
-    config.lba_sectors = sim.nsect;
-    CHECK(ide_read_long(100, 0, lb) == IDE_LONG_NOT_SENT && ide_read_long(100, 65, lb) == IDE_LONG_NOT_SENT && q6.held(),
-          "ide.c: sent with 0 or 65 ECC bytes");
+    CHECK(ide_read_long(100, lb) == IDE_LONG_NOT_SENT && q6.held(), "ide.c: sent on an LBA48 mount");
     config.lba_sectors = 0x0FFFFFFFull;             // the largest 28-bit mount is fine
     CHECK(long_data_right(read_long_cmd(100, 516), 100, 4), "28-bit mount of FFFFFFFh sectors");
 }
@@ -3154,26 +3173,71 @@ static void test_read_long_drive_errors() {
     h = host_read10(2000, 8);
     CHECK(h.ok && matches_medium(h, 2000), "READ(10) after the reset");
 
-    // More ECC bytes than word 22 says: the drive still offers data at the
-    // end. Recorded, reset, and nothing left for the next command.
-    long_setup("READ LONG: more ECC bytes than word 22", LBA, 4, 6);
-    s = read_long_cmd(2003, 516);
-    ide_last_failure(&f);
-    CHECK(s.r < 0 && sense_is(s.sense, 0x0B, 0x00, 0x00), "more: r %d", s.r);
-    CHECK(f.kind == IDE_FAIL_BAD_END && f.command == 0x23 && sim.srst == 1 && sim.violations == 0,
-          "record kind %u srst %d violations %d", f.kind, sim.srst, sim.violations);
-    h = host_read10(2000, 8);
-    CHECK(h.ok && matches_medium(h, 2000), "READ(10) after");
+    // A drive that sends more than 4 vendor specific bytes (5, or all 57 its
+    // word 22 names, as if SET FEATURES had been sent): still offering data
+    // at the end. Recorded, reset, and nothing left for the next command.
+    const struct { uint16_t w22; int ecc; } more[] = { { 4, 5 }, { 57, 57 }, { 4, 6 } };
+    for (auto &e : more) {
+        long_setup("READ LONG: a drive that sends more than 4", LBA, e.w22, e.ecc);
+        uint64_t t0 = mock_now_ns;
+        s = read_long_cmd(2003, 516);
+        CHECK(mock_now_ns - t0 < 50000000ull, "%d bytes: the bad end took %llu ms", e.ecc,
+              (unsigned long long)((mock_now_ns - t0) / 1000000));
+        ide_last_failure(&f);
+        CHECK(s.r < 0 && s.data.empty() && sense_is(s.sense, 0x0B, 0x00, 0x00), "%d bytes: r %d", e.ecc, s.r);
+        CHECK(f.kind == IDE_FAIL_BAD_END && f.command == 0x23 && sim.srst == 1 && sim.violations == 0,
+              "%d bytes: record kind %u srst %d violations %d", e.ecc, f.kind, sim.srst, sim.violations);
+        h = host_read10(2000, 8);
+        CHECK(h.ok && matches_medium(h, 2000), "%d bytes: READ(10) after", e.ecc);
+    }
     // Fewer: never read past what the drive offers; it is idle, no reset.
-    long_setup("READ LONG: fewer ECC bytes than word 22", LBA, 4, 2);
-    reads = sim.data_reads;
-    s = read_long_cmd(2004, 516);
+    const int fewer[] = { 3, 2, 0 };
+    for (int ecc : fewer) {
+        long_setup("READ LONG: a drive that sends fewer than 4", LBA, 4, ecc);
+        reads = sim.data_reads;
+        s = read_long_cmd(2004, 516);
+        ide_last_failure(&f);
+        CHECK(s.r < 0 && s.data.empty() && sense_is(s.sense, 0x0B, 0x00, 0x00), "%d bytes: r %d", ecc, s.r);
+        CHECK(f.kind == IDE_FAIL_BAD_END && sim.violations == 0 && sim.srst == 0 && sim.data_reads == reads + 256 + ecc,
+              "%d bytes: record kind %u violations %d srst %d reads %d", ecc, f.kind, sim.violations, sim.srst,
+              sim.data_reads - reads);
+        h = host_read10(2000, 8);
+        CHECK(h.ok && matches_medium(h, 2000), "%d bytes: READ(10) after", ecc);
+    }
+
+    // ABRT alone: the drive does not support READ LONG (ATA-3 7.16): 5/20/00,
+    // not a medium error (review of 0.6f3p9, LOW-2). Recorded as ever.
+    long_setup("READ LONG: not supported (ABRT)", LBA);
+    sim.long_unsupported = true;
+    s = read_long_cmd(2005, 516);
     ide_last_failure(&f);
-    CHECK(s.r < 0 && sense_is(s.sense, 0x0B, 0x00, 0x00), "fewer: r %d", s.r);
-    CHECK(f.kind == IDE_FAIL_BAD_END && sim.violations == 0 && sim.srst == 0 && sim.data_reads == reads + 256 + 2,
-          "record kind %u violations %d srst %d reads %d", f.kind, sim.violations, sim.srst, sim.data_reads - reads);
-    h = host_read10(2000, 8);
-    CHECK(h.ok && matches_medium(h, 2000), "READ(10) after");
+    CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x20, 0x00), "ABRT at once: r %d", s.r);
+    CHECK(f.kind == IDE_FAIL_ERR && f.command == 0x23 && f.error == 0x04 && sim.srst == 0, "record kind %u err %02X", f.kind, f.error);
+    sim.long_unsupported = false;
+    sim.long_err = 0x04;                            // ABRT after BSY
+    s = read_long_cmd(2005, 516);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x05, 0x20, 0x00), "ABRT after BSY: r %d", s.r);
+    // ABRT with another error bit is a read error, as are the others.
+    const uint8_t media[] = { 0x14, 0x40, 0x10, 0x01, 0x44 };
+    for (uint8_t e : media) {
+        sim.long_err = e;
+        s = read_long_cmd(2005, 516);
+        CHECK(s.r < 0 && sense_is(s.sense, 0x03, 0x11, 0x00), "error %02X: r %d", e, s.r);
+    }
+    sim.long_err = 0;
+
+    // DRQ a moment late to drop after the last byte (review of 0.6f3p9,
+    // LOW-3): within the settle it is a good end; past it, a bad end.
+    long_setup("READ LONG: DRQ drops 500 us after the last byte", LBA);
+    sim.drq_linger = 500000;
+    s = read_long_cmd(2006, 516);
+    CHECK(long_data_right(s, 2006, 4) && sim.srst == 0 && sim.violations == 0, "500 us: r %d srst %d", s.r, sim.srst);
+    long_setup("READ LONG: DRQ drops 3 ms after the last byte", LBA);
+    sim.drq_linger = 3000000;
+    s = read_long_cmd(2006, 516);
+    ide_last_failure(&f);
+    CHECK(s.r < 0 && sense_is(s.sense, 0x0B, 0x00, 0x00) && f.kind == IDE_FAIL_BAD_END && sim.srst == 1,
+          "3 ms: r %d kind %u srst %d", s.r, f.kind, sim.srst);
 }
 
 // ILI and INFORMATION go with READ LONG's own refusal and nothing else. The

@@ -640,7 +640,9 @@ static void draw_selection_menu_ex(uint16_t *id, int selected_idx, bool force_mo
     cdc_puts(BOX_MLD); emit_n(BOX_HH, 62); cdc_puts(BOX_MRD);
 
     cdc_printf("\033[%d;%dH" BOX_VH "  " BOX_ARRU " " BOX_ARRD ": Mode    TAB: Change CHS     Enter: Select    Esc: Quit " BOX_VH, start_row+11, start_col);
-    if (iordy_note_due(true, id[49]))     // 12 + 38 + 12: the 62 columns inside
+    // Only for a real IDENTIFY: the F: Force picker passes zeros (review of
+    // 0.6f3p9, LOW-4).
+    if (iordy_note_due(!force_mode, id[49]))  // 12 + 38 + 12: the 62 columns inside
         cdc_printf("\033[%d;%dH" BOX_VH "            \033[33m" IORDY_NOTE "\033[0m" SEL_RED "            " BOX_VH, start_row+12, start_col);
     else
         cdc_printf("\033[%d;%dH" BOX_VH "  \033[33m   LBA Recommended for modern drives; NORMAL for legacy.    \033[0m" SEL_RED BOX_VH, start_row+12, start_col);
@@ -741,7 +743,9 @@ static void run_debug_identify(void) {
     }
     debug_print(14, FG_YELLOW, "[Advanced]");
     debug_print(15, FG_WHITE, "DMA Support: %04X  PIO Support: %04X", id[49], id[64]);
-    debug_print(16, FG_WHITE, "ATA Major Ver: %04X", id[80]);
+    // Word 22: vendor specific bytes a drive sends on READ LONG after a SET
+    // FEATURES; without one it sends 4 (ATA-3 2.1.7, 7.7.12). Shown only.
+    debug_print(16, FG_WHITE, "ATA Major Ver: %04X  Word 22 (READ LONG): %u", id[80], id[22]);
 }
 
 static void run_debug_taskfile(void) {

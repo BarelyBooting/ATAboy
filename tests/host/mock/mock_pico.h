@@ -12,6 +12,7 @@ extern uint64_t mock_now_ns;
 typedef uint64_t absolute_time_t;
 static inline absolute_time_t get_absolute_time(void) { return mock_now_ns / 1000; }
 static inline uint32_t to_ms_since_boot(absolute_time_t t) { return (uint32_t)(t / 1000); }
+static inline uint64_t to_us_since_boot(absolute_time_t t) { return t; }
 static inline void busy_wait_us_32(uint32_t us) { mock_now_ns += (uint64_t)us * 1000; }
 static inline void busy_wait_at_least_cycles(uint32_t c) { mock_now_ns += c * 7ull; }  // ~150 MHz
 static inline void sleep_ms(uint32_t ms) { mock_now_ns += (uint64_t)ms * 1000000; }

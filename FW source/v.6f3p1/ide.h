@@ -151,28 +151,39 @@ void    ide_salvage_get(ide_salvage_t *out);
 // ---------------------------------------------------------------------------
 //  READ LONG (0.6f3p9)
 // ---------------------------------------------------------------------------
-// IDENTIFY word 22 (ECC bytes on READ LONG) of the drive in use, from the
-// firmware's own IDENTIFY at detection. False when there is nothing to trust:
-// no IDENTIFY since power-up or since the last probe, the last one failed,
-// Ctrl+G (which never sends IDENTIFY) has run since, the drive was unmounted
+// IDENTIFY word 22 of the drive in use, from the firmware's own IDENTIFY at
+// detection. False when there is nothing to trust: no IDENTIFY since
+// power-up or since the last probe, the last one failed, Ctrl+G (which never
+// sends IDENTIFY) has run since, the drive was unmounted
 // (ide_read_long_forget), or another device is selected now. In every build.
+// READ LONG is only allowed while this is true (a drive that answered
+// IDENTIFY); the value itself is advisory and does not set the length (below).
 bool    ide_read_long_word22(uint16_t *w22);
 void    ide_read_long_forget(void);
 
 // READ LONG WITHOUT RETRIES (23h), one sector, addressed as a READ(10) of
 // that sector would be (LBA28, or CHS through the mounted geometry, with the
 // geometry sent again first if a reset dropped it). buf gets 512 data bytes
-// and then `ecc` ECC bytes. Same time budget, recovery, waits and failure
-// record as ide_read_sectors_partial(). Never used with LBA48 addressing
-// (there is no 48-bit READ LONG), and only with 1 <= ecc <= IDE_LONG_ECC_MAX.
-#define IDE_LONG_ECC_MAX    64
+// and then IDE_LONG_ECC_BYTES vendor specific (ECC) bytes. Same time budget,
+// recovery, waits and failure record as ide_read_sectors_partial(). Never
+// used with LBA48 addressing (there is no 48-bit READ LONG).
+//
+// Why 4, whatever word 22 says (review of 0.6f3p9, M-1). ATA-3 (X3T13/2008D
+// rev 7b) section 2.1.7: the default number of vendor specific bytes on READ
+// LONG is four. Sections 7.7.12 and 7.16: a drive sends 512 plus word 22 only
+// after a SET FEATURES that switches it to that length. This firmware never
+// sends SET FEATURES, so the drive sends 512 plus 4. A drive that sends some
+// other number anyway is caught as a bad end (IDE_LONG_ABORTED).
+#define IDE_LONG_ECC_BYTES  4
 #define IDE_LONG_OK         0
-#define IDE_LONG_NOT_SENT   1   // nothing sent: bad arguments, a reset still pending,
-                                // no time, not ready, stale data, no geometry
+#define IDE_LONG_NOT_SENT   1   // nothing sent: a reset still pending, no time,
+                                // not ready, stale data, no geometry, LBA48 mount
 #define IDE_LONG_ERR        2   // the drive ended it with ERR (recorded)
 #define IDE_LONG_ABORTED    3   // no data in time, or the drive offered more or fewer
-                                // bytes than word 22 says (recorded; reset if needed)
-int     ide_read_long(uint32_t lba, uint8_t ecc, uint8_t *buf);
+                                // than 4 vendor specific bytes (recorded; reset if needed)
+#define IDE_LONG_ABRT       4   // ERR with ABRT and no other error bit: ATA-3 section
+                                // 7.16, the drive does not support READ LONG (recorded)
+int     ide_read_long(uint32_t lba, uint8_t *buf);
 
 // A reset started for a USB command has not finished yet: the next USB
 // command carries on with it before anything else (ide.c, recovery).

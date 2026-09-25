@@ -1523,34 +1523,40 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
 //  READ LONG WITHOUT RETRIES (0.6f3p9, ide.h)
 // ---------------------------------------------------------------------------
 // Sent only when the host asks for it with SCSI READ LONG(10) (usb.c), which
-// has checked that the drive's own IDENTIFY word 22 gives the ECC byte count,
-// that the geometry did not come from Ctrl+G, that the mount is not 48-bit
-// and that the sector is inside it. One sector (count 1), and never the form
-// with retries (22h): the point is to see a sector as the drive has it, not
-// to make the drive work harder at a bad one. The drive does not check the
-// ECC on READ LONG, so a sector that fails READ SECTORS with UNC normally
-// reads here with good status.
+// has checked that the drive answered the firmware's own IDENTIFY, that the
+// geometry did not come from Ctrl+G, that the mount is not 48-bit, that the
+// CBW is data-in and that the sector is inside the mount. One sector (count
+// 1), and never the form with retries (22h): the point is to see a sector as
+// the drive has it, not to make the drive work harder at a bad one. The
+// drive does not check the ECC on READ LONG, so a sector that fails READ
+// SECTORS with UNC normally reads here with good status.
 //
-// How the ECC bytes come across. ATA-1 (X3.221-1994) says the ECC bytes of
-// READ LONG are transferred 8 bits wide, and ATA-3 (X3T13 2008D rev 7b) that
-// the vendor specific bytes are 16-bit transfers with the byte in bits 7:0.
-// Either way that is one read of the data register per byte, low byte valid,
-// and that is what this does: 256 word reads for the data, then `ecc` reads,
-// keeping bits 7:0 of each. Those readings are from memory of the standards,
-// not checked against their text for this change, and no drive has been
-// tried yet (FORK-README item 26). ATA asks for PIO mode 0 timing on these
-// bytes; mode 0 is the only timing this bus runs (ataboy.pio).
+// What comes across, from ATA-3 (X3T13/2008D rev 7b; quotes in palimpsest
+// docs/research/ATA3-READ-LONG-2026-09-24.md): section 7.16, "The transfer
+// of the vendor specific bytes shall be 16 bit transfers with the vendor
+// specific byte in bits 7 through 0", so 256 word reads for the data, then
+// one read per vendor specific byte keeping bits 7:0; how many is 4, the
+// default of section 2.1.7, since no SET FEATURES is ever sent (ide.h,
+// IDE_LONG_ECC_BYTES). Section 7.16 also asks for PIO mode 0, which is the
+// only timing this bus runs (ataboy.pio: 400 ns DIOR-, 700 ns cycle).
 //
-// Before each ECC byte, Alternate Status (no side effects) must show DRQ with
-// BSY clear, so a drive that has fewer bytes than word 22 says is never read
+// Before each vendor specific byte, Alternate Status (no side effects) must
+// show DRQ with BSY clear, so a drive that has fewer than 4 is never read
 // past the end of its data. One that has more is still offering data at the
-// end. Both are a bad end: recorded, and a drive still offering data is soft
-// reset, as the SAT path does, so nothing is left for the next command.
+// end; it gets up to IDE_LONG_SETTLE_US for DRQ to drop first (review of
+// 0.6f3p9, LOW-3: DRQ need not fall the instant the last byte is read).
+// Either way it is a bad end: recorded, and a drive still offering data is
+// soft reset, as the SAT path does, so nothing is left for the next command.
+// ERR with ABRT alone means the drive does not support READ LONG (section
+// 7.16) and is reported apart from a read error (IDE_LONG_ABRT).
 // Everything else (the time budget, the recovery gate, the least time a
 // command is sent with, the ready and stale-data checks, the CHS geometry,
 // wall-clock waits, the failure record, reset on a timeout, no reset on ERR)
 // is as in ide_read_sectors_partial() for a read of one sector.
 #define IDE_LONG_END_MS 1000        // after the last byte, for BSY to drop (as SAT_END_TIMEOUT_MS)
+#define IDE_LONG_SETTLE_US 1000     // after the last byte, for DRQ to drop
+
+static uint64_t us_now(void) { return to_us_since_boot(get_absolute_time()); }
 
 // Read `n` single transfers from the data register while the drive offers
 // them, keeping bits 7:0 of each in out (out may be null: discard). Returns
@@ -1571,10 +1577,10 @@ static uint32_t read_long_ecc(uint8_t *out, uint32_t n, uint8_t *st) {
     return n;
 }
 
-int ide_read_long(uint32_t lba, uint8_t ecc, uint8_t *buf) {
+int ide_read_long(uint32_t lba, uint8_t *buf) {
     uint8_t st = 0;
     const uint8_t cmd = 0x23;                               // READ LONG WITHOUT RETRIES
-    if (ecc < 1 || ecc > IDE_LONG_ECC_MAX) return IDE_LONG_NOT_SENT;
+    const uint32_t ecc = IDE_LONG_ECC_BYTES;
     if (config.use_lba_mode && config.lba_sectors > 0x0FFFFFFF) return IDE_LONG_NOT_SENT;   // no 48-bit form
     if (!recovery_gate()) return IDE_LONG_NOT_SENT;
     if (!time_to_send(lba, 1)) return IDE_LONG_NOT_SENT;
@@ -1640,7 +1646,7 @@ int ide_read_long(uint32_t lba, uint8_t ecc, uint8_t *buf) {
             buf[2 * i + 1] = (uint8_t)(words[i] >> 8);
         }
     }
-    if (read_long_ecc(buf + 512, ecc, &st) < ecc) goto long_bad_end;   // fewer bytes than word 22
+    if (read_long_ecc(buf + 512, ecc, &st) < ecc) goto long_bad_end;   // fewer than 4
 
     // The drive should now end the command: BSY and DRQ clear.
     {
@@ -1649,11 +1655,24 @@ int ide_read_long(uint32_t lba, uint8_t ecc, uint8_t *buf) {
         for (;;) {
             st = ide_read_reg(7);
             if (!(st & 0x80)) {
-                if (st & 0x08) goto long_bad_end;           // more bytes than word 22
-                if (st & 0x01) goto long_err;
-                return IDE_LONG_OK;
+                if (st & 0x08) {
+                    // DRQ still up: let it settle, polling Alternate Status,
+                    // before taking it as more than 4 bytes on offer.
+                    uint64_t t0 = us_now();
+                    while ((st & 0x88) == 0x08 && us_now() - t0 < IDE_LONG_SETTLE_US) {
+                        busy_wait_us_32(10);
+                        st = ide_read_alt_status();
+                    }
+                    if ((st & 0x88) == 0x08) goto long_bad_end;     // more than 4
+                    // Dropped: read Status again, below, within the same limit.
+                } else {
+                    if (st & 0x01) goto long_err;
+                    return IDE_LONG_OK;
+                }
             }
-            // Still busy: as a read leaves it, the next command waits for ready.
+            // Still busy: as a read leaves it, the next command waits for ready
+            // (and its stale-data check resets a drive that then offers more).
+            // Bounded however DRQ comes and goes.
             if (ms_passed(end_start, end_limit)) return IDE_LONG_OK;
             busy_wait_us_32(10);
         }
@@ -1670,12 +1689,13 @@ long_err:
         last_fail.drained = true;
     }
     if (!idle_after_error(2000)) soft_reset_restore();
-    return IDE_LONG_ERR;
+    // ABRT and nothing else: the command is not supported (ATA-3 7.16).
+    return last_fail.error == 0x04 ? IDE_LONG_ABRT : IDE_LONG_ERR;
 
 long_bad_end:
-    // The drive did not offer exactly 512 + word 22 bytes. A drive still
-    // offering data is reset (st has DRQ); one that stopped short and is idle
-    // needs nothing.
+    // The drive did not offer exactly 512 + 4 bytes. A drive still offering
+    // data is reset (st has DRQ); one that stopped short and is idle needs
+    // nothing.
     record_failure(IDE_FAIL_BAD_END, cmd, st, lba, 0, 1);
     if ((st & 0x08) || !idle_after_error(2000)) soft_reset_restore();
     return IDE_LONG_ABORTED;
