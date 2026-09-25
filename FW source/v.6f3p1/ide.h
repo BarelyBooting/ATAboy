@@ -102,7 +102,9 @@ typedef struct {
     uint8_t  status;        // status register when the failure was seen
     uint8_t  error;         // error register (meaningful when status has ERR)
     uint8_t  tf[5];         // registers 2..6: count, sector, cyl lo, cyl hi, dev/head
-    bool     drained;       // drive offered data for the failed sector; discarded
+    bool     drained;       // drive offered data for the failed sector; not handed to
+                            // the host (kept for READ BUFFER since 0.6f3p9, salvaged)
+    bool     salvaged;      // ...and kept as the salvage capture (ide_salvage_get)
     // The reset flags cover the whole host command this record belongs to,
     // not only this record's own recovery: the issue #13 call again at the
     // failing sector can fail and write a new record after the first call
@@ -121,6 +123,30 @@ typedef struct {
 
 // Copy of the last failure record (kind == IDE_FAIL_NONE if none yet).
 void    ide_last_failure(ide_fail_t *out);
+
+// ---------------------------------------------------------------------------
+//  Salvage capture (0.6f3p9)
+// ---------------------------------------------------------------------------
+// When a sector read ends with ERR and the drive offers data for the failed
+// sector (the issue #13 path, which used to drain and discard it), those 512
+// bytes are kept here with what the drive reported. Nothing extra is sent to
+// the drive: these are the bytes the drain reads anyway. They never go into
+// a READ(10) buffer or anywhere else a normal read can see; usb.c hands them
+// out only through SCSI READ BUFFER (mode 02h, buffer ID 5Ah).
+// One capture is kept, overwritten by the next. RAM only: valid is false
+// from power-up until the first capture.
+#define IDE_SALVAGE_BYTES 512
+typedef struct {
+    bool     valid;         // a capture exists
+    uint8_t  status;        // status register with ERR (and DRQ) set
+    uint8_t  error;         // error register, read before the data
+    uint8_t  command;       // the READ SECTORS command that failed (20h or 24h)
+    uint32_t lba;           // the failed sector as the host numbers it (LBA or CHS mount)
+    uint32_t seq;           // 1 for the first capture since power-up, then +1 each
+    uint32_t ms;            // ms since boot when it was captured
+    uint8_t  data[IDE_SALVAGE_BYTES];  // as the drive offered them, low byte of each word first
+} ide_salvage_t;
+void    ide_salvage_get(ide_salvage_t *out);
 
 // A reset started for a USB command has not finished yet: the next USB
 // command carries on with it before anything else (ide.c, recovery).

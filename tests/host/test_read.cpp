@@ -161,6 +161,7 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     iordy_held = false;
     chs_geometry_lost = false;
     manual_chs_active = false;
+    memset(&salvage, 0, sizeof salvage);            // power-up: no salvage capture
     tud_mount_cb();
     reset_worst();
     mock_gpio_out = (1u << 24) | (1u << 25);      // CS0/CS1 idle high
@@ -2735,6 +2736,187 @@ static void test_sat_manual_chs_refused() {
 }
 #endif
 
+// ---------------------------------------------------------------------------
+//  0.6f3p9: salvage capture and READ BUFFER
+// ---------------------------------------------------------------------------
+
+static std::vector<uint8_t> rbuf_cdb(uint8_t mode = 0x02, uint8_t id = 0x5A, uint32_t off = 0, uint32_t alloc = 544) {
+    return { 0x3C, mode, id, (uint8_t)(off >> 16), (uint8_t)(off >> 8), (uint8_t)off,
+             (uint8_t)(alloc >> 16), (uint8_t)(alloc >> 8), (uint8_t)alloc, 0 };
+}
+static uint32_t le32_at(const std::vector<uint8_t> &d, size_t o) {
+    return d[o] | (d[o + 1] << 8) | (d[o + 2] << 16) | ((uint32_t)d[o + 3] << 24);
+}
+static bool no_ili(const std::vector<uint8_t> &s) { return s.size() >= 3 && !(s[2] & 0x20); }
+static SatResult read_buffer_cmd(const std::vector<uint8_t> &cdb, uint32_t xfer = 544) {
+    return sat_cmd(cdb, xfer, true, 18);
+}
+// The drive saw nothing at all since these counts were taken.
+struct Quiet {
+    int writes, cmds, reads;
+    Quiet() : writes(sim.reg_writes), cmds(sim.commands), reads(sim.data_reads) {}
+    bool held() const { return sim.reg_writes == writes && sim.commands == cmds && sim.data_reads == reads; }
+};
+
+// READ BUFFER's answer holds exactly this capture.
+static bool salvage_answer_is(const SatResult &b, const ide_salvage_t &sv) {
+    if (b.r != 544 || b.data.size() != 544 || memcmp(b.data.data(), "ATBSALV1", 8) != 0) return false;
+    if (b.data[8] != 1 || b.data[9] != sv.status || b.data[10] != sv.error || b.data[11] != sv.command) return false;
+    if (le32_at(b.data, 12) != sv.lba || le32_at(b.data, 16) != sv.seq || le32_at(b.data, 20) != sv.ms) return false;
+    for (int i = 24; i < 32; i++) if (b.data[i]) return false;
+    return memcmp(b.data.data() + 32, sv.data, 512) == 0;
+}
+
+// C: the bytes a drive offers with a failed sector are kept, and handed out
+// only by READ BUFFER. The READ(10) fails exactly as it did before 0.6f3p9:
+// the same as a drive that offers nothing, same sense, same good prefix.
+static void test_salvage_capture(Mode m) {
+    setup(m == LBA ? "salvage: capture and READ BUFFER, LBA" : "salvage: capture and READ BUFFER, CHS", m);
+    sim.vary_flawed = true;
+    // Power-up: nothing captured. Signature, then zeros.
+    SatResult b0 = read_buffer_cmd(rbuf_cdb());
+    bool zero = b0.r == 544 && memcmp(b0.data.data(), "ATBSALV1", 8) == 0;
+    for (size_t i = 8; zero && i < b0.data.size(); i++) zero = b0.data[i] == 0;
+    CHECK(zero, "before any capture: r %d", b0.r);
+    // The same read against a drive that offers nothing with the ERR.
+    sim.bad[5003] = {BAD_ERR, 0};
+    HostRead plain = host_read10(5000, 8);
+    ide_salvage_t sv; ide_salvage_get(&sv);
+    CHECK(!sv.valid && sv.seq == 0, "ERR without data captured something: seq %u", sv.seq);
+    // Now one that offers flawed data with it.
+    sim.bad[5003] = {BAD_ERR_DRQ, 0};
+    int att = sim.attempts[5003];
+    uint64_t t0 = mock_now_ns;
+    HostRead h = host_read10(5000, 8);
+    uint64_t t1 = mock_now_ns;
+    int captures = sim.attempts[5003] - att;        // each attempt offered a block
+    CHECK(!h.ok && h.data.size() == 3 * 512 && matches_medium(h, 5000), "READ(10): ok %d, %zu bytes", h.ok, h.data.size());
+    CHECK(h.ok == plain.ok && h.data == plain.data && h.key == plain.key && h.asc == plain.asc && h.calls == plain.calls,
+          "not as without the data: key %02X/%02X asc %02X/%02X calls %d/%d", h.key, plain.key, h.asc, plain.asc,
+          h.calls, plain.calls);
+    CHECK(h.key == SCSI_SENSE_MEDIUM_ERROR && h.asc == 0x11, "sense %X/%02X", h.key, h.asc);
+    bool leaked = false;
+    for (size_t o = 0; o + 512 <= h.data.size(); o += 2)
+        if (memcmp(h.data.data() + o, sim.offered.data(), 512) == 0) leaked = true;
+    CHECK(!leaked, "the offered bytes are in the READ(10) data");
+    ide_salvage_get(&sv);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(captures >= 1 && sv.valid && sv.seq == (uint32_t)captures, "seq %u after %d captures", sv.seq, captures);
+    CHECK(sv.lba == 5003 && sv.status == 0x59 && sv.error == 0x40 && sv.command == 0x20,
+          "lba %u st %02X err %02X cmd %02X", sv.lba, sv.status, sv.error, sv.command);
+    CHECK(sv.ms >= t0 / 1000000 && sv.ms <= t1 / 1000000, "ms %u not in %llu..%llu", sv.ms,
+          (unsigned long long)(t0 / 1000000), (unsigned long long)(t1 / 1000000));
+    CHECK(memcmp(sv.data, sim.offered.data(), 512) == 0, "captured bytes are not the ones offered");
+    CHECK(f.kind == IDE_FAIL_ERR && f.drained && f.salvaged && f.lba == 5003, "record kind %u drained %d salvaged %d",
+          f.kind, f.drained, f.salvaged);
+    CHECK(sim.srst == 0 && sim.violations == 0, "srst %d violations %d", sim.srst, sim.violations);
+    Quiet q;
+    SatResult b = read_buffer_cmd(rbuf_cdb());
+    CHECK(salvage_answer_is(b, sv), "READ BUFFER: r %d", b.r);
+    CHECK(q.held(), "READ BUFFER touched the drive");
+    // ERR with no data: nothing new, the capture stays as it was.
+    sim.bad[5003] = {BAD_ERR, 0};
+    HostRead h2 = host_read10(5000, 8);
+    ide_salvage_t sv2; ide_salvage_get(&sv2);
+    CHECK(!h2.ok && memcmp(&sv2, &sv, sizeof sv) == 0, "ERR without DRQ changed the capture: seq %u", sv2.seq);
+    // Good reads, a reset, a drive that hangs, an unmount: still there.
+    sim.bad.clear();
+    HostRead g = host_read10(100, 8);
+    sim.bad[7003] = {BAD_HANG, 0};
+    host_read10(7000, 8);
+    sim.bad.clear();
+    is_mounted = false;
+    ide_reset_drive();
+    ide_salvage_get(&sv2);
+    CHECK(g.ok && memcmp(&sv2, &sv, sizeof sv) == 0, "the capture changed without a new one: seq %u", sv2.seq);
+    b = read_buffer_cmd(rbuf_cdb());
+    CHECK(salvage_answer_is(b, sv), "READ BUFFER while unmounted: r %d", b.r);
+    is_mounted = true;
+    // A new capture replaces it, and the sequence says so.
+    sim.bad[6001] = {BAD_ERR_DRQ, 0};
+    host_read10(6001, 1);
+    ide_salvage_get(&sv2);
+    CHECK(sv2.valid && sv2.seq == sv.seq + 1 && sv2.lba == 6001 && memcmp(sv2.data, sim.offered.data(), 512) == 0,
+          "new capture: seq %u lba %u", sv2.seq, sv2.lba);
+    b = read_buffer_cmd(rbuf_cdb());
+    CHECK(salvage_answer_is(b, sv2), "READ BUFFER after the new capture");
+    // The failed sector is the one recorded, wherever it falls in the read
+    // (the host's call again at it, above, starts there, so this one does not).
+    sim.bad[6001] = {BAD_ERR_DRQ, 0};
+    uint8_t pbuf[8 * 512]; uint32_t pdone = 0;
+    CHECK(ide_read_sectors_partial(5998, 8, pbuf, &pdone) < 0 && pdone == 3, "partial read: done %u", pdone);
+    ide_salvage_get(&sv2);
+    CHECK(sv2.lba == 6001 && sv2.seq == sv.seq + 2, "partial read: lba %u seq %u", sv2.lba, sv2.seq);
+    sim.bad.erase(6001);
+    // A drive still offering data after the block (issue #13's stuck case):
+    // captured once, then reset as before.
+    sim.bad[6002] = {BAD_ERR_DRQ_MORE, 0};
+    sim.srst = 0;
+    HostRead h3 = host_read10(6002, 1);
+    ide_salvage_t sv3; ide_salvage_get(&sv3);
+    CHECK(!h3.ok && h3.data.empty() && sv3.seq == sv2.seq + 1 && sv3.lba == 6002 && sim.srst >= 1,
+          "DRQ stays: ok %d seq %u srst %d", h3.ok, sv3.seq, sim.srst);
+}
+
+// LBA48 mounts send READ SECTORS EXT; the capture says so.
+static void test_salvage_lba48() {
+    setup("salvage: LBA48 command recorded", LBA, 0x10000100u);
+    sim.nsect = 0x10000100u;
+    sim.vary_flawed = true;
+    sim.bad[0x10000010u] = {BAD_ERR_DRQ, 0};
+    host_read10(0x10000010u, 1);
+    ide_salvage_t sv; ide_salvage_get(&sv);
+    CHECK(sv.valid && sv.command == 0x24 && sv.lba == 0x10000010u && sv.seq == 1, "cmd %02X lba %X seq %u",
+          sv.command, sv.lba, sv.seq);
+}
+
+// READ BUFFER takes exactly one form. Everything else is refused, 5/24/00,
+// with no data. The allocation length cuts the answer.
+static void test_read_buffer_cdb() {
+    setup("READ BUFFER: CDB checks and allocation length", LBA);
+    sim.vary_flawed = true;
+    sim.bad[300] = {BAD_ERR_DRQ, 0};
+    host_read10(300, 1);
+    ide_salvage_t sv; ide_salvage_get(&sv);
+    Quiet q;
+    struct { const char *name; std::vector<uint8_t> cdb; } bad[] = {
+        { "mode 00h (combined)",  rbuf_cdb(0x00) },
+        { "mode 01h",             rbuf_cdb(0x01) },
+        { "mode 03h (descriptor)", rbuf_cdb(0x03) },
+        { "mode 0Ah (echo)",      rbuf_cdb(0x0A) },
+        { "mode 1Ch (error hist)", rbuf_cdb(0x1C) },
+        { "mode 12h",             rbuf_cdb(0x12) },
+        { "mode 1Fh",             rbuf_cdb(0x1F) },
+        { "buffer id 00h",        rbuf_cdb(0x02, 0x00) },
+        { "buffer id 5Bh",        rbuf_cdb(0x02, 0x5B) },
+        { "buffer id DAh",        rbuf_cdb(0x02, 0xDA) },
+        { "offset 1",             rbuf_cdb(0x02, 0x5A, 1) },
+        { "offset 100h",          rbuf_cdb(0x02, 0x5A, 0x100) },
+        { "offset 10000h",        rbuf_cdb(0x02, 0x5A, 0x10000) },
+    };
+    for (auto &e : bad) {
+        SatResult s = read_buffer_cmd(e.cdb);
+        CHECK(s.r < 0 && s.data.empty() && sense_is(s.sense, 0x05, 0x24, 0x00) && no_ili(s.sense), "%s: r %d", e.name, s.r);
+    }
+    // MODE is bits 4:0 of byte 1; the bits above it are not MODE.
+    SatResult hi = read_buffer_cmd(rbuf_cdb(0xE2));
+    CHECK(salvage_answer_is(hi, sv), "mode byte E2h: r %d", hi.r);
+    const struct { uint32_t alloc, xfer; int32_t want; } al[] = {
+        { 0, 0, 0 }, { 1, 1, 1 }, { 8, 8, 8 }, { 100, 100, 100 }, { 543, 543, 543 }, { 544, 544, 544 },
+        { 545, 545, 544 }, { 4096, 4096, 544 }, { 0xFFFFFF, 4096, 544 }, { 544, 32, 32 },
+        { 0, 544, 0 }, { 1, 544, 1 }, { 100, 4096, 100 }, { 0x100, 4096, 0x100 }, { 543, 4096, 543 },
+        { 0x010000, 4096, 544 },
+    };
+    SatResult full = read_buffer_cmd(rbuf_cdb());
+    for (auto &a : al) {
+        SatResult s = read_buffer_cmd(rbuf_cdb(0x02, 0x5A, 0, a.alloc), a.xfer);
+        bool same = s.r == a.want && s.data.size() == (size_t)a.want &&
+                    std::equal(s.data.begin(), s.data.end(), full.data.begin());
+        CHECK(same, "alloc %u, host length %u: r %d, want %d", a.alloc, a.xfer, s.r, a.want);
+    }
+    CHECK(q.held(), "READ BUFFER touched the drive");
+}
+
 int main() {
     // The budget is a design number, not only what the helpers measure
     // against: 10 s under the 30 s that Linux and the project's tools give a
@@ -2824,6 +3006,11 @@ int main() {
     test_iordy_setting_deferred();
     test_write_refused_while_pending();
     test_srst_marks_geometry_lost();
+    // 0.6f3p9: salvage capture and READ BUFFER
+    test_salvage_capture(LBA);
+    test_salvage_capture(CHS);
+    test_salvage_lba48();
+    test_read_buffer_cdb();
 #if ATABOY_SAT
     test_sat_smart_status(LBA);
     test_sat_smart_status(CHS);

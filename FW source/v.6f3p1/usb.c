@@ -360,6 +360,60 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
 }
 
 // ---------------------------------------------------------------------------
+//  READ BUFFER(10): the salvage capture, and nothing else (0.6f3p9)
+// ---------------------------------------------------------------------------
+// The only way the bytes a drive offered with a failed sector (ide.h, salvage
+// capture) leave the firmware. Never through READ(10), ATA PASS-THROUGH or an
+// image. Accepted exactly as:
+//   CDB 3Ch, byte 1 bits 4:0 (MODE) 02h (data), byte 2 (BUFFER ID) 5Ah,
+//   bytes 3-5 (BUFFER OFFSET) 0, bytes 6-8 ALLOCATION LENGTH (big-endian).
+// Anything else: CHECK CONDITION, ILLEGAL REQUEST, 24h/00h (invalid field in
+// CDB), no data. The answer is SALV_LEN bytes, cut to the allocation length:
+//   0   "ATBSALV1"
+//   8   valid: 1 a capture exists, 0 none (then everything after is 0)
+//   9   ATA status at the failure     10  ATA error     11  ATA command
+//   12  u32 LE: the failed sector, as the host numbers it
+//   16  u32 LE: sequence, 1 for the first capture since power-up, +1 each
+//   20  u32 LE: ms since boot at the capture
+//   24..31  0
+//   32..543 the 512 bytes as the drive offered them
+// It does not touch the drive, and works mounted or not.
+#define SALV_BUFFER_ID  0x5A
+#define SALV_LEN        (32 + IDE_SALVAGE_BYTES)
+_Static_assert(SALV_LEN <= CFG_TUD_MSC_EP_BUFSIZE, "the salvage answer must fit the MSC buffer");
+
+static void put_le32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+static int32_t read_buffer(uint8_t lun, uint8_t const cdb[16], uint8_t *buf, uint16_t bufsize) {
+    if ((cdb[1] & 0x1F) != 0x02 || cdb[2] != SALV_BUFFER_ID || cdb[3] || cdb[4] || cdb[5]) {
+        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
+        return -1;
+    }
+    uint32_t alloc = ((uint32_t)cdb[6] << 16) | ((uint32_t)cdb[7] << 8) | cdb[8];
+    ide_salvage_t sv;
+    ide_salvage_get(&sv);
+    uint8_t r[SALV_LEN];
+    memset(r, 0, sizeof r);
+    memcpy(r, "ATBSALV1", 8);
+    if (sv.valid) {
+        r[8]  = 1;
+        r[9]  = sv.status;
+        r[10] = sv.error;
+        r[11] = sv.command;
+        put_le32(r + 12, sv.lba);
+        put_le32(r + 16, sv.seq);
+        put_le32(r + 20, sv.ms);
+        memcpy(r + 32, sv.data, IDE_SALVAGE_BYTES);
+    }
+    uint32_t n = alloc < SALV_LEN ? alloc : SALV_LEN;
+    if (n > bufsize) n = bufsize;           // never past the host's transfer length
+    memcpy(buf, r, n);
+    return (int32_t)n;
+}
+
+// ---------------------------------------------------------------------------
 //  SCSI — Mode Sense + misc
 // ---------------------------------------------------------------------------
 
@@ -429,6 +483,12 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
     case 0x1B: return 0;  // START STOP UNIT
     case 0x35: return 0;  // SYNCHRONIZE CACHE
     case 0x1E: return 0;  // PREVENT ALLOW MEDIUM REMOVAL
+
+    case 0x3C:  // READ BUFFER(10): the salvage capture only; no drive access
+#if ATABOY_SAT
+        sat_sense_forget();
+#endif
+        return read_buffer(lun, scsi_cmd, buf, bufsize);
 
 #if ATABOY_SAT
     case 0xA1:  // ATA PASS-THROUGH (12)

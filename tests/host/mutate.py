@@ -43,7 +43,14 @@ MUTANTS = [
      '    ide_write_reg(7, cmd);                                 // READ SECTORS EXT / READ SECTORS\n    wait_after_command();',
      '    ide_write_reg(7, cmd);                                 // READ SECTORS EXT / READ SECTORS'),
     ('registers captured after the reset instead of before', 'ide.c',
-     '    record_failure(IDE_FAIL_ERR, cmd, st, lba + s, s, count);\n    if (st & 0x08) {\n        // Data offered for the failed sector. Not good data: discard it.\n        ide_drain_sector();\n        last_fail.drained = true;\n    }\n    if (!idle_after_error(2000)) soft_reset_restore();',
+     '    record_failure(IDE_FAIL_ERR, cmd, st, lba + s, s, count);\n    if (st & 0x08) {\n'
+     '        // Data offered for the failed sector. Not good data: it never goes\n'
+     '        // into buf. Since 0.6f3p9 it is kept as the salvage capture instead\n'
+     '        // of thrown away, for READ BUFFER only (usb.c). Same reads as the\n'
+     '        // drain, nothing more sent; the error register was read above.\n'
+     '        salvage_sector(cmd, st, last_fail.error, lba + s);\n'
+     '        last_fail.drained = true;\n        last_fail.salvaged = true;\n    }\n'
+     '    if (!idle_after_error(2000)) soft_reset_restore();',
      '    soft_reset_restore();\n    record_failure(IDE_FAIL_ERR, cmd, st, lba + s, s, count);'),
     ('always soft reset after ERR (old recovery)', 'ide.c',
      '    if (!idle_after_error(2000)) soft_reset_restore();',
@@ -52,13 +59,13 @@ MUTANTS = [
      '    if (!idle_after_error(2000)) soft_reset_restore();',
      '    (void)idle_after_error(2000);'),
     ('no drain of the flawed data', 'ide.c',
-     '        ide_drain_sector();\n        last_fail.drained = true;',
+     '        salvage_sector(cmd, st, last_fail.error, lba + s);\n        last_fail.drained = true;',
      '        last_fail.drained = true;'),
     ('CHS geometry not restored after a reset', 'ide.c',
      '    rec.stage = REC_GEO;\n    if (recovery_ms(IDE_GEOMETRY_TIMEOUT_MS) < IDE_GEOMETRY_TIMEOUT_MS) return 0;\n    return recovery_end(ide_set_geometry(config.heads, config.spt));',
      '    return recovery_end(true);'),
     ('read data into the caller buffer when draining', 'ide.c',
-     '        ide_drain_sector();\n        last_fail.drained = true;',
+     '        salvage_sector(cmd, st, last_fail.error, lba + s);\n        last_fail.drained = true;',
      '        set_address(0); xcvr_read(); sio_hw->gpio_clr = (1 << IDE_CS0);\n'
      '        ide_pio_read(256, wbuf + s * 256);\n'
      '        sio_hw->gpio_set = (1 << IDE_CS0); bus_idle();\n'
@@ -672,6 +679,56 @@ MUTANTS = [
      '    id_w49_known = false;           // no IDENTIFY: nothing to say about IORDY\n', ''),
     ('IORDY note: auto-mount does not record word 49', 'menus.c',
      '    id_w49 = id_buf[49]; id_w49_known = true;   // IORDY advisory\n', ''),
+    # --- 0.6f3p9, C: salvage capture and READ BUFFER (test_read) ---
+    ('salvage: capture not stored (drained and thrown away, as 0.6f3p8)', 'ide.c',
+     '        salvage_sector(cmd, st, last_fail.error, lba + s);\n        last_fail.drained = true;\n        last_fail.salvaged = true;',
+     '        ide_drain_sector();\n        last_fail.drained = true;\n        last_fail.salvaged = true;'),
+    ('salvage: bytes read but never marked valid', 'ide.c',
+     '    salvage.seq++;\n    salvage.valid   = true;', '    salvage.seq++;'),
+    ('salvage: bytes handed to READ(10) as the failed sector', 'ide.c',
+     '        last_fail.salvaged = true;\n    }',
+     '        last_fail.salvaged = true;\n        memcpy(buf + s * 512, salvage.data, 512); s++;\n    }'),
+    ('salvage: sequence not incremented', 'ide.c',
+     '    salvage.seq++;\n', '    salvage.seq = 1;\n'),
+    ('salvage: wrong LBA recorded (the first sector of the read)', 'ide.c',
+     '        salvage_sector(cmd, st, last_fail.error, lba + s);', '        salvage_sector(cmd, st, last_fail.error, lba);'),
+    ('salvage: high and low bytes swapped', 'ide.c',
+     '        salvage.data[2 * i]     = (uint8_t)(words[i] & 0xFF);\n        salvage.data[2 * i + 1] = (uint8_t)(words[i] >> 8);',
+     '        salvage.data[2 * i]     = (uint8_t)(words[i] >> 8);\n        salvage.data[2 * i + 1] = (uint8_t)(words[i] & 0xFF);'),
+    # Not listed, equivalent: the error register read after the data instead
+    # of before. The simulated drive, like a real one, does not change it.
+    ('salvage: no time stamp', 'ide.c',
+     '    salvage.ms      = ms_now();\n', ''),
+    ('salvage: status not recorded', 'ide.c',
+     '    salvage.status  = st;\n', ''),
+    ('READ BUFFER: any mode accepted', 'usb.c',
+     "    if ((cdb[1] & 0x1F) != 0x02 || cdb[2] != SALV_BUFFER_ID || cdb[3] || cdb[4] || cdb[5]) {",
+     "    if (cdb[2] != SALV_BUFFER_ID || cdb[3] || cdb[4] || cdb[5]) {"),
+    ('READ BUFFER: MODE compared with the bits above it', 'usb.c',
+     "    if ((cdb[1] & 0x1F) != 0x02 || cdb[2] != SALV_BUFFER_ID || cdb[3] || cdb[4] || cdb[5]) {",
+     "    if (cdb[1] != 0x02 || cdb[2] != SALV_BUFFER_ID || cdb[3] || cdb[4] || cdb[5]) {"),
+    ('READ BUFFER: any buffer id accepted', 'usb.c',
+     "    if ((cdb[1] & 0x1F) != 0x02 || cdb[2] != SALV_BUFFER_ID || cdb[3] || cdb[4] || cdb[5]) {",
+     "    if ((cdb[1] & 0x1F) != 0x02 || cdb[3] || cdb[4] || cdb[5]) {"),
+    ('READ BUFFER: offset low byte not checked', 'usb.c',
+     "    if ((cdb[1] & 0x1F) != 0x02 || cdb[2] != SALV_BUFFER_ID || cdb[3] || cdb[4] || cdb[5]) {",
+     "    if ((cdb[1] & 0x1F) != 0x02 || cdb[2] != SALV_BUFFER_ID || cdb[3] || cdb[4]) {"),
+    ('READ BUFFER: offset high byte not checked', 'usb.c',
+     "    if ((cdb[1] & 0x1F) != 0x02 || cdb[2] != SALV_BUFFER_ID || cdb[3] || cdb[4] || cdb[5]) {",
+     "    if ((cdb[1] & 0x1F) != 0x02 || cdb[2] != SALV_BUFFER_ID || cdb[4] || cdb[5]) {"),
+    ('READ BUFFER: allocation length ignored', 'usb.c',
+     '    uint32_t n = alloc < SALV_LEN ? alloc : SALV_LEN;', '    uint32_t n = SALV_LEN;'),
+    ('READ BUFFER: allocation length read little-endian', 'usb.c',
+     '    uint32_t alloc = ((uint32_t)cdb[6] << 16) | ((uint32_t)cdb[7] << 8) | cdb[8];',
+     '    uint32_t alloc = ((uint32_t)cdb[8] << 16) | ((uint32_t)cdb[7] << 8) | cdb[6];'),
+    ('READ BUFFER: past the host transfer length', 'usb.c',
+     '    if (n > bufsize) n = bufsize;           // never past the host\'s transfer length\n', ''),
+    ('READ BUFFER: sequence field carries the LBA', 'usb.c',
+     '        put_le32(r + 16, sv.seq);', '        put_le32(r + 16, sv.lba);'),
+    ('READ BUFFER: valid byte always 1', 'usb.c',
+     '    memcpy(r, "ATBSALV1", 8);\n', '    memcpy(r, "ATBSALV1", 8);\n    r[8] = 1;\n'),
+    ('READ BUFFER: not answered (unsupported, as 0.6f3p8)', 'usb.c',
+     '        return read_buffer(lun, scsi_cmd, buf, bufsize);', '        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0); return -1;'),
     # L-2: nothing through SAT to a drive set up by Ctrl+G.
     ('L-2: SAT not told about Ctrl+G', 'sat.c',
      '    in.manual_chs = ide_manual_chs_active();', '    in.manual_chs = false;'),

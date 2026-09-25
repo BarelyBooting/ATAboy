@@ -701,6 +701,41 @@ void ide_drain_sector(void) {
 }
 
 // ---------------------------------------------------------------------------
+//  Salvage capture (0.6f3p9, ide.h)
+// ---------------------------------------------------------------------------
+// Written only by the issue #13 path below, on core 0 inside a READ(10)
+// callback, and read by usb.c's READ BUFFER on core 0 too; Debug E reads it
+// on core 1 only after waiting for any USB command still running (menus.c,
+// bus_free_wait). Zero at power-up: no capture, sequence 0.
+static ide_salvage_t salvage;
+
+void ide_salvage_get(ide_salvage_t *out) { *out = salvage; }
+
+// The drive offers data for a sector whose read ended with ERR: read the 256
+// words it offers, exactly as the drain did, but into the salvage buffer
+// instead of throwing them away. Never into the caller's buffer.
+static void salvage_sector(uint8_t cmd, uint8_t st, uint8_t err, uint32_t lba) {
+    uint16_t words[256];
+    set_address(0);
+    xcvr_read();
+    sio_hw->gpio_clr = (1 << IDE_CS0);
+    ide_pio_read(256, words);
+    sio_hw->gpio_set = (1 << IDE_CS0);
+    bus_idle();
+    for (int i = 0; i < 256; i++) {
+        salvage.data[2 * i]     = (uint8_t)(words[i] & 0xFF);
+        salvage.data[2 * i + 1] = (uint8_t)(words[i] >> 8);
+    }
+    salvage.status  = st;
+    salvage.error   = err;
+    salvage.command = cmd;
+    salvage.lba     = lba;
+    salvage.ms      = ms_now();
+    salvage.seq++;
+    salvage.valid   = true;
+}
+
+// ---------------------------------------------------------------------------
 //  Failure record and recovery for sector I/O
 // ---------------------------------------------------------------------------
 
@@ -723,6 +758,7 @@ static void record_failure(uint8_t kind, uint8_t cmd, uint8_t st,
     last_fail.error   = ide_read_reg(1);
     for (int i = 0; i < 5; i++) last_fail.tf[i] = ide_read_reg(2 + i);
     last_fail.drained = false;
+    last_fail.salvaged = false;
     last_fail.reset   = host.resets > 0 || host.hw_resets > 0;
     last_fail.reset_failed = false;
     last_fail.hw_reset = host.hw_resets > 0;
@@ -1210,7 +1246,8 @@ int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
 // Error handling (issue #13): an ERR from the drive means it has finished the
 // command, so no reset is needed. If it offers data for the bad sector along
 // with ERR (older drives put the flawed data in the buffer), that data is
-// drained and thrown away. A soft reset is only used when the drive does not
+// drained and never put in buf; since 0.6f3p9 the drain keeps it as the
+// salvage capture (ide.h). A soft reset is only used when the drive does not
 // end the command (timeout) or is not idle afterwards.
 //
 // Time (review M-1): inside a host command every wait is cut to the command's
@@ -1328,9 +1365,13 @@ read_err:
     note_failed_sector(lba + s, ms_now() - sector_start);
     record_failure(IDE_FAIL_ERR, cmd, st, lba + s, s, count);
     if (st & 0x08) {
-        // Data offered for the failed sector. Not good data: discard it.
-        ide_drain_sector();
+        // Data offered for the failed sector. Not good data: it never goes
+        // into buf. Since 0.6f3p9 it is kept as the salvage capture instead
+        // of thrown away, for READ BUFFER only (usb.c). Same reads as the
+        // drain, nothing more sent; the error register was read above.
+        salvage_sector(cmd, st, last_fail.error, lba + s);
         last_fail.drained = true;
+        last_fail.salvaged = true;
     }
     if (!idle_after_error(2000)) soft_reset_restore();
     if (done) *done = s;

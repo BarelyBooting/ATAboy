@@ -57,6 +57,10 @@ int ide_manual_chs(uint8_t, uint8_t, uint8_t *st) { *st = 0x50; return IDE_MCHS_
 #ifdef SAVE_REFUSED_MCHS    // review of 0.6f3p8, L-1
 bool ide_manual_chs_active(void) { return true; }
 #endif
+#ifdef IDE_SALVAGE_BYTES    // 0.6f3p9: the salvage capture (Debug E)
+static ide_salvage_t stub_salvage;
+void ide_salvage_get(ide_salvage_t *out) { *out = stub_salvage; }
+#endif
 
 static void save(const char *dir, const char *name) {
     std::string p = std::string(dir) + "/" + name + ".bin";
@@ -225,6 +229,18 @@ int main(int argc, char **argv) {
     picker_identify(0x0A00);
     draw_bios_frame(); update_main_menu(); draw_selection_menu(picker_id, 2);
     save(dir, "picker-iordy-declared");
+#endif
+#ifdef IDE_SALVAGE_BYTES
+    // 0.6f3p9: Debug E with a salvage capture, and the longest numbers.
+    reset_state();
+    current_screen = SCREEN_DEBUG;
+    SET_STUB_FAILURE();
+    stub_fail.reset = true; stub_fail.hw_reset = true; stub_fail.reset_failed = true; stub_fail.salvaged = true;
+    stub_salvage.valid = true; stub_salvage.seq = 4294967295u; stub_salvage.lba = 4294967295u;
+    stub_salvage.status = 0x59; stub_salvage.error = 0x40; stub_salvage.command = 0x20;
+    draw_bios_frame(); draw_debug_overlay(); run_debug_errors();
+    save(dir, "debug-errors-salvage");
+    memset(&stub_salvage, 0, sizeof stub_salvage);
 #endif
 #ifdef SAVE_REFUSED_MCHS
     // F10 with Auto Mount on and a Ctrl+G geometry: not saved (review of

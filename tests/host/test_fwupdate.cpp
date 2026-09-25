@@ -73,6 +73,9 @@ void ide_last_failure(ide_fail_t *out) { *out = stub_fail; }
 bool ide_recovery_pending(void) { return false; }
 int ide_manual_chs(uint8_t, uint8_t, uint8_t *st) { bus_use(); *st = 0x50; return IDE_MCHS_OK; }
 bool ide_manual_chs_active(void) { return false; }
+// 0.6f3p9: the salvage capture (Debug E).
+static ide_salvage_t stub_salvage;
+void ide_salvage_get(ide_salvage_t *out) { *out = stub_salvage; }
 
 static int failures = 0, checks = 0;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; \

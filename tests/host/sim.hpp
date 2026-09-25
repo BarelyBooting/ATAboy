@@ -42,6 +42,8 @@
 // in the device register and reads the address registers as CHS
 // (lba_ignored), so an LBA address names some other sector, with good status.
 // 0.6f3p9: IDENTIFY answers word 49 (id_w49; bit 11 is IORDY supported).
+// 0.6f3p9: the flawed data offered with an ERR can differ per sector
+// (vary_flawed), and what was last offered is kept (offered).
 #pragma once
 #include <stdint.h>
 #include <map>
@@ -127,6 +129,8 @@ struct SimDrive {
     bool     abort_recal = false;           // RECALIBRATE (0x10) ends at once with ABRT
     bool     lba_ignored = false;           // the LBA bit means nothing: every address is CHS
     uint16_t id_w49 = 0x0200;               // IDENTIFY word 49: LBA; bit 11 (IORDY) clear
+    bool     vary_flawed = false;           // flawed data differs per sector, not DEADh
+    std::vector<uint8_t> offered;           // the last flawed block offered with ERR
     std::vector<uint8_t> cmd_log;           // every command byte, in order
     int      reg_writes = 0;                // any task file or Device Control write
     uint8_t idle_status() const { return (drdy_needs_idp && !geo_valid) ? 0x10 : 0x50; }
@@ -221,6 +225,8 @@ struct SimDrive {
         return w != written.end() ? w->second[i] : pattern(lba, i);
     }
 
+    static uint8_t flawed_at(uint32_t lba, int i) { return pattern(lba ^ 0x80000000u, i); }
+
     // ---- register decode --------------------------------------------------
     uint32_t addr_lba() const {
         if (cmd == 0x24) {
@@ -284,7 +290,10 @@ struct SimDrive {
         reg[2] = (uint8_t)left;
         error = err;
         if (offer) {
-            for (int i = 0; i < 256; i++) xfer[i] = 0xDEAD;   // flawed data, never valid
+            for (int i = 0; i < 256; i++)                     // flawed data, never valid
+                xfer[i] = vary_flawed ? (uint16_t)(flawed_at(cur, 2 * i) | (flawed_at(cur, 2 * i + 1) << 8)) : 0xDEAD;
+            offered.assign(512, 0);
+            for (int i = 0; i < 256; i++) { offered[2 * i] = xfer[i] & 0xFF; offered[2 * i + 1] = xfer[i] >> 8; }
             widx = 0; phase = ERR_DRQ; status = 0x59;
         } else { phase = IDLE; status = 0x51; }
     }

@@ -797,6 +797,15 @@ static void run_debug_errors(void) {
         if (f.pending)
             debug_print(4, FG_YELLOW, "Reset still running: the next USB command waits for it");
     }
+    // The salvage capture (0.6f3p9): the bytes a drive offered with the last
+    // failed sector that had any, kept for READ BUFFER. On a line of its own:
+    // row 3 has no room for "salvaged" beside "drained" (it is 68 columns
+    // with "HW reset FAILED"). At its longest this line is 66.
+    ide_salvage_t sv;
+    ide_salvage_get(&sv);
+    if (sv.valid)
+        debug_print(5, FG_WHITE, "Salvaged #%lu: LBA %lu ST:%02X ERR:%02X, READ BUFFER 5Ah",
+                    (unsigned long)sv.seq, (unsigned long)sv.lba, sv.status, sv.error);
 }
 
 static void run_seek_test(void) {
