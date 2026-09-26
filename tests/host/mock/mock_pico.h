@@ -38,8 +38,11 @@ bool mock_intrq(void);
 // The IDE RESET- line (GPIO 23) is driven with gpio_put; the simulated drive
 // sees every change of it through this (test_read.cpp; a no-op elsewhere).
 void mock_reset_line(bool high);
-static inline void gpio_init_mask(uint32_t) {}
-static inline void gpio_set_dir_out_masked(uint32_t) {}
+// Review C, C-5: gpio_init_mask leaves the output latches at 0, as the SDK
+// does, and the latch as it was when the pins became outputs is kept.
+inline uint32_t mock_gpio_out_at_dir = 0;
+static inline void gpio_init_mask(uint32_t m) { mock_gpio_out &= ~m; }
+static inline void gpio_set_dir_out_masked(uint32_t) { mock_gpio_out_at_dir = mock_gpio_out; }
 static inline void gpio_init(unsigned) {}
 static inline void gpio_set_dir(unsigned, bool) {}
 static inline void gpio_pull_down(unsigned) {}

@@ -898,7 +898,8 @@ static void test_lone_slave_hw_reset(Mode m) {
     CHECK(sim.srst == 1 && sim.hw_resets == 1, "srst %d hardware resets %d", sim.srst, sim.hw_resets);
     CHECK(((sim.reg[6] >> 4) & 1) == 1, "slave not selected after the hardware reset (DH %02X)", sim.reg[6]);
     if (m == CHS)
-        CHECK(sim.geo_valid && sim.heads == 5 && sim.spt == 34 && sim.init_params == 1,
+        // Two since review C, C-1: one before the WRITE, one after the reset.
+        CHECK(sim.geo_valid && sim.heads == 5 && sim.spt == 34 && sim.init_params == 2,
               "geometry after the hardware reset: %d %u x %u, %d INITIALIZE", sim.geo_valid, sim.heads, sim.spt, sim.init_params);
     CHECK(sim.cmd_count[0x10] >= 1, "no RECALIBRATE after the hardware reset");
     CHECK(ms_since(t0) < IDE_CMD_TIMEOUT_MS + 2 * 31000 + 5000, "took %llu ms", (unsigned long long)ms_since(t0));
@@ -2256,7 +2257,10 @@ static void test_recal_after_hw_reset() {
     ide_fail_t f; ide_last_failure(&f);
     CHECK(r < 0 && f.hw_reset && f.reset_failed && sim.cmd_count[0x10] == 1, "hw %d failed %d RECAL %d",
           f.hw_reset, f.reset_failed, sim.cmd_count[0x10]);
-    CHECK(sim.init_params == 0 && sim.violations == 0, "0x91 sent %d times, violations %d", sim.init_params, sim.violations);
+    // Review C, C-1: one 0x91 goes out before the READ; none after the
+    // RECALIBRATE that never ended.
+    CHECK(sim.init_params == 1 && sim.cmd_log.back() == 0x10 && sim.violations == 0, "0x91 sent %d times (last %02X), violations %d",
+          sim.init_params, sim.cmd_log.back(), sim.violations);
 
     setup("RECALIBRATE after RESET-: slow to start, no INTRQ", CHS);
     chs_user_geometry();
@@ -2267,7 +2271,7 @@ static void test_recal_after_hw_reset() {
     sim.bad[5003] = {BAD_HANG, 0};
     r = ide_read_sectors_partial(5000, 8, buf, &done);
     ide_last_failure(&f);
-    CHECK(r < 0 && f.hw_reset && !f.reset_failed && sim.init_params == 1, "hw %d failed %d 0x91 %d", f.hw_reset, f.reset_failed,
+    CHECK(r < 0 && f.hw_reset && !f.reset_failed && sim.init_params == 2, "hw %d failed %d 0x91 %d", f.hw_reset, f.reset_failed,
           sim.init_params);
     CHECK(sim.violations == 0 && sim.geo_valid && sim.heads == 5, "violations %d (0x91 while RECALIBRATE ran)", sim.violations);
 }
@@ -2560,7 +2564,8 @@ static void test_geometry_waits_for_time() {
     CHECK(f.pending && !f.reset_failed, "record: pending %d failed %d", f.pending, f.reset_failed);
     h = host_read10(5000, 8);
     ide_last_failure(&f);
-    CHECK(h.ok && matches_medium(h, 5000) && sim.init_params == idp + 1, "next command: ok %d, 0x91 %d", h.ok, sim.init_params - idp);
+    // Two since review C, C-1: the recovery's, then the one before the READ.
+    CHECK(h.ok && matches_medium(h, 5000) && sim.init_params == idp + 2, "next command: ok %d, 0x91 %d", h.ok, sim.init_params - idp);
     CHECK(!f.pending && !f.reset_failed && sim.geo_valid && sim.heads == 5 && sim.spt == 34, "after: pending %d failed %d geometry %d",
           f.pending, f.reset_failed, sim.geo_valid);
     CHECK(sim.violations == 0 && sim.hw_resets == 1, "violations %d hw %d", sim.violations, sim.hw_resets);
@@ -2965,7 +2970,9 @@ static void test_read_long_ok(Mode m) {
         int reads = sim.data_reads, n = sim.commands;
         SatResult s = read_long_cmd(lba, 516);
         CHECK(long_data_right(s, lba, 4), "lba %u: r %d", lba, s.r);
-        CHECK(sim.commands == n + 1 && sim.cmd_log.back() == 0x23 && sim.long_lba == lba && sim.long_bad_count == 0,
+        // CHS: 0x91 first, since review C, C-1.
+        CHECK(sim.commands == n + (m == CHS ? 2 : 1) && sim.cmd_log.back() == 0x23 && sim.long_lba == lba && sim.long_bad_count == 0 &&
+              (m != CHS || sim.cmd_log[sim.cmd_log.size() - 2] == 0x91),
               "lba %u: %d commands, last %02X, drive read %u", lba, sim.commands - n, sim.cmd_log.back(), sim.long_lba);
         CHECK(sim.data_reads == reads + 256 + 4, "lba %u: %d data reads", lba, sim.data_reads - reads);
         CHECK(((sim.reg[6] & 0x40) != 0) == (m == LBA), "lba %u: device register %02X", lba, sim.reg[6]);
@@ -3307,6 +3314,140 @@ static void test_read_long_recovery_pending() {
     CHECK(!f.pending && f.reset_failed, "record: pending %d, reset failed %d", f.pending, f.reset_failed);
 }
 
+// ---- review C of 0.6f3p10 ------------------------------------------------------
+// C-2: the end of a READ SECTORS. The final status used to go unread: a drive
+// that lost power right after a block, or ended with DF or ERR, gave good
+// data. Each case with the sector it concerns, and the control.
+static void test_c2_read_end(Mode m) {
+    const char *mn = m == CHS ? "CHS" : "LBA";
+    std::string n;
+    uint8_t buf[8 * 512]; uint32_t done = 0; int32_t r; ide_fail_t f;
+
+    n = std::string("C-2 control: a clean read of 8, ") + mn; setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    CHECK(r == 8 * 512 && done == 8, "control: r %d done %u", r, done);
+
+    n = std::string("C-2: DF at the end, ") + mn; setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.df_cmd = 0x20;
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_last_failure(&f);
+    CHECK(r < 0 && done == 7 && f.kind == IDE_FAIL_ERR && f.status == 0x70 && f.lba == 5007, "DF: r %d done %u kind %u st %02X lba %u",
+          r, done, f.kind, f.status, f.lba);
+    HostRead h = host_read10(5000, 8);
+    CHECK(!h.ok && h.data.size() <= 7 * 512 && matches_medium(h, 5000), "DF: host got %zu bytes", h.data.size());
+
+    n = std::string("C-2: ERR at the end, ") + mn; setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.err_end_cmd = 0x20;
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_last_failure(&f);
+    CHECK(r < 0 && done == 7 && f.kind == IDE_FAIL_ERR && f.status == 0x51, "ERR: r %d done %u kind %u st %02X", r, done, f.kind, f.status);
+
+    n = std::string("C-2: power lost on the last block, ") + mn; setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.dead_at = 5007;
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_last_failure(&f);
+    CHECK(r < 0 && done == 7 && f.kind == IDE_FAIL_NO_DRIVE && f.status == 0xFF && f.lba == 5007,
+          "last block: r %d done %u kind %u st %02X lba %u", r, done, f.kind, f.status, f.lba);
+
+    n = std::string("C-2: power lost on block 3 of 8, ") + mn; setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.dead_at = 5003;
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_last_failure(&f);
+    bool good = true;
+    for (uint32_t i = 0; i < done * 512; i++) good = good && buf[i] == sim.byte_at(5000 + i / 512, (int)(i % 512));
+    CHECK(r < 0 && done == 3 && good && f.kind == IDE_FAIL_NO_DRIVE, "block 3: r %d done %u good %d kind %u", r, done, good, f.kind);
+    // Through READ(10): the host is never given the FFFFh block.
+    n = std::string("C-2: power lost on block 3, READ(10), ") + mn; setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.dead_at = 5003;
+    h = host_read10(5000, 8);
+    CHECK(!h.ok && h.data.size() <= 3 * 512 && matches_medium(h, 5000), "READ(10): %zu bytes, right %d", h.data.size(),
+          matches_medium(h, 5000));
+
+    n = std::string("C-7: IORDY stall in block 4 of 8, ") + mn; setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.stall_at = 5004;
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_last_failure(&f);
+    CHECK(r < 0 && done == 4 && f.kind == IDE_FAIL_BAD_END && f.lba == 5004, "stall: r %d done %u kind %u lba %u",
+          r, done, f.kind, f.lba);
+
+    n = std::string("C-2: still busy after the last block, ") + mn; setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.busy_after[5007] = 60000000000ull;
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_last_failure(&f);
+    CHECK(r < 0 && done == 7 && f.kind == IDE_FAIL_TIMEOUT && f.reset, "busy: r %d done %u kind %u reset %d", r, done, f.kind, f.reset);
+}
+
+// C-2 for READ LONG: DF at the end, and the drive gone.
+static void test_c2_read_long_end() {
+    long_setup("C-2: READ LONG ends with DF", LBA);
+    sim.df_cmd = 0x23;
+    SatResult s = read_long_cmd(100, 516);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(!s.ok() && f.kind == IDE_FAIL_ERR && (f.status & 0x20), "DF: r %d kind %u st %02X", s.r, f.kind, f.status);
+    long_setup("C-2: READ LONG, the drive gone", LBA);
+    sim.dead_at = 100;
+    s = read_long_cmd(100, 516);
+    ide_last_failure(&f);
+    CHECK(!s.ok() && f.kind == IDE_FAIL_NO_DRIVE, "gone: r %d kind %u", s.r, f.kind);
+    long_setup("C-7: READ LONG with an IORDY stall", LBA);
+    sim.stall_at = 100;
+    s = read_long_cmd(100, 516);
+    ide_last_failure(&f);
+    CHECK(!s.ok() && f.kind == IDE_FAIL_BAD_END, "stall: r %d kind %u", s.r, f.kind);
+    long_setup("C-2: READ LONG still busy at the end", LBA);
+    sim.busy_after[100] = 60000000000ull;
+    s = read_long_cmd(100, 516);
+    ide_last_failure(&f);
+    CHECK(!s.ok() && f.kind == IDE_FAIL_TIMEOUT, "busy: r %d kind %u", s.r, f.kind);
+}
+
+// C-1: a drive that resets on its own, not by this firmware, loses its 91h.
+// In the 91h mode the geometry now goes out before every CHS command, so
+// the next read is still right.
+static void test_c1_outside_reset() {
+    setup("C-1: the drive resets by itself between reads, CHS", CHS);
+    chs_user_geometry();                            // 5 x 34 on a drive whose default is 10 x 17
+    HostRead h = host_read10(5000, 8);
+    CHECK(h.ok && matches_medium(h, 5000), "before the glitch");
+    sim.hw_reset_line(false, mock_now_ns);          // a power glitch: not sent by the firmware
+    mock_now_ns += 1000000;
+    sim.hw_reset_line(true, mock_now_ns);
+    mock_now_ns += 2000000000ull;                   // back and idle before the next command
+    h = host_read10(5000, 8);
+    CHECK(h.ok && matches_medium(h, 5000), "after an outside reset: ok %d, right %d", h.ok, matches_medium(h, 5000));
+    CHECK(sim.geo_valid && sim.heads == 5 && sim.spt == 34, "geometry not sent again: %d %u/%u", sim.geo_valid, sim.heads, sim.spt);
+}
+
+// C-4: a Ctrl+G drive is write protected whatever Features says.
+static void test_c4_ctrlg_write_protect() {
+    setup("C-4: Ctrl+G drive, write protect off in Features", CHS);
+    is_mounted = false;
+    uint8_t st = 0;
+    CHECK(ide_manual_chs(10, 17, &st) == IDE_MCHS_OK, "Ctrl+G: st %02X", st);
+    config.drive_write_protected = false;
+    is_mounted = true;
+    std::vector<uint8_t> data = fill512(8, 0x33);
+    int writes = sim.cmd_count[0x30];
+    CHECK(!tud_msc_is_writable_cb(0), "reported writable");
+    CHECK(host_write10(200, data.data(), 8) < 0 && sim.cmd_count[0x30] == writes, "WRITE(10) reached the drive");
+    SatResult ms6 = sat_cmd({ 0x1A, 0x00, 0x3F, 0x00, 0xFF, 0x00 }, 255, true);
+    SatResult ms10 = sat_cmd({ 0x5A, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00 }, 255, true);
+    CHECK(ms6.ok() && ms6.data.size() > 2 && (ms6.data[2] & 0x80) && ms10.ok() && ms10.data.size() > 3 && (ms10.data[3] & 0x80),
+          "MODE SENSE does not say write protected");
+    // Without a Ctrl+G, Features decides, as before.
+    setup("C-4: no Ctrl+G, write protect off", CHS);
+    config.drive_write_protected = false;
+    CHECK(tud_msc_is_writable_cb(0), "not writable without a Ctrl+G");
+}
+
 int main() {
     // The budget is a design number, not only what the helpers measure
     // against: 10 s under the 30 s that Linux and the project's tools give a
@@ -3407,6 +3548,11 @@ int main() {
     test_read_long_chs_geometry();
     test_read_long_refused();
     test_read_long_manual_chs();
+    test_c2_read_end(LBA);
+    test_c2_read_end(CHS);
+    test_c2_read_long_end();
+    test_c1_outside_reset();
+    test_c4_ctrlg_write_protect();
     test_read_long_drive_errors();
     test_read_long_ili_delivery();
     test_read_long_recovery_pending();

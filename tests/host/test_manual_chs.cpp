@@ -229,7 +229,8 @@ static void test_accepted() {
     bool right = got >= 0;
     for (int i = 0; right && i < 512; i++) right = buf[i] == sim.byte_at(1234, i);
     CHECK(right, "read after manual CHS: %d", (int)got);
-    CHECK(sim.cmd_log == (std::vector<uint8_t>{ 0x10, 0x91, 0x20 }), "commands after the read: %zu", sim.cmd_log.size());
+    // Review C, C-1: 0x91 again right before the READ, every time.
+    CHECK(sim.cmd_log == (std::vector<uint8_t>{ 0x10, 0x91, 0x91, 0x20 }), "commands after the read: %zu", sim.cmd_log.size());
     // The main menu shows it.
     tty.clear(); update_main_menu();
     CHECK(has("Manual CHS (no IDENTIFY)") && has("1045 Cyl / 2 Hd / 40 SPT"), "main menu");
@@ -334,7 +335,9 @@ static void test_refused() {
     t0 = mock_now_ns;
     CHECK(run_manual_chs(), "no result box");
     CHECK(sim.commands == 0 && no_identify(), "commands %d", sim.commands);
-    CHECK(mock_now_ns - t0 < 4000000000ull, "took %llu ms", (unsigned long long)((mock_now_ns - t0) / 1000000));
+    // Review C, C-8: FFh is given the same 45 s as BSY before "no drive".
+    uint64_t nd_ms = (mock_now_ns - t0) / 1000000;
+    CHECK(nd_ms >= 2000 + IDE_MCHS_READY_MS && nd_ms < 2000 + IDE_MCHS_READY_MS + 1000, "took %llu ms", (unsigned long long)nd_ms);
     CHECK(strstr(hdd_status_text, "Manual CHS: no drive answered (ST:FF)") != nullptr, "\"%s\"", hdd_status_text);
     CHECK(chs_geometry_lost, "RESET- sent, geometry not marked lost (M-1)");
 
@@ -539,18 +542,25 @@ static void test_m1_debug_r() {
 // geometry is cleared at the probe, so there is nothing to mount; and ide.c
 // on its own would have sent 0x91 again first.
 static void test_m1_auto_detect_esc() {
-    fresh("M-1 P2: Ctrl+G, Auto Detect, Esc");
+    // Review C, C-3: Auto Detect after a Ctrl+G is refused outright now,
+    // nothing sent, nothing changed.
+    fresh("M-1 P2: Ctrl+G, then Auto Detect is refused");
     sim.identify_ok = true;
     ctrl_g();
     CHECK(cur_cyls == C && ide_manual_chs_active(), "Ctrl+G did not set it");
-    keys("\x1b");
-    run_auto_detect();
-    CHECK(sim.id_commands() == 1 && !ide_manual_chs_active(), "Auto Detect: %d IDENTIFY, flag %d",
-          sim.id_commands(), ide_manual_chs_active());
-    CHECK(cur_cyls == 0 && cur_heads == 0 && cur_spt == 0 && !use_lba_mode && total_lba_sectors == 0,
-          "the Ctrl+G geometry kept: %u/%u/%u", cur_cyls, cur_heads, cur_spt);
-    CHECK(config.cyls == 0 && config.heads == 0 && config.spt == 0 && !config.use_lba_mode && config.lba_sectors == 0,
-          "config kept it: %u/%u/%u", config.cyls, config.heads, config.spt);
+    size_t m0 = sim.cmd_log.size();
+    int w0 = sim.reg_writes, hw0 = sim.hw_resets;
+    tty.clear();
+    keys("x\x1b\x1b");   // x for the refusal; Esc, Esc if Auto Detect ran
+    CHECK(!run_auto_detect() && sim.id_commands() == 0 && sim.cmd_log.size() == m0 && sim.reg_writes == w0 && sim.hw_resets == hw0,
+          "Auto Detect after Ctrl+G: %d IDENTIFY, %zu commands", sim.id_commands(), sim.cmd_log.size() - m0);
+    CHECK(has(AUTODETECT_REFUSED_MCHS) && cur_cyls == C && ide_manual_chs_active(), "not refused, or state changed");
+    // What the probe itself does is unchanged (the old test's ide.c half).
+    fresh("M-1 P2: the probe clears nothing it should not");
+    ctrl_g();
+    ide_probe_devices();
+    cur_cyls = 0; cur_heads = 0; cur_spt = 0; sync_to_config();     // as run_auto_detect clears it
+    CHECK(config.cyls == 0 && config.heads == 0 && config.spt == 0, "config kept it: %u/%u/%u", config.cyls, config.heads, config.spt);
     // Mount Drive's own test (core1_entry, main menu item 1): nothing to mount.
     bool gv = (use_lba_mode && total_lba_sectors > 0) || (!use_lba_mode && cur_cyls > 0 && cur_heads > 0 && cur_spt > 0);
     CHECK(!gv && saves == 0, "a geometry to mount, or the EEPROM written");
@@ -570,11 +580,6 @@ static void test_m1_auto_detect_esc() {
 
     // The drive refuses IDENTIFY (the CP3044 case): the error box with F:
     // Force, and the Ctrl+G geometry is not kept for the forced entry either.
-    fresh("M-1 P2: Ctrl+G, Auto Detect, IDENTIFY refused");
-    ctrl_g();
-    CHECK(run_auto_detect() && force_detect, "no error box offering F: Force");
-    CHECK(cur_cyls == 0 && cur_heads == 0 && config.cyls == 0 && config.heads == 0, "the Ctrl+G geometry kept");
-    CHECK(ide_manual_chs_active(), "flag cleared by an IDENTIFY that failed");
 }
 
 // N5: Ctrl+G after an Auto Detect that chose LBA must leave LBA mode, or the
@@ -594,7 +599,7 @@ static void test_mchs_after_lba_detect() {
     CHECK(cur_cyls == C && config.heads == H && config.spt == S, "geometry %u/%u/%u", cur_cyls, config.heads, config.spt);
     size_t m = sim.cmd_log.size();
     CHECK(read_right(1234), "read went to another sector");
-    CHECK(cmds_since(m) == std::vector<uint8_t>{ 0x20 } && !(sim.reg[6] & 0x40),
+    CHECK(cmds_since(m) == (std::vector<uint8_t>{ 0x91, 0x20 }) && !(sim.reg[6] & 0x40),   // 0x91 first: review C, C-1
           "not a CHS read: device register %02X", sim.reg[6]);
 }
 
@@ -622,8 +627,13 @@ static void test_mchs_iordy_held() {
     ctrl_g();
     CHECK(sent_exactly_recal_idp() && cur_cyls == C, "commands %zu", sim.cmd_log.size());
     CHECK(sim.iordy_stalls == 0, "%d register cycles with IORDY believed in the diagnostics", sim.iordy_stalls);
-    CHECK(mock_iordy_inover == GPIO_OVERRIDE_NORMAL, "IORDY not believed again after");
+    // Review C, C-7: never believed again for a Ctrl+G drive.
+    CHECK(mock_iordy_inover == GPIO_OVERRIDE_HIGH, "IORDY believed after Ctrl+G");
+    ide_iordy_follow_config();
+    ide_host_cmd_enter(); ide_host_cmd_leave();
+    CHECK(mock_iordy_inover == GPIO_OVERRIDE_HIGH, "IORDY believed at a host command after Ctrl+G");
     config.iordy_enabled = false;
+    mchs_no_identify = false;
     ide_iordy_follow_config();
 }
 
@@ -644,9 +654,11 @@ static void test_mchs_flag() {
     ctrl_g();
     current_screen = SCREEN_DEBUG; debug_key('i'); current_screen = SCREEN_MAIN;
     CHECK(ide_manual_chs_active() && sim.id_commands() == 0, "Debug I sent IDENTIFY after Ctrl+G (review of p10, M-1)");
-    keys("\x1b");
+    // Review C, C-3: Auto Detect is refused after a Ctrl+G, so only an
+    // ATAboy power cycle ends it (fresh() here).
+    keys("x\x1b\x1b");   // x for the refusal; Esc, Esc if Auto Detect ran
     run_auto_detect();
-    CHECK(!ide_manual_chs_active() && sim.id_commands() == 1, "kept after Auto Detect's IDENTIFY answered");
+    CHECK(ide_manual_chs_active() && sim.id_commands() == 0, "Auto Detect ran after Ctrl+G");
 
     fresh("Ctrl+G flag: not set by a refused 0x91");
     sim.reject_idp = true;
@@ -670,7 +682,6 @@ static void test_save_setup() {
 
     fresh("F10, Auto Mount on, after an Auto Detect that answered");
     sim.identify_ok = true;
-    ctrl_g();
     keys("\r");
     run_auto_detect();
     config.auto_mount = true;
@@ -837,7 +848,8 @@ static void test_native_resets() {
     int base = idp_sent();
     sim.bad[4321] = {BAD_HANG, 0};
     read_right(4321, &got);
-    CHECK(idp_sent() == base + 1, "old mode: 0x91 not sent after the soft reset (%d)", idp_sent() - base);
+    // One before the READ (review C, C-1), one after the soft reset.
+    CHECK(idp_sent() == base + 2, "old mode: 0x91 not sent after the soft reset (%d)", idp_sent() - base);
     native_drive("old mode control: recovery over host commands");
     keys("522\r4\r40\ry"); run_manual_chs();
     base = idp_sent();
@@ -963,15 +975,15 @@ static void test_p10_m1_no_identify() {
             debug('T'); debug('E');
             CHECK(sim.id_commands() == 0, "T or E sent IDENTIFY");
         }
-    // Auto Detect ends it: IDENTIFY goes out there, and Debug I afterwards.
-    native_drive("M-1: Auto Detect ends the refusal");
+    // Review C, C-3: Auto Detect does not end it any more; it is refused.
+    native_drive("M-1: Auto Detect refused too");
     sim.identify_ok = true;
     ctrl_g_native();
-    keys("\x1b");
+    keys("x\x1b\x1b");   // x for the refusal; Esc, Esc if Auto Detect ran
     run_auto_detect();
-    CHECK(sim.id_commands() == 1 && !ide_mchs_no_identify(), "Auto Detect: %d", sim.id_commands());
+    CHECK(sim.id_commands() == 0 && ide_mchs_no_identify(), "Auto Detect: %d", sim.id_commands());
     debug('I');
-    CHECK(sim.id_commands() == 2, "Debug I after Auto Detect: %d", sim.id_commands());
+    CHECK(sim.id_commands() == 0, "Debug I after Auto Detect: %d", sim.id_commands());
 }
 
 // M-2: an IDENTIFY that answers (only Auto Detect's can, now) ends both
@@ -1157,10 +1169,9 @@ static void test_p10_n2_marker_kept() {
     keys("522\r4\r40\ry"); run_manual_chs();
     detect_result_dismiss();
     CHECK(strcmp(hdd_model_raw, MCHS_MODEL_CLEARED) == 0, "\"%s\"", hdd_model_raw);
-    // Auto Detect ends it: as before.
-    native_drive("N-2: not after Auto Detect");
+    // With no Ctrl+G since the ATAboy started: as before.
+    native_drive("N-2: not without a Ctrl+G");
     sim.identify_ok = false;
-    ctrl_g_native();
     keys("\r");
     run_auto_detect();
     detect_result_dismiss();
@@ -1213,6 +1224,46 @@ static void test_p10_layers() {
     ide_manual_chs_native_forget();                 // the mode ended, the drive still marked
     CHECK(!ide_set_geometry(NH, NS) && refused.idp_native == 1 && refused.idp_zero == 0 && idp_sent() == 0,
           "native refusals %u", refused.idp_native);
+}
+#endif
+
+#ifdef AUTODETECT_CONFIRM
+// ---- 14. review C of 0.6f3p10 --------------------------------------------------
+static void test_c3_c5_c8() {
+    // C-3: Enter on Auto Detect asks first, and sends nothing to do so.
+    fresh("C-3: Auto Detect asks first");
+    sim.identify_ok = true;
+    keys("\x1b");                                    // if it ran at once, Esc out of its picker
+    CHECK(auto_detect_enter() && current_screen == SCREEN_CONFIRM && confirm_type == 6 && nothing_sent(),
+          "screen %d confirm %d, writes %d", (int)current_screen, confirm_type, sim.reg_writes);
+    current_screen = SCREEN_MAIN;
+    // ...and after a Ctrl+G it is refused at once: no question, nothing sent.
+    fresh("C-3: Auto Detect refused after a Ctrl+G");
+    sim.identify_ok = true;
+    ctrl_g_native();
+    size_t m = sim.cmd_log.size();
+    int w = sim.reg_writes;
+    keys("x\x1b\x1b");   // x for the refusal; Esc, Esc if Auto Detect ran
+    tty.clear();
+    CHECK(!auto_detect_enter() && current_screen == SCREEN_MAIN && sim.cmd_log.size() == m && sim.reg_writes == w &&
+          sim.id_commands() == 0 && has(AUTODETECT_REFUSED_MCHS), "screen %d, %zu commands", (int)current_screen, sim.cmd_log.size() - m);
+    // C-5: the active-low outputs are high before they become outputs.
+    fresh("C-5: no RESET- or CS pulse at boot");
+    mock_gpio_out = 0;
+    ide_hw_init();
+    uint32_t need = (1u << IDE_RESET) | (1u << IDE_CS0) | (1u << IDE_CS1) | (1u << IDE_OE) | (1u << IDE_OE1);
+    CHECK((mock_gpio_out_at_dir & need) == need, "latch at output enable %08X", (unsigned)mock_gpio_out_at_dir);
+    // C-2: Debug E names the new failure kind.
+    fresh("C-2: Debug E says no drive");
+    last_fail.kind = IDE_FAIL_NO_DRIVE; last_fail.command = 0x20; last_fail.status = 0xFF; last_fail.lba = 5003;
+    last_fail.done = 3; last_fail.count = 8;
+    tty.clear(); run_debug_errors();
+    CHECK(has("[Last Failed I/O] cmd 20 no drive at LBA 5003, 3 of 8 done"), "Debug E");
+    // C-8: a drive that floats the bus (FFh) for 5 s after RESET- is waited for.
+    native_drive("C-8: FFh for 5 s after RESET-");
+    sim.t_float = 5000000000ull;
+    keys("\x07" "522\r4\r40\ry");
+    CHECK(!run_manual_chs() && cur_cyls == NC, "\"%s\"", hdd_status_text);
 }
 #endif
 
@@ -1358,6 +1409,9 @@ int main() {
 #ifdef MCHS_MODEL_CLEARED
     test_p10_n2_marker_kept();
     test_p10_layers();
+#endif
+#ifdef AUTODETECT_CONFIRM
+    test_c3_c5_c8();
 #endif
     test_core1();                                   // does not return
     printf("%d checks, %d failed\n", checks, failures);

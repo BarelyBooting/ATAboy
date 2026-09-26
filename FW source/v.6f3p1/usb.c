@@ -191,9 +191,17 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8],
     memcpy(product_rev, rev, strlen(rev) < 4 ? strlen(rev) : 4);
 }
 
+// Review C, C-4: a drive set up by Ctrl+G (either mode, until the ATAboy is
+// power-cycled) is write protected whatever Features says: nothing it is
+// for needs a write, and a saved "Disabled" from a donor session must not
+// reach it.
+static bool write_protected(void) {
+    return config.drive_write_protected || ide_mchs_no_identify();
+}
+
 bool tud_msc_is_writable_cb(uint8_t lun) {
     (void)lun;
-    return !config.drive_write_protected;
+    return !write_protected();
 }
 
 bool tud_msc_test_unit_ready_cb(uint8_t lun) {
@@ -334,7 +342,7 @@ static int32_t write10(uint8_t lun, uint32_t lba, uint32_t offset,
     sat_sense_forget();     // this command may set sense of its own
 #endif
     usb_sense_forget();
-    if (!is_mounted || config.drive_write_protected) return -1;
+    if (!is_mounted || write_protected()) return -1;
 
     // TinyUSB derives the block size from the host's CBW (length / count)
     // and never checks it against the 512 we report. With 512-byte blocks
@@ -600,12 +608,12 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
 
         if (!is10) {
             buf[0] = (uint8_t)(pos - 1);
-            buf[2] = config.drive_write_protected ? 0x80 : 0x00;
+            buf[2] = write_protected() ? 0x80 : 0x00;
         } else {
             uint16_t full = pos - 2;
             buf[0] = (uint8_t)(full >> 8);
             buf[1] = (uint8_t)(full & 0xFF);
-            buf[3] = config.drive_write_protected ? 0x80 : 0x00;
+            buf[3] = write_protected() ? 0x80 : 0x00;
         }
         return (int32_t)pos;
     }

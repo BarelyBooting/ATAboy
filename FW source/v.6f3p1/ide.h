@@ -98,6 +98,8 @@ void    ide_host_cmd_leave(void);
                                 // refused INITIALIZE DEVICE PARAMETERS (command says which)
 #define IDE_FAIL_MCHS_NOT_READY 9   // manual CHS, power-up default mode: RECALIBRATE (10h)
                                 // ended but the drive was not ready, no ERR, within 1 s
+#define IDE_FAIL_NO_DRIVE   10  // status FFh or 7Fh for IDE_FLOAT_MS: nothing drives the bus
+                                // (drive unpowered, unplugged or dead); review C, C-2
 typedef struct {
     uint8_t  kind;          // IDE_FAIL_*
     uint8_t  command;       // ATA command that failed

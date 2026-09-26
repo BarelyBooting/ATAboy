@@ -255,6 +255,10 @@ void ide_write_control(uint8_t val) {
 }
 
 void ide_set_iordy(bool enabled) {
+    // Review C, C-7: never believed for a Ctrl+G drive (until the ATAboy is
+    // power-cycled). The CP3044's connector table marks pin 27 (IORDY)
+    // RESERVED, and a drive holding it low would stall the PIO programs.
+    if (mchs_no_identify) enabled = false;
     gpio_set_inover(IDE_IORDY, enabled ? GPIO_OVERRIDE_NORMAL : GPIO_OVERRIDE_HIGH);
 }
 
@@ -493,6 +497,12 @@ void ide_hw_init(void) {
                        (1 << IDE_CS0) | (1 << IDE_CS1);
 
     gpio_init_mask(sio_out);
+    // Review C, C-5: gpio_init_mask leaves every output latch at 0, so making
+    // them outputs drove RESET-, CS0-, CS1- and both transceiver enables low
+    // until the lines below: a reset of the drive at every boot, of
+    // unmeasured length. The active-low ones are set high first.
+    sio_hw->gpio_set = (1 << IDE_RESET) | (1 << IDE_CS0) | (1 << IDE_CS1) |
+                       (1 << IDE_OE) | (1 << IDE_OE1);
     gpio_set_dir_out_masked(sio_out);
 
     // INTRQ — active-high from drive, idle low
@@ -1128,8 +1138,17 @@ static void soft_reset_restore(void) {
 // CHS mode after a reset that could not restore the geometry: try once more
 // (the drive may just have been slow). False if the drive still will not
 // take it; the caller must then refuse the transfer.
+// Review C, C-1: in the 91h mode the geometry is sent before EVERY CHS
+// transfer, not only after a reset this firmware sent or saw. A drive that
+// resets on its own (a power glitch, a brown-out, an internal reset) drops
+// its 91h, and nothing on the bus need show it: the next command would go
+// through the drive's own default translation and read other sectors with
+// good status. Sending 91h each time costs one short command per chunk of
+// at most 8 sectors. In the power-up default mode none is ever sent (the
+// default is the geometry in use, and a reset restores it).
 static bool chs_geometry_ok(void) {
-    if (config.use_lba_mode || !chs_geometry_lost) return true;
+    if (config.use_lba_mode) return true;
+    if (native_geometry_in_use()) { chs_geometry_lost = false; return true; }
     // No geometry at all (Auto Detect cleared it, or a Ctrl+G failed): there
     // is nothing to send, and a CHS address could not even be worked out.
     // usb.c refuses before this with nothing mounted; this does not rely on it.
@@ -1219,11 +1238,16 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
     }
     ide_write_reg(6, dev_base);
     busy_wait_us_32(50);            // let selection settle, as the probe
+    // Review C, C-8: FFh is "nothing drives the bus yet", which a drive older
+    // than ATA can show while it comes out of reset, so it gets the same 45 s
+    // as BSY; only FFh all that time is "no drive".
     for (;;) {
         st = ide_read_reg(7);
-        if (st == 0xFF) { *status = st; return IDE_MCHS_NO_DEVICE; }
-        if (!(st & 0x80)) break;
-        if (ms_passed(t0, IDE_MCHS_READY_MS)) { *status = st; return IDE_MCHS_BUSY; }
+        if (st != 0xFF && !(st & 0x80)) break;
+        if (ms_passed(t0, IDE_MCHS_READY_MS)) {
+            *status = st;
+            return st == 0xFF ? IDE_MCHS_NO_DEVICE : IDE_MCHS_BUSY;
+        }
         busy_wait_us_32(10);
     }
     iordy_release();                // past its power-on diagnostics
@@ -1372,6 +1396,25 @@ static bool time_to_send(uint32_t lba, uint32_t count) {
 
 // A sector read failed after the drive had worked on it for ms: kept for the
 // issue #13 call again at it, in this host command only.
+// Review C, C-2: a status no drive gives. FFh is what the Rev .6 board reads
+// when nothing drives the bus (16 pull-ups to +5 V: a drive unpowered,
+// unplugged or dead); 7Fh the same with DD7 pulled down. Taken as floating
+// once it has lasted IDE_FLOAT_MS, since BSY makes the other bits
+// meaningless for a moment.
+#define IDE_FLOAT_MS 50
+static inline bool status_floating(uint8_t st) { return st == 0xFF || st == 0x7F; }
+
+// The status now, and whether it stays floating for IDE_FLOAT_MS.
+static bool floating_persists(uint8_t *st) {
+    uint32_t t0 = ms_now();
+    for (;;) {
+        *st = ide_read_reg(7);
+        if (!status_floating(*st)) return false;
+        if (ms_passed(t0, IDE_FLOAT_MS)) return true;
+        busy_wait_us_32(10);
+    }
+}
+
 static void note_failed_sector(uint32_t lba, uint32_t ms) {
     host.failed = true;
     host.fail_lba = lba;
@@ -1490,6 +1533,13 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
     uint32_t sector_start = start;                         // when the drive began on sector s
 
     uint16_t *wbuf = (uint16_t *)buf;
+    // Review C, C-2: a block is only good once a sane status (not floating)
+    // has followed it: the drive losing power right after offering one
+    // leaves FFFFh words and status FFh behind.
+    bool vouched = true;
+    bool floating = false;
+    uint32_t float_since = 0;
+    uint32_t stalls = ide_pio_stalls();                    // review C, C-7: IORDY held too long
 
     for (s = 0; s < count; s++) {
         // Poll for DRQ — INTRQ provides early-exit if enabled, otherwise pure polling
@@ -1497,6 +1547,14 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
             if (ms_passed(start, limit)) goto read_timeout;   // read: no DRQ in time
             if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
             st = ide_read_reg(7);
+            if (status_floating(st)) {
+                if (!floating) { floating = true; float_since = ms_now(); }
+                else if (ms_passed(float_since, IDE_FLOAT_MS)) goto read_float;
+                busy_wait_us_32(10);
+                continue;
+            }
+            floating = false;
+            vouched = true;
             // While BSY is set the other status bits are not valid (ATA), so a
             // leftover ERR must not end a command the drive is still working on.
             if (st & 0x80) { busy_wait_us_32(10); continue; }
@@ -1514,11 +1572,81 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
 
         sio_hw->gpio_set = (1 << IDE_CS0);
         bus_idle();
+        if (ide_pio_stalls() != stalls) goto read_stall;
         sector_start = ms_now();
+        vouched = false;
     }
+
+    // Review C, C-2: the end of the command. Its final status was never
+    // read, so a drive that died after the last block, or ended the command
+    // with ERR or DF, gave good data. Now BSY must clear (within the
+    // command's time) with DRDY, and ERR, DF and DRQ clear, the status not
+    // floating; otherwise the last sector fails and is not handed over.
+    floating = false;
+    for (;;) {
+        st = ide_read_reg(7);
+        if (status_floating(st)) {
+            if (!floating) { floating = true; float_since = ms_now(); }
+            else if (ms_passed(float_since, IDE_FLOAT_MS)) { s = count - 1; vouched = true; goto read_float; }
+        } else {
+            floating = false;
+            if (!(st & 0x80) && (st & 0x61)) break;       // not busy: DRDY, or ERR or DF to report
+        }
+        if (ms_passed(start, limit)) goto end_busy;
+        busy_wait_us_32(10);
+    }
+    if (st & 0x21) goto end_err;                           // ERR or DF at the end
+    if (st & 0x08) goto end_drq;                           // still offering data
 
     if (done) *done = count;
     return (int32_t)(count * 512);
+
+end_err:
+    // The last block was transferred, then the drive reported an error (ERR)
+    // or a device fault (DF). That sector is not trusted.
+    note_failed_sector(lba + count - 1, ms_now() - sector_start);
+    record_failure(IDE_FAIL_ERR, cmd, st, lba + count - 1, count - 1, count);
+    if ((st & 0x20) || !idle_after_error(2000)) soft_reset_restore();
+    if (done) *done = count - 1;
+    return -1;
+
+end_drq:
+    // More data on offer than was asked for: the drive and the firmware
+    // disagree about the command. Reset it; the last sector is not trusted.
+    note_failed_sector(lba + count - 1, ms_now() - sector_start);
+    record_failure(IDE_FAIL_BAD_END, cmd, st, lba + count - 1, count - 1, count);
+    soft_reset_restore();
+    if (done) *done = count - 1;
+    return -1;
+
+end_busy:
+    // Still busy when the command's time ran out, after the last block.
+    note_failed_sector(lba + count - 1, ms_now() - sector_start);
+    record_failure(IDE_FAIL_TIMEOUT, cmd, st, lba + count - 1, count - 1, count);
+    soft_reset_restore();
+    if (done) *done = count - 1;
+    return -1;
+
+read_stall:
+    // Review C, C-7: IORDY held a cycle of this block past IDE_PIO_STALL_US,
+    // and ide_pio released it by ignoring IORDY. The block is not trusted
+    // and the drive is reset; the blocks before it are good.
+    note_failed_sector(lba + s, ms_now() - sector_start);
+    record_failure(IDE_FAIL_BAD_END, cmd, ide_read_reg(7), lba + s, s, count);
+    soft_reset_restore();
+    if (done) *done = s;
+    return -1;
+
+read_float:
+    // Nothing drives the bus. The block before this status, if any, came
+    // with no sane status after it, so it is not counted either. The reset
+    // marks the geometry lost (a drive that lost power lost its 91h too).
+    if (!vouched && s > 0) s--;
+    note_failed_sector(lba + s, ms_now() - sector_start);
+    record_failure(IDE_FAIL_NO_DRIVE, cmd, st, lba + s, s, count);
+    soft_reset_restore();
+    if (done) *done = s;
+    return -1;
 
 read_err:
     // The drive ended the command with ERR at sector s. Sectors 0..s-1 are
@@ -1542,6 +1670,7 @@ read_timeout:
     // No DRQ in the time allowed: the drive may still be retrying, so abort
     // with SRST (and, if it does not come back, one hardware reset). The
     // sectors before this one are good and go to the host (issue #13).
+    if (!vouched && s > 0) s--;                            // review C, C-2, as read_float
     note_failed_sector(lba + s, ms_now() - sector_start);
     record_failure(IDE_FAIL_TIMEOUT, cmd, st, lba + s, s, count);
     soft_reset_restore();
@@ -1759,10 +1888,20 @@ int ide_read_long(uint32_t lba, uint8_t *buf) {
     uint32_t start = ms_now();                              // as a read: the whole command,
     uint32_t limit = work_ms(IDE_CMD_TIMEOUT_MS);           // or what the host command has left
 
+    bool floating = false;                                  // review C, C-2, as a read
+    uint32_t float_since = 0;
+    uint32_t stalls = ide_pio_stalls();                     // review C, C-7
     for (;;) {
         if (ms_passed(start, limit)) goto long_timeout;     // no DRQ in time
         if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
         st = ide_read_reg(7);
+        if (status_floating(st)) {
+            if (!floating) { floating = true; float_since = ms_now(); }
+            else if (ms_passed(float_since, IDE_FLOAT_MS)) goto long_float;
+            busy_wait_us_32(10);
+            continue;
+        }
+        floating = false;
         if (st & 0x80) { busy_wait_us_32(10); continue; }  // BSY: other bits not valid yet
         if (st & 0x01) goto long_err;
         if (st & 0x08) break;
@@ -1783,13 +1922,25 @@ int ide_read_long(uint32_t lba, uint8_t *buf) {
         }
     }
     if (read_long_ecc(buf + 512, ecc, &st) < ecc) goto long_bad_end;   // fewer than 4
+    if (ide_pio_stalls() != stalls) goto long_bad_end;      // review C, C-7: IORDY held too long
 
     // The drive should now end the command: BSY and DRQ clear.
     {
         uint32_t end_start = ms_now();
         uint32_t end_limit = recovery_ms(IDE_LONG_END_MS);
+        floating = false;
         for (;;) {
             st = ide_read_reg(7);
+            // Review C, C-2: a floating bus at the end is a drive gone, not
+            // an end; DF is an error like ERR.
+            if (status_floating(st)) {
+                if (!floating) { floating = true; float_since = ms_now(); }
+                else if (ms_passed(float_since, IDE_FLOAT_MS)) goto long_float;
+                if (ms_passed(end_start, end_limit)) goto long_float;
+                busy_wait_us_32(10);
+                continue;
+            }
+            floating = false;
             if (!(st & 0x80)) {
                 if (st & 0x08) {
                     // DRQ still up: let it settle, polling Alternate Status,
@@ -1802,14 +1953,14 @@ int ide_read_long(uint32_t lba, uint8_t *buf) {
                     if ((st & 0x88) == 0x08) goto long_bad_end;     // more than 4
                     // Dropped: read Status again, below, within the same limit.
                 } else {
-                    if (st & 0x01) goto long_err;
+                    if (st & 0x21) goto long_err;           // ERR, or DF (review C, C-2)
                     return IDE_LONG_OK;
                 }
             }
-            // Still busy: as a read leaves it, the next command waits for ready
-            // (and its stale-data check resets a drive that then offers more).
-            // Bounded however DRQ comes and goes.
-            if (ms_passed(end_start, end_limit)) return IDE_LONG_OK;
+            // Still busy when the time for the end is up. Review C, C-2: that
+            // used to count as done; the data is not trusted now, and the
+            // drive is reset as after any command that did not end.
+            if (ms_passed(end_start, end_limit)) goto long_timeout;
             busy_wait_us_32(10);
         }
     }
@@ -1824,20 +1975,27 @@ long_err:
         (void)read_long_ecc(0, ecc, &st);
         last_fail.drained = true;
     }
-    if (!idle_after_error(2000)) soft_reset_restore();
+    if ((st & 0x20) || !idle_after_error(2000)) soft_reset_restore();
     // ABRT and nothing else: the command is not supported (ATA-3 7.16).
-    return last_fail.error == 0x04 ? IDE_LONG_ABRT : IDE_LONG_ERR;
+    return (!(st & 0x20) && last_fail.error == 0x04) ? IDE_LONG_ABRT : IDE_LONG_ERR;
 
 long_bad_end:
     // The drive did not offer exactly 512 + 4 bytes. A drive still offering
     // data is reset (st has DRQ); one that stopped short and is idle needs
-    // nothing.
+    // nothing. Review C, C-2: one that has gone (a floating bus reads as
+    // BSY and DRQ together) is recorded as that.
+    if (status_floating(st) && floating_persists(&st)) goto long_float;
     record_failure(IDE_FAIL_BAD_END, cmd, st, lba, 0, 1);
     if ((st & 0x08) || !idle_after_error(2000)) soft_reset_restore();
     return IDE_LONG_ABORTED;
 
 long_timeout:
     record_failure(IDE_FAIL_TIMEOUT, cmd, st, lba, 0, 1);
+    soft_reset_restore();
+    return IDE_LONG_ABORTED;
+
+long_float:
+    record_failure(IDE_FAIL_NO_DRIVE, cmd, st, lba, 0, 1);  // review C, C-2
     soft_reset_restore();
     return IDE_LONG_ABORTED;
 }

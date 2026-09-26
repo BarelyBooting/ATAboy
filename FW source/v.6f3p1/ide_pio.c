@@ -5,6 +5,7 @@
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "pico/stdlib.h"
+#include "pico/time.h"
 
 static PIO pio = pio0;
 static uint sm_read;
@@ -59,17 +60,33 @@ void ide_pio_init(void) {
 
 }
 
+// Review C, C-7: a cycle held by IORDY for longer than IDE_PIO_STALL_US is
+// released by taking IORDY as high from here on (the GPIO input override;
+// ide.c puts the configured setting back at the next reset or host command,
+// and the next stall, if any, ends the same way).
+static volatile uint32_t stalls = 0;
+uint32_t ide_pio_stalls(void) { return stalls; }
+
+static void iordy_unstick(void) {
+    gpio_set_inover(IDE_IORDY, GPIO_OVERRIDE_HIGH);
+    stalls++;
+}
+
+// Wait for cond with a deadline of IDE_PIO_STALL_US from the last progress.
+#define PIO_WAIT(cond) do {         uint64_t t0_ = time_us_64();         while (!(cond)) {             if (time_us_64() - t0_ > IDE_PIO_STALL_US) { iordy_unstick(); t0_ = time_us_64(); }             tight_loop_contents();         }     } while (0)
+
 void ide_pio_read(uint32_t count, uint16_t *buf) {
     // Push count-1 to start the read burst
-    pio_sm_put_blocking(pio, sm_read, count - 1);
+    PIO_WAIT(!pio_sm_is_tx_fifo_full(pio, sm_read));
+    pio_sm_put(pio, sm_read, count - 1);
 
     for (uint32_t i = 0; i < count; i++) {
-        buf[i] = (uint16_t)pio_sm_get_blocking(pio, sm_read);
+        PIO_WAIT(!pio_sm_is_rx_fifo_empty(pio, sm_read));
+        buf[i] = (uint16_t)pio_sm_get(pio, sm_read);
     }
 
     // Wait for PIO completion IRQ, then clear it to release the SM
-    while (!(pio->irq & (1u << sm_read)))
-        tight_loop_contents();
+    PIO_WAIT(pio->irq & (1u << sm_read));
     pio->irq = 1u << sm_read;
 }
 
@@ -78,14 +95,15 @@ void ide_pio_write(uint32_t count, const uint16_t *buf) {
     pio_sm_set_consecutive_pindirs(pio, sm_write, 0, 16, true);
 
     // Push count-1, then each data word
-    pio_sm_put_blocking(pio, sm_write, count - 1);
+    PIO_WAIT(!pio_sm_is_tx_fifo_full(pio, sm_write));
+    pio_sm_put(pio, sm_write, count - 1);
     for (uint32_t i = 0; i < count; i++) {
-        pio_sm_put_blocking(pio, sm_write, (uint32_t)buf[i]);
+        PIO_WAIT(!pio_sm_is_tx_fifo_full(pio, sm_write));
+        pio_sm_put(pio, sm_write, (uint32_t)buf[i]);
     }
 
     // Wait for completion
-    while (!(pio->irq & (1u << sm_write)))
-        tight_loop_contents();
+    PIO_WAIT(pio->irq & (1u << sm_write));
     pio->irq = 1u << sm_write;
 
     // Data bus back to input

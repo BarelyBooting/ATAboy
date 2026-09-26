@@ -17,4 +17,12 @@ void ide_pio_read(uint32_t count, uint16_t *buf);
 // Automatically toggles data bus direction (output during write, input after).
 void ide_pio_write(uint32_t count, const uint16_t *buf);
 
+// Review C, C-7: the PIO programs wait on IORDY with no timeout of their
+// own. ide_pio_read and ide_pio_write give each word IDE_PIO_STALL_US; a
+// cycle still held after that is released by taking IORDY as high (ignored,
+// GPIO override) and counted here. What that word carried is not to be
+// trusted: ide.c fails a transfer during which the count moved.
+#define IDE_PIO_STALL_US 1000
+uint32_t ide_pio_stalls(void);
+
 #endif

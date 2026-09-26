@@ -780,7 +780,7 @@ static void run_debug_errors(void) {
         debug_print(2, FG_WHITE, "[Last Failed I/O] none since power-up");
     } else {
         static const char *kinds[] = {"?", "not ready", "ERR", "timeout", "stale data", "no geometry",
-                                      "no time", "bad end"};
+                                      "no time", "bad end", "?", "?", "no drive"};   // 10: review C, C-2
         if (f.kind == IDE_FAIL_MANUAL_CHS)      // Ctrl+G: no sector was asked for
             debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X, manual CHS: %s", f.command,
                         f.command == 0x91 ? "drive refused geometry" : "RECALIBRATE did not end");
@@ -789,7 +789,7 @@ static void run_debug_errors(void) {
                         f.command);
         else
             debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
-                        f.command, kinds[f.kind < 8 ? f.kind : 0], (unsigned long)f.lba,
+                        f.command, kinds[f.kind < 11 ? f.kind : 0], (unsigned long)f.lba,
                         (unsigned long)f.done, (unsigned long)f.count);
         // "HW reset": the soft reset did not bring the drive back, so RESET-
         // was used as well (both devices on the cable). The longest row,
@@ -911,7 +911,7 @@ static void debug_key(int k) {
     if ((k == 'i' || k == 'I' || k == 's' || k == 'S') && ide_mchs_no_identify()) {
         debug_cls();
         debug_print(0, "\033[91;1m", DEBUG_REFUSED_MCHS);
-        debug_print(1, FG_WHITE, "Auto Detect ends this (it sends IDENTIFY).");
+        debug_print(1, FG_WHITE, "Power-cycle the ATAboy to end this.");
         return;
     }
     if (!bus_free_wait(true)) return;
@@ -1073,7 +1073,19 @@ static void fwupdate_confirmed(void) {
 // Auto Detect (main menu, Enter on the first item). Waits first for a USB
 // command that is still running on core 0 (bus_free_wait, review L-5).
 // True when the result box should be drawn (core1_entry's trigger_overlay).
+// Review C, C-3: Auto Detect sends the drive IDENTIFY, so it is refused
+// after any Ctrl+G, either mode, until the ATAboy is power-cycled (the
+// no-IDENTIFY rule is RAM only), and from the main menu it asks first
+// (confirm_type 6). Nothing is sent before the refusal.
+#define AUTODETECT_REFUSED_MCHS "Ctrl+G drive: Auto Detect refused. Press a key"
+#define AUTODETECT_CONFIRM      "Auto Detect sends IDENTIFY. Run it (Y/N)?"
 static bool run_auto_detect(void) {
+    if (ide_mchs_no_identify()) {
+        draw_confirm_box(AUTODETECT_REFUSED_MCHS);
+        while (get_input() == -1) tight_loop_contents();
+        needs_full_redraw = true;
+        return false;
+    }
     if (!bus_free_wait(false)) { needs_full_redraw = true; return false; }
     bool overlay = false;
     // Auto Detect: single reset, probe master then slave
@@ -1392,6 +1404,18 @@ static void mount_nothing_to_mount(void) {
     show_detect_result = true; needs_full_redraw = true;
 }
 
+// Enter on "Auto Detect & Set Geometry". Review C, C-3: it asks first
+// (confirm_type 6; Y runs it), and after a Ctrl+G it is refused at once
+// (run_auto_detect says so), nothing sent either way. True when the
+// question is to be drawn.
+static bool auto_detect_enter(void) {
+    if (ide_mchs_no_identify()) { (void)run_auto_detect(); return false; }
+    current_screen = SCREEN_CONFIRM;
+    confirm_type = 6;
+    needs_full_redraw = true;
+    return true;
+}
+
 // Y at "Save Current Setup to EEPROM" (F10, or the main menu item). Review of
 // 0.6f3p8 (L-1): with Auto Mount on, every power-up resets the drive and
 // sends it IDENTIFY before anything else (try_auto_mount), whenever a
@@ -1465,6 +1489,7 @@ void core1_entry(void) {
                 else if (confirm_type == 3) draw_confirm_box("Are you sure you want to mount the drive (Y/N)?");
                 else if (confirm_type == 4) draw_confirm_box("Are you sure you want to unmount (Y/N)?");
                 else if (confirm_type == 5) draw_confirm_box("Enter firmware update mode (Y/N)?");
+                else if (confirm_type == 6) draw_confirm_box(AUTODETECT_CONFIRM);
                 trigger_overlay = false;
             }
         } else if (current_screen == SCREEN_MOUNTED) {
@@ -1562,6 +1587,10 @@ void core1_entry(void) {
                     fwupdate_confirmed();
                     current_screen = SCREEN_MAIN;
                 }
+                else if (confirm_type == 6) {       // review C, C-3: Y to Auto Detect
+                    current_screen = SCREEN_MAIN;
+                    if (run_auto_detect()) trigger_overlay = true;
+                }
                 needs_full_redraw = true;
             } else if (k == 'n' || k == 'N' || k == KEY_ESC) {
                 current_screen = (confirm_type == 1) ? confirm_return_screen :
@@ -1593,7 +1622,7 @@ void core1_entry(void) {
             }
             else if (k == KEY_ENTER) {
                 if (config.main_selected == 0) {
-                    if (run_auto_detect()) trigger_overlay = true;
+                    if (auto_detect_enter()) trigger_overlay = true;
                 } else if (config.main_selected == 1) {
                     bool dv = (hdd_model_raw[0] != '\0');
                     bool gv = (use_lba_mode && total_lba_sectors > 0) || (!use_lba_mode && cur_cyls > 0 && cur_heads > 0 && cur_spt > 0);

@@ -174,6 +174,16 @@ struct SimDrive {
     // error register 0; for a PIO data-in command after its last block, or,
     // with df_before_data, instead of the first block. 0 = none.
     uint8_t  df_cmd = 0;
+    // Review C (C-2): the drive loses power while it offers the block for
+    // dead_at (words FFFFh from then on, status FFh, nothing answers), or
+    // ends a read with ERR after the last block (err_end_cmd, status 51h).
+    uint32_t dead_at = 0xFFFFFFFFu;
+    uint32_t stall_at = 0xFFFFFFFFu;           // C-7: IORDY holds a cycle of this block too long
+    uint32_t pio_stalls = 0;
+    uint64_t t_float = 0;                      // C-8: status FFh this long after RESET- goes high
+    uint64_t float_until = 0;
+    bool     dead = false;
+    uint8_t  err_end_cmd = 0;
     bool     df_before_data = false;
     // INTRQ. intrq is the drive's interrupt pending; the line is high when
     // it is, the drive is selected and nIEN (Device Control bit 1) is 0.
@@ -406,6 +416,8 @@ struct SimDrive {
 
     // alt: Alternate Status (control block), which does not release INTRQ.
     uint8_t read_status(uint64_t now, bool alt = false) {
+        if (dead) return 0xFF;                     // review C: nothing drives the bus
+        if (now < float_until) return 0xFF;        // C-8: not driving the bus yet
         if (!selected()) {
             if (slave && master_present) return master_busy(now) ? 0x80 : 0x50;
             return 0xFF;                           // no such device: the ATAboy bus floats high (ide.c probe filter)
@@ -432,6 +444,7 @@ struct SimDrive {
 
     uint16_t read_reg(int r, uint64_t now) {
         if (r == 7) return read_status(now);
+        if (dead) return 0xFF;
         if (r == 1) return error;
         if ((devctl & 0x80) && r >= 2 && r <= 5) return hob[r];   // HOB: previous content
         return reg[r];
@@ -629,13 +642,17 @@ struct SimDrive {
             wedged = wedged_before_reset;
         }
         ready_at = now + t_hw_reset;
+        float_until = now + t_float;
         srst_released_at = now;
         status_before_srst = 0x80;             // BSY through the 2 ms window
         master_ready_at = now + t_hw_reset;
     }
 
     uint16_t read_data(uint64_t now) {
+        if (dead) { data_reads++; return 0xFFFF; }
         tick(now);
+        if ((phase == DRQ_IN) && widx == 0 && cur == dead_at) { dead = true; data_reads++; return 0xFFFF; }
+        if ((phase == DRQ_IN) && widx == 0 && cur == stall_at) pio_stalls++;   // ide_pio released it
         data_reads++;
         if (cmd == 0xEC) id_data_reads++;
         if (phase == DRQ_IN || phase == ERR_DRQ) {
@@ -650,6 +667,7 @@ struct SimDrive {
                     cur++; left--;
                     if (left == 0) {
                         phase = IDLE; status = (df_cmd && cmd == df_cmd) ? 0x70 : 0x50;
+                        if (err_end_cmd && cmd == err_end_cmd) { status = 0x51; error = 0x04; }
                         if (busy_after.count(cur - 1)) { status = 0x80; ready_at = now + busy_after[cur - 1]; }
                         if (is_long() && drq_linger) { status = 0x58; lingering = true; linger_until = now + drq_linger; }
                     }
@@ -699,6 +717,8 @@ inline void iordy_check() {
 // middle of a command (an unmount, say), run from the next register read.
 // The callback clears it first if it should run once.
 inline void (*sim_on_read)() = nullptr;
+// ide_pio.c's count of IORDY stalls it had to release (review C, C-7).
+uint32_t ide_pio_stalls(void) { return sim.pio_stalls; }
 void ide_pio_read(uint32_t count, uint16_t *buf) {
     if (sim_on_read) sim_on_read();
     iordy_check();
