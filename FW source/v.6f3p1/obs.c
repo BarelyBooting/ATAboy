@@ -393,6 +393,8 @@ bool obs_hash_engine_ok(void) { return engine_ok; }
 static struct { obs_hash_entry_t *e; uint32_t seq; const uint8_t *data; } hq[OBS_HASH_QUEUE];
 static uint32_t hq_head, hq_tail;       // queued: hq_head up to hq_tail
 static obs_hash_entry_t *hash_pend;     // the engine has it
+static bool read_ahead;                 // usb.c: blocks read ahead (stage 2) get OBS_H_PREFETCH
+void obs_set_read_ahead(bool on) { read_ahead = on; }
 static uint32_t hash_pend_seq;
 
 static void hash_collect(void) {
@@ -432,7 +434,7 @@ void obs_hash_sector(uint32_t cmd_seq, uint32_t lba, uint32_t index, uint8_t fla
     e->lba = lba;
     e->cmd_seq = cmd_seq;
     e->index = (uint16_t)index;
-    e->flags = flags;
+    e->flags = (uint8_t)(flags | (read_ahead ? OBS_H_PREFETCH : 0));
     e->reserved = 0;
     uint32_t i = hq_tail % OBS_HASH_QUEUE;
     hq[i].e = e;
@@ -549,6 +551,7 @@ void obs_test_reset(uint32_t log_first, uint32_t hash_first) {
     host_on = false;
     hash_pend = NULL; hash_pend_seq = 0;
     hq_head = hq_tail = 0;
+    read_ahead = false;
     sw_pending = false;
     engine_ok = false; engine_tested = false;
     obs_init();

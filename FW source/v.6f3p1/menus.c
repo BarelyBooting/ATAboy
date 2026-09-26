@@ -408,13 +408,14 @@ static void update_main_menu(void) {
 // ---------------------------------------------------------------------------
 
 static void update_features_menu(void) {
-    const char *labels[] = {"Write Protect", "Auto Mount at Start", "IORDY", "INTRQ", "Debug Mode"};
+    const char *labels[] = {"Write Protect", "Auto Mount at Start", "IORDY", "INTRQ", "Debug Mode", "Pipelined Reads"};
     const char *helps[] = {
         "Prevents any write commands from reaching the HDD.",
         "Automatically mounts the drive to USB on power-up sequence.",
         "Enables hardware IORDY (pin 27) flow control on the IDE bus.  Toggling this may help with picky drives.",
         "Enables hardware INTRQ (pin 28) for faster IDE command completion.  Toggling this may help with picky drives.",
-        "Open low-level drive diagnostics and register status screen."
+        "Open low-level drive diagnostics and register status screen.",
+        "Reads the next part of a long read while USB sends the last.  Off: as every earlier build."
     };
 
     cdc_puts("\033[3;63H" FG_WHITE "Item Help");
@@ -423,7 +424,7 @@ static void update_features_menu(void) {
     emit_n(BOX_HL, 24);
     cdc_puts(BOX_MR);
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         int row = 4 + i;
         cdc_printf("\033[%d;4H" FG_WHITE "%-25s", row, labels[i]);
         cdc_printf("\033[%d;35H" FG_YELLOW "[", row);
@@ -434,6 +435,7 @@ static void update_features_menu(void) {
         else if (i == 2) cdc_printf("%-8s", config.iordy_enabled ? "Enabled" : "Disabled");
         else if (i == 3) cdc_printf("%-8s", config.intrq_enabled ? "Enabled" : "Disabled");
         else if (i == 4) cdc_printf("%-8s", "Enter");
+        else if (i == 5) cdc_printf("%-8s", config.pipelined_reads ? "On" : "Off");   // F1 stage 2
 
         cdc_puts(RESET BG_BLUE FG_WHITE "]");
         if (i == config.feat_selected) print_help(helps[i]);
@@ -1714,7 +1716,7 @@ void core1_entry(void) {
             }
         } else if (current_screen == SCREEN_FEATURES) {
             if (k == KEY_UP && config.feat_selected > 0) config.feat_selected--;
-            else if (k == KEY_DOWN && config.feat_selected < 4) config.feat_selected++;
+            else if (k == KEY_DOWN && config.feat_selected < 5) config.feat_selected++;
             else if (k == KEY_ESC) current_screen = SCREEN_MAIN;
             else if (k == KEY_ENTER) {
                 if (config.feat_selected == 0) config.drive_write_protected = !config.drive_write_protected;
@@ -1722,6 +1724,7 @@ void core1_entry(void) {
                 else if (config.feat_selected == 2) features_toggle_iordy();
                 else if (config.feat_selected == 3) config.intrq_enabled = !config.intrq_enabled;
                 else if (config.feat_selected == 4) current_screen = SCREEN_DEBUG;
+                else if (config.feat_selected == 5) config.pipelined_reads = !config.pipelined_reads;   // F1 stage 2: usb.c takes it at a READ(10)'s start
             }
             needs_full_redraw = true;
         }

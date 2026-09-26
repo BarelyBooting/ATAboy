@@ -117,6 +117,7 @@ _Static_assert(sizeof(obs_hash_entry_t) == 48, "hash entry is 48 bytes");
 
 void     obs_init(void);                        // BOOT entry, hash engine self-test
 void     obs_set_host(bool on);                 // ide.c: inside a USB host command or not
+void     obs_set_read_ahead(bool on);           // usb.c: a pipelined read ahead (stage 2)
 // Bus events (ide.c). Only the core using the bus calls these.
 void     obs_tf_write(uint8_t reg, uint8_t val);    // registers 1 to 6
 uint32_t obs_cmd(uint8_t opcode);                   // returns the entry's seq

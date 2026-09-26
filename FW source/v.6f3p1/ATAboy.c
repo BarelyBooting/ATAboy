@@ -72,6 +72,7 @@ static void cdc_task(void) {
 // ---------------------------------------------------------------------------
 
 extern void core1_entry(void);
+extern void usb_read_ahead_task(void);      // usb.c, F1 stage 2
 
 // Holistic review L-4: core 1's stack. The SDK default was 2 KB and core 1's
 // deepest path measured 2048 bytes (-fstack-usage: the menu loop, Auto
@@ -117,6 +118,7 @@ int main(void) {
     // Core 0 loop: service USB + CDC bridge
     while (true) {
         tud_task();
+        usb_read_ahead_task();  // F1 stage 2: Pipelined Reads, between USB callbacks
         cdc_task();
     }
 }

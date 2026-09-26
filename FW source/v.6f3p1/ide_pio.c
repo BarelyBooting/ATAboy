@@ -82,10 +82,21 @@ static void iordy_unstick(void) {
     stalls++;
 }
 
-// Wait for cond with a deadline of IDE_PIO_STALL_US from the last progress.
-#define PIO_WAIT(cond) do {         uint64_t t0_ = time_us_64();         while (!(cond)) {             if (time_us_64() - t0_ > IDE_PIO_STALL_US) { iordy_unstick(); t0_ = time_us_64(); }             tight_loop_contents();         }     } while (0)
+// F1 stage 2 (d): the two burst loops run from SCRATCH_X, the 4 KB RAM bank
+// next to core 0 that nothing else uses here (core 1 has its own stack in
+// main RAM, ATAboy.c; core 0's stack is in SCRATCH_Y). No flash (XIP cache
+// misses) and no contention with DMA, USB or core 1 in the main RAM banks
+// while a block is moved. The strobes themselves are the state machines'
+// (ataboy.pio) and do not depend on where this code runs; a slower loop
+// only lets the read FIFO fill, which holds DIOR- low a little longer (the
+// sample is still taken with DIOR- low). The deadline uses the 32-bit
+// microsecond timer, read inline (time_us_64 is a function in flash).
+// tests/host/check_scratch.sh checks the placement in the ELF.
 
-void ide_pio_read(uint32_t count, uint16_t *buf) {
+// Wait for cond with a deadline of IDE_PIO_STALL_US from the last progress.
+#define PIO_WAIT(cond) do {         uint32_t t0_ = time_us_32();         while (!(cond)) {             if ((uint32_t)(time_us_32() - t0_) > IDE_PIO_STALL_US) { iordy_unstick(); t0_ = time_us_32(); }             tight_loop_contents();         }     } while (0)
+
+void __scratch_x("ide_pio") ide_pio_read(uint32_t count, uint16_t *buf) {
     // Push count-1 to start the read burst
     PIO_WAIT(!pio_sm_is_tx_fifo_full(pio, sm_read));
     pio_sm_put(pio, sm_read, count - 1);
@@ -100,7 +111,7 @@ void ide_pio_read(uint32_t count, uint16_t *buf) {
     pio->irq = 1u << sm_read;
 }
 
-void ide_pio_write(uint32_t count, const uint16_t *buf) {
+void __scratch_x("ide_pio") ide_pio_write(uint32_t count, const uint16_t *buf) {
     // Data bus to output for the duration of the write
     pio_sm_set_consecutive_pindirs(pio, sm_write, 0, 16, true);
 

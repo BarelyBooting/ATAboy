@@ -1426,6 +1426,13 @@ static void test_holistic_menus() {
     d = c; { uint8_t two = 2; memcpy(&d.auto_mount, &two, 1); } d.crc = config_crc(&d); CHECK(!config_valid(&d), "a bool of 2 taken");
     d = c; d.cyls = 522; d.heads = 4; d.spt = 0; d.crc = config_crc(&d); CHECK(!config_valid(&d), "0 sectors taken");
     d = c; d.cyls = 522; d.heads = 4; d.spt = 40; d.crc = config_crc(&d); CHECK(config_valid(&d), "522/4/40 refused");
+    // F1 stage 2: Pipelined Reads in the CRC, a real bool, the cursor on row 5.
+    d = c; d.pipelined_reads = true; CHECK(!config_valid(&d), "Pipelined Reads changed under the old CRC taken");
+    d.crc = config_crc(&d); CHECK(config_valid(&d), "Pipelined Reads On refused");
+    d = c; { uint8_t two = 2; memcpy(&d.pipelined_reads, &two, 1); } d.crc = config_crc(&d); CHECK(!config_valid(&d), "a Pipelined Reads of 2 taken");
+    d = c; d.feat_selected = 5; d.crc = config_crc(&d); CHECK(config_valid(&d), "the cursor on Pipelined Reads refused");
+    d = c; d.feat_selected = 6; d.crc = config_crc(&d); CHECK(!config_valid(&d), "a cursor past the last item taken");
+    d = c; d.magic = 0x1DE45708; d.crc = config_crc(&d); CHECK(!config_valid(&d), "the layout before Pipelined Reads taken");
     d = c; d.auto_mount = true; d.crc = config_crc(&d); d.lba_sectors = 1; CHECK(!config_valid(&d), "a changed field under an old CRC taken");
 
     // B1: no active-low line dips at boot (warm or cold).
@@ -1479,6 +1486,11 @@ static void core1_done() {
     CHECK(mounts == 1 && unmounts == 1 && mk.value == OBS_MNT_MENU && mk.tf[0] == OBS_MODE_MCHS_91 &&
           mk.tf[1] == S && mk.tf[2] == H && (mk.tf[3] | (mk.tf[4] << 8)) == C && !is_mounted,
           "mounts %d unmounts %d, marker mode %u, mounted %d", mounts, unmounts, mk.tf[0], is_mounted);
+    CHECK(config.pipelined_reads && current_screen == SCREEN_FEATURES && config.feat_selected == 5 &&
+          has("Pipelined Reads"),
+          "Pipelined Reads not switched on from Features: %d, screen %d, item %d", config.pipelined_reads,
+          (int)current_screen, config.feat_selected);
+    CHECK(has("Reads the next part"), "Pipelined Reads help not shown");
     printf("%d checks, %d failed\n", checks, failures);
     exit(failures > 255 ? 255 : failures);
 }
@@ -1499,6 +1511,18 @@ static void test_core1() {
     rx.push_back({ t + 40000, 'y' });
     rx.push_back({ t + 60000, 'u' });
     rx.push_back({ t + 80000, 'y' });
+    // F1 stage 2: then Features (up, right, Enter), down to Pipelined Reads, Enter.
+    t += 100000;
+    for (const char *seq : { "\x1b[A", "\x1b[C" }) {
+        for (const char *c = seq; *c; c++) { rx.push_back({ t, *c }); t += 1000; }
+        t += 20000;
+    }
+    rx.push_back({ t, '\r' }); t += 20000;
+    for (int i = 0; i < 5; i++) {
+        for (const char *c = "\x1b[B"; *c; c++) { rx.push_back({ t, *c }); t += 1000; }
+        t += 20000;
+    }
+    rx.push_back({ t, '\r' });
     obs_test_reset(0, 0);
     idle_after_ns = mock_now_ns + 20000000000ull;
     on_idle = core1_done;

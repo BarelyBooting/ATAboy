@@ -22,6 +22,7 @@ void config_defaults(void) {
     config.spt = 0;
     config.lba_sectors = 0;
     config.dev_base = 0xA0;
+    config.pipelined_reads = false;
 }
 
 void config_load(void) {

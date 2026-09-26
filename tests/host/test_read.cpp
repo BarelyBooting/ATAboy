@@ -64,6 +64,45 @@ static void note_cmd(const char *what, uint64_t cmd_ns) {
 }
 static void note_cb(uint64_t ns) { if (ns > worst_cb_ns) worst_cb_ns = ns; }
 
+// ---- F1 stage 2: both modes of Pipelined Reads ------------------------------
+// run.sh builds this program twice, with Pipelined Reads Off (as every
+// earlier build) and On (-DATABOY_TEST_PIPELINED=1), and compares what the
+// two wrote to their transcripts (ATABOY_TRANSCRIPT): every READ(10) and
+// WRITE(10) through the helpers below, what the host got, and every ATA
+// command the drive saw for it. They must be the same, byte for byte.
+#ifndef ATABOY_TEST_PIPELINED
+#define ATABOY_TEST_PIPELINED 0
+#endif
+static bool test_pipelined = ATABOY_TEST_PIPELINED;
+static FILE *transcript = nullptr;
+// USB's own time for the data a callback returned (ns a byte); 0: instant,
+// as every older test has it. The read ahead runs in that time.
+static uint64_t usb_ns_per_byte = 0;
+static uint32_t fnv32(const uint8_t *p, size_t n) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+// The ATA commands the drive saw from cmd_log index c0 on, as text, and a
+// check that no read command named a sector outside [lo, hi).
+static std::string cmds_text(size_t c0, uint32_t lo, uint32_t hi, int *outside) {
+    std::string s;
+    char b[64];
+    for (size_t i = c0; i < sim.cmd_log.size(); i++) {
+        auto &r = sim.cmd_tf_log[i];
+        snprintf(b, sizeof b, " %02X:%02X%02X%02X%02X%02X%02X", sim.cmd_log[i], r[0], r[1], r[2], r[3], r[4], r[5]);
+        s += b;
+        uint8_t c = sim.cmd_log[i];
+        if (c != 0x20 && c != 0x24) continue;
+        uint32_t start, n = r[1] ? r[1] : 256;
+        if (c == 0x24) start = r[2] | (r[3] << 8) | (r[4] << 16) | ((uint32_t)r[7] << 24);
+        else if (r[5] & 0x40) start = r[2] | (r[3] << 8) | (r[4] << 16) | ((uint32_t)(r[5] & 0x0F) << 24);
+        else start = (((uint32_t)(r[3] | (r[4] << 8)) * config.heads) + (r[5] & 0x0F)) * config.spt + r[2] - 1;
+        if (start < lo || start + n > hi) (*outside)++;
+    }
+    return s;
+}
+
 // ---- host side of READ(10) -------------------------------------------------
 struct HostRead {
     bool ok = false;
@@ -75,27 +114,46 @@ struct HostRead {
 // Called between two chunks of one READ(10), when set (mutation run of
 // fa3190a): what the drive does on its own while the host sends nothing.
 static void (*between_chunks)() = nullptr;
+// F1 stage 2: TinyUSB receives the CBW into this same buffer and calls the
+// first callback on it as it is (usb.c reads the READ(10)'s length there).
+// After each callback the main loop runs the read ahead while USB sends
+// what the callback returned (usb_ns_per_byte), then the next callback.
+static bool cbw_in_buffer = true;
+static void put_read10_cbw(uint8_t *b, uint32_t lba, uint32_t nblocks) {
+    uint32_t len = nblocks * 512;
+    const uint8_t cbw[31] = { 0x55, 0x53, 0x42, 0x43, 0x11, 0x22, 0x33, 0x44,
+                              (uint8_t)len, (uint8_t)(len >> 8), (uint8_t)(len >> 16), (uint8_t)(len >> 24),
+                              0x80, 0x00, 10, 0x28, 0x00, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
+                              (uint8_t)(lba >> 8), (uint8_t)lba, 0x00, (uint8_t)(nblocks >> 8), (uint8_t)nblocks, 0x00 };
+    memcpy(b, cbw, sizeof cbw);
+}
 static void host_read10_body(HostRead &h, uint32_t lba, uint32_t nblocks) {
     uint32_t total = nblocks * 512, xferred = 0;
     static uint8_t epbuf[CFG_TUD_MSC_EP_BUFSIZE];
     last_key = last_asc = 0;
     int busy = 0;
+    usb_test_between_chunks = between_chunks;       // F1 stage 2: inside a pipelined callback too
     while (xferred < total) {
         uint32_t cur = lba + xferred / 512, off = xferred % 512;
         uint32_t n = total - xferred;
         if (n > CFG_TUD_MSC_EP_BUFSIZE) n = CFG_TUD_MSC_EP_BUFSIZE;
         memset(epbuf, 0xA5, sizeof(epbuf));        // poison: anything not written shows up
+        if (xferred == 0 && h.calls == 0 && cbw_in_buffer) put_read10_cbw(epbuf, lba, nblocks);
         uint64_t t = mock_now_ns;
         int32_t r = tud_msc_read10_cb(0, cur, off, epbuf, n);
         note_cb(mock_now_ns - t);
         h.calls++;
-        if (r < 0) { h.key = last_key; h.asc = last_asc; return; }
+        if (r < 0) { h.key = last_key; h.asc = last_asc; usb_test_between_chunks = nullptr; return; }
         if (r == 0) { if (++busy > 100) return; continue; }
         if ((uint32_t)r > n) { std::printf("callback returned more than asked\n"); return; }
         h.data.insert(h.data.end(), epbuf, epbuf + r);
         xferred += r;
+        uint64_t sent_at = mock_now_ns + (uint64_t)r * usb_ns_per_byte;
         if (between_chunks && xferred < total) between_chunks();
+        usb_read_ahead_task();                      // core 0's main loop, while USB sends
+        if (mock_now_ns < sent_at) mock_now_ns = sent_at;
     }
+    usb_test_between_chunks = nullptr;
     h.ok = true;
 }
 
@@ -107,10 +165,22 @@ static std::vector<uint8_t> request_sense(uint8_t alloc);
 static HostRead host_read10(uint32_t lba, uint32_t nblocks) {
     HostRead h;
     uint64_t t0 = mock_now_ns;
+    size_t c0 = sim.cmd_log.size();
+    int srst0 = sim.srst, hw0 = sim.hw_resets;
+    uint64_t max = total_sectors();                 // before: a test may unmount midway
     host_read10_body(h, lba, nblocks);
     note_cmd("READ(10)", mock_now_ns - t0);
     tud_msc_read10_complete_cb(0);                  // the CSW has gone out
     if (!h.ok) request_sense(18);
+    // F1 stage 2: never a sector outside the host's request or the medium.
+    int outside = 0;
+    uint32_t hi = (uint64_t)lba + nblocks < max ? lba + nblocks : (uint32_t)max;
+    std::string cmds = cmds_text(c0, lba, hi, &outside);
+    CHECK(outside == 0, "READ(10) of %u at %u: %d read commands outside it", nblocks, lba, outside);
+    if (transcript)
+        fprintf(transcript, "[%s] R %u+%u ok %d bytes %zu fnv %08X sense %X/%02X srst %d hw %d |%s\n", current.c_str(),
+                lba, nblocks, h.ok, h.data.size(), fnv32(h.data.data(), h.data.size()), h.key, h.asc,
+                sim.srst - srst0, sim.hw_resets - hw0, cmds.c_str());
     return h;
 }
 
@@ -122,6 +192,7 @@ static int32_t host_write10(uint32_t lba, const uint8_t *data, uint32_t nblocks)
     static uint8_t epbuf[CFG_TUD_MSC_EP_BUFSIZE];
     uint32_t total = nblocks * 512, xferred = 0;
     uint64_t t0 = mock_now_ns;
+    size_t c0 = sim.cmd_log.size();
     int32_t result = (int32_t)total;
     while (xferred < total) {
         uint32_t n = total - xferred;
@@ -136,6 +207,11 @@ static int32_t host_write10(uint32_t lba, const uint8_t *data, uint32_t nblocks)
     note_cmd("WRITE(10)", mock_now_ns - t0);
     tud_msc_write10_complete_cb(0);
     if (result < 0) request_sense(18);
+    if (transcript) {
+        int outside = 0;
+        fprintf(transcript, "[%s] W %u+%u r %d |%s\n", current.c_str(), lba, nblocks, result,
+                cmds_text(c0, 0, 0xFFFFFFFFu, &outside).c_str());
+    }
     return result;
 }
 
@@ -178,6 +254,9 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     mock_gpio_out = (1u << 24) | (1u << 25);      // CS0/CS1 idle high
     memset(&config, 0, sizeof(config));
     config.dev_base = 0xA0;
+    config.pipelined_reads = test_pipelined;       // F1 stage 2
+    memset(&rd_pipe, 0, sizeof rd_pipe);
+    usb_ns_per_byte = 0; cbw_in_buffer = true;
     config.use_lba_mode = (m == LBA);
     config.cyls = 980; config.heads = 10; config.spt = 17;
     config.lba_sectors = medium_sectors ? medium_sectors : sim.nsect;
@@ -4379,7 +4458,157 @@ static void test_obs_cost() {
     }
 }
 
+// ---------------------------------------------------------------------------
+//  F1 stage 2: Pipelined Reads (usb.c). These set the mode themselves; the
+//  rest of the file runs in both (run.sh) and is compared by transcript.
+// ---------------------------------------------------------------------------
+static int hashes_flagged_read_ahead(uint32_t from_hash) {
+    int n = 0;
+    for (uint32_t s = from_hash; s < hash_next; s++)
+        if (hash_ring[s % OBS_HASH_ENTRIES].seq == s && (hash_ring[s % OBS_HASH_ENTRIES].flags & OBS_H_PREFETCH)) n++;
+    return n;
+}
+
+// It does read ahead, three of imagelba's four callbacks' worth, and only On.
+static void test_pipe_reads_ahead() {
+    for (int on = 0; on < 2; on++) {
+        setup(on ? "F1 pipe: On reads ahead" : "F1 pipe: Off does not", LBA);
+        config.pipelined_reads = on;
+        obs_test_reset(0, 0);
+        uint32_t h0 = hash_next;
+        HostRead h = host_read10(1000, 128);
+        int ra = hashes_flagged_read_ahead(h0);
+        CHECK(h.ok && matches_medium(h, 1000) && h.calls == (on ? 4 : 16) && ra == (on ? 96 : 0),
+              "ok %d calls %d, %d sectors read ahead", h.ok, h.calls, ra);
+        CHECK(sim.cmd_count[0x20] == 16, "%d READ SECTORS, want 16 of 8", sim.cmd_count[0x20]);
+    }
+}
+
+// What it is for: the drive reads while USB sends. USB at 1 MB/s, the drive
+// 200 us a sector, a READ(10) of 128 sectors: printed, and On must be faster.
+static void test_pipe_throughput() {
+    uint64_t took[2];
+    for (int on = 0; on < 2; on++) {
+        setup(on ? "F1 pipe: throughput On" : "F1 pipe: throughput Off", LBA);
+        config.pipelined_reads = on;
+        sim_reg_cost_ns = 1000; sim_word_ns = 800;
+        usb_ns_per_byte = 1000;
+        uint64_t t0 = mock_now_ns;
+        HostRead h = host_read10(0, 128);
+        took[on] = mock_now_ns - t0;
+        CHECK(h.ok && matches_medium(h, 0), "the read");
+    }
+    printf("pipelined reads: READ(10) of 128 sectors, USB 1 MB/s, drive 200 us a sector: Off %.1f ms, On %.1f ms (%.0f%%)\n",
+           took[0] / 1e6, took[1] / 1e6, 100.0 * took[1] / took[0]);
+    CHECK(took[1] < took[0] * 8 / 10, "On %llu ns, Off %llu ns", (unsigned long long)took[1], (unsigned long long)took[0]);
+}
+
+// Never past the request or the medium: no CBW, no read ahead; a READ(10)
+// running into the end of the medium; data that looks like a longer CBW.
+static void test_pipe_bounds() {
+    setup("F1 pipe: no CBW in the buffer, no read ahead", LBA);
+    config.pipelined_reads = true;
+    cbw_in_buffer = false;
+    obs_test_reset(0, 0);
+    uint32_t h0 = hash_next;
+    HostRead h = host_read10(2000, 64);
+    CHECK(h.ok && matches_medium(h, 2000) && hashes_flagged_read_ahead(h0) == 0, "no CBW: ok %d, read ahead %d",
+          h.ok, hashes_flagged_read_ahead(h0));
+    cbw_in_buffer = true;
+
+    setup("F1 pipe: into the end of the medium", LBA, 1000);
+    config.pipelined_reads = true;
+    h = host_read10(950, 100);                      // host_read10 checks nothing past 1000 was read
+    CHECK(!h.ok && h.data.size() == 50 * 512 && matches_medium(h, 950), "ok %d, %zu bytes", h.ok, h.data.size());
+
+    setup("F1 pipe: data that looks like a longer CBW", LBA);
+    config.pipelined_reads = true;
+    static uint8_t b[CFG_TUD_MSC_EP_BUFSIZE];
+    const uint32_t L = 3000;
+    memset(b, 0xA5, sizeof b);
+    put_read10_cbw(b, L, 64);
+    int32_t r1 = tud_msc_read10_cb(0, L, 0, b, 16384);
+    usb_read_ahead_task();
+    size_t c0 = sim.cmd_log.size();
+    put_read10_cbw(b, L + 32, 1000);                // what the first part's data could look like
+    int32_t r2 = tud_msc_read10_cb(0, L + 32, 0, b, 16384);
+    usb_read_ahead_task();
+    int outside = 0;
+    cmds_text(c0, L + 32, L + 64, &outside);
+    tud_msc_read10_complete_cb(0);
+    CHECK(r1 == 16384 && r2 == 16384 && outside == 0 && rd_pipe.end == L + 64, "r %d %d, %d reads outside, end %u",
+          r1, r2, outside, rd_pipe.end);
+
+    // An unmount (core 1) after a callback, before the main loop's read
+    // ahead: nothing is sent, as Off mode's next callback would send nothing.
+    setup("F1 pipe: unmounted before the read ahead", LBA);
+    config.pipelined_reads = true;
+    memset(b, 0xA5, sizeof b);
+    put_read10_cbw(b, L, 64);
+    r1 = tud_msc_read10_cb(0, L, 0, b, 16384);
+    bool planned = rd_pipe.want;
+    is_mounted = false;
+    size_t c1 = sim.cmd_log.size();
+    usb_read_ahead_task();
+    CHECK(r1 == 16384 && planned && sim.cmd_log.size() == c1 && !rd_pipe.held, "r %d, planned %d, %zu commands sent",
+          r1, planned, sim.cmd_log.size() - c1);
+    is_mounted = true;
+    tud_msc_read10_complete_cb(0);
+}
+
+// Things that end a read ahead: an unmount between callbacks, a new command
+// before the next part is asked for; and the mode is the one the READ(10)
+// began with. Run in each mode; the transcripts compare them.
+static void test_pipe_interruptions(Mode m) {
+    setup(m == LBA ? "F1 pipe: unmount between callbacks, LBA" : "F1 pipe: unmount between callbacks, CHS", m);
+    between_chunks = [] { is_mounted = false; };
+    HostRead h = host_read10(4000, 64);
+    between_chunks = nullptr;
+    is_mounted = true;
+    CHECK(!h.ok && h.data.size() == 8u * 512 && matches_medium(h, 4000),
+          "unmounted: ok %d, %zu bytes", h.ok, h.data.size());
+
+    setup(m == LBA ? "F1 pipe: abandoned, then elsewhere, LBA" : "F1 pipe: abandoned, then elsewhere, CHS", m);
+    static uint8_t b[CFG_TUD_MSC_EP_BUFSIZE];
+    memset(b, 0xA5, sizeof b);
+    put_read10_cbw(b, 4100, 64);
+    tud_msc_read10_cb(0, 4100, 0, b, test_pipelined ? 16384 : 4096);
+    usb_read_ahead_task();                          // reads ahead (On), then the host resets
+    tud_mount_cb();
+    HostRead g = host_read10(4132, 8);             // where the read ahead was, a new command
+    CHECK(g.ok && matches_medium(g, 4132) && !rd_pipe.held, "after the reset: ok %d", g.ok);
+
+    setup(m == LBA ? "F1 pipe: mode changed mid-command, LBA" : "F1 pipe: mode changed mid-command, CHS", m);
+    between_chunks = [] { config.pipelined_reads = !config.pipelined_reads; };
+    bool was = config.pipelined_reads;
+    h = host_read10(4200, 64);
+    between_chunks = nullptr;
+    CHECK(h.ok && matches_medium(h, 4200) && rd_pipe.on == was, "ok %d, mode %d from %d", h.ok, rd_pipe.on, was);
+    config.pipelined_reads = test_pipelined;
+}
+
+// R3-1 and the end check with the failure in a part that was read ahead:
+// only real sectors, never past the first block taken with no drop seen.
+static void test_pipe_clamp(Mode m) {
+    const BadMode modes[] = { BAD_ERR, BAD_ERR_DRQ, BAD_HANG };
+    for (uint32_t k : { 5033u, 5041u, 5045u })
+        for (int mi = 0; mi < 3; mi++) {
+            std::string n = std::string("F1 pipe clamp: DRQ once after ") + std::to_string(k) + ", failure at " +
+                            std::to_string(k + 3) + " mode " + std::to_string(mi) + (m == CHS ? ", CHS" : ", LBA");
+            setup(n.c_str(), m);
+            if (m == CHS) chs_user_geometry();
+            sim_reg_cost_ns = 2000; sim_word_ns = 800;
+            sim.intrq_wired = false;
+            sim.mid_linger = true; sim.mid_linger_once = true; sim.mid_linger_from = k; sim.drq_linger = 2000000;
+            sim.bad[k + 3] = {modes[mi], 0};
+            HostRead h = host_read10(5000, 64);
+            CHECK(matches_medium(h, 5000) && h.data.size() < 64u * 512, "%zu bytes (ok %d)", h.data.size(), h.ok);
+        }
+}
+
 int main() {
+    if (const char *tp = getenv("ATABOY_TRANSCRIPT")) transcript = fopen(tp, "w");
+    std::printf("Pipelined Reads %s\n", test_pipelined ? "On" : "Off");
     // The budget is a design number, not only what the helpers measure
     // against: 10 s under the 30 s that Linux and the project's tools give a
     // command (ide.c). A larger one would pass every test above and still
@@ -4485,6 +4714,14 @@ int main() {
     test_obs_cursor();
     test_obs_flags();
     test_obs_cost();
+    // F1 stage 2: Pipelined Reads
+    test_pipe_reads_ahead();
+    test_pipe_throughput();
+    test_pipe_bounds();
+    test_pipe_interruptions(LBA);
+    test_pipe_interruptions(CHS);
+    test_pipe_clamp(LBA);
+    test_pipe_clamp(CHS);
     // 0.6f3p9: READ LONG
     test_read_long_ok(LBA);
     test_read_long_ok(CHS);

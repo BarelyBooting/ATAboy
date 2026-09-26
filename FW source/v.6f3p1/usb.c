@@ -102,13 +102,19 @@ static struct {
 // cut to this command's time while it is entered. Called after
 // msc_busy_begin(), so this read of is_mounted is the one the busy flag's
 // protocol pairs with (above).
-static void host_cmd_enter(bool rw, bool write, uint32_t lba) {
-    if (!is_mounted) return;
-    if (!rw || !rw_cmd.open || rw_cmd.write != write || lba != rw_cmd.next_lba)
+static void read_ahead_forget(void);
+static bool host_cmd_enter(bool rw, bool write, uint32_t lba) {
+    if (!is_mounted) return false;
+    bool begun = false;
+    if (!rw || !rw_cmd.open || rw_cmd.write != write || lba != rw_cmd.next_lba) {
         ide_host_cmd_begin();
+        read_ahead_forget();                    // F1 stage 2: never across commands
+        begun = true;
+    }
     rw_cmd.open = rw;
     rw_cmd.write = write;
     ide_host_cmd_enter();
+    return begun;
 }
 
 static void host_cmd_leave(uint32_t lba, int32_t r) {
@@ -165,13 +171,14 @@ int32_t tud_msc_request_sense_cb(uint8_t lun, void *buffer, uint16_t bufsize) {
 }
 #endif
 
-void tud_msc_read10_complete_cb(uint8_t lun) { (void)lun; rw_cmd.open = false; }
-void tud_msc_write10_complete_cb(uint8_t lun) { (void)lun; rw_cmd.open = false; }
+void tud_msc_read10_complete_cb(uint8_t lun) { (void)lun; rw_cmd.open = false; read_ahead_forget(); }
+void tud_msc_write10_complete_cb(uint8_t lun) { (void)lun; rw_cmd.open = false; read_ahead_forget(); }
 void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
     (void)lun; (void)scsi_cmd;
     rw_cmd.open = false;
+    read_ahead_forget();
 }
-void tud_mount_cb(void) { rw_cmd.open = false; }
+void tud_mount_cb(void) { rw_cmd.open = false; read_ahead_forget(); }
 
 // ---------------------------------------------------------------------------
 //  MSC Required Callbacks
@@ -225,6 +232,180 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition,
 }
 
 // ---------------------------------------------------------------------------
+//  Pipelined reads (owner decision F1, stage 2, 2026-09-26)
+// ---------------------------------------------------------------------------
+// Features, "Pipelined Reads", Off by default and saved with the settings.
+// Taken at the first callback of each READ(10) and kept for the whole of it.
+//
+// Off: exactly as every earlier build. The MSC buffer is now 16 KB
+// (tusb_config.h), but each callback takes at most USB_ATA_CHUNK (4 KB, 8
+// sectors) and returns that; TinyUSB sends it and calls again for the rest,
+// so the drive, the host and every guard see what they saw with a 4 KB
+// buffer. Writes are always handled this way, in both modes.
+//
+// On: a callback takes the whole 16 KB it is offered, read as ATA commands of
+// 8 sectors each (never more: ide.c's fair window, time_to_send, and the
+// throughput floor are worked out for 8). And after a callback that handed
+// over everything it was asked for, while TinyUSB is sending that to the
+// host, core 0's main loop reads the next part of the same READ(10) into a
+// second buffer (usb_read_ahead_task), so the drive works while USB
+// transfers. The next callback copies it over if it is for exactly that
+// place. Nothing else changes: the same ATA commands, of the same sectors,
+// in the same order, through the same ide_read_sectors_partial with all its
+// guards (the R-1 rule, the clamp, the end check, the Ctrl+G rules, the
+// salvage capture), and the host is handed the same sectors and gets the
+// same errors. A failure that Off mode would report at the start of a
+// callback is reported the same way here: the sectors before it go out, and
+// the next callback fails without sending anything (read_fail_at), just as
+// Off mode's callback for that chunk failed. What can differ is time: read
+// ahead, a chunk goes to the drive earlier, with more of the host command's
+// 20 s ahead of it.
+//
+// Never past the host's request or the medium. TinyUSB does not tell the
+// callback how long the READ(10) is; each callback only knows its own part.
+// The CBW does, and on a READ(10)'s first callback it is still in the buffer
+// (TinyUSB received it there and has not written to it since; sat.c and READ
+// LONG rely on the same). It is taken only when it is exactly this command:
+// signature, data-in, a 10-byte READ(10) at this LBA, and a length of its
+// blocks times 512. Without it nothing is read ahead. A later callback of the
+// same READ(10) holds the last part's data instead; data that happens to look
+// like such a CBW can only shorten the range, never lengthen it. A read
+// ahead is also cut at the end of the medium (total_sectors), and forgotten
+// at the end of the command, at any other command, a USB reset or unmount.
+#define USB_ATA_CHUNK 4096u
+
+static struct {
+    bool     on;            // this READ(10) runs pipelined
+    uint32_t end;           // one past the READ(10)'s last LBA; 0: not known
+    // What a callback, or a read ahead, found (read_run).
+    bool     fail_pending;  // the next callback, at fail_lba, fails at once:
+    uint32_t fail_lba;      //   its chunk's first sector failed already
+    // The read ahead.
+    bool     want;          // usb_read_ahead_task: read [lba, lba + n)
+    bool     held;          // done: good sectors in ra_buf
+    uint32_t lba, n;
+    uint32_t good;          // sectors read well, from lba
+    bool     failed;        // a chunk failed after `good` sectors
+    bool     failed_at_chunk_start;
+} rd_pipe;
+static uint8_t __attribute__((aligned(4))) ra_buf[CFG_TUD_MSC_EP_BUFSIZE];
+
+static void read_ahead_forget(void) {
+    rd_pipe.want = false;
+    rd_pipe.held = false;
+    rd_pipe.fail_pending = false;
+}
+
+// The READ(10) CBW TinyUSB left in the buffer, if it is exactly this command:
+// the LBA one past its last block, or 0.
+static uint32_t cbw_read10_end(const uint8_t *img, uint32_t lba) {
+    if (img[0] != 0x55 || img[1] != 0x53 || img[2] != 0x42 || img[3] != 0x43) return 0;
+    if (img[12] != 0x80 || img[14] != 10 || img[15] != 0x28) return 0;
+    uint32_t len = (uint32_t)img[8] | ((uint32_t)img[9] << 8) | ((uint32_t)img[10] << 16) | ((uint32_t)img[11] << 24);
+    uint32_t clba = ((uint32_t)img[17] << 24) | ((uint32_t)img[18] << 16) | ((uint32_t)img[19] << 8) | img[20];
+    uint32_t blocks = ((uint32_t)img[22] << 8) | img[23];
+    if (clba != lba || blocks == 0 || len != blocks * 512u) return 0;
+    return lba + blocks;
+}
+
+// n sectors from lba into buf as ATA commands of at most 8 sectors, stopping
+// at the first that fails, or when the drive has been unmounted: what a run
+// of Off mode's callbacks over the same sectors sends. *good: the sectors read well from lba; *at_start: the one
+// that failed was the first of its chunk (Off mode: a callback that failed
+// with nothing to hand over).
+#if ATABOY_HOST_TEST
+// Host tests: what the drive does on its own between two chunks, where Off
+// mode has a callback boundary (test_read.cpp's between_chunks).
+inline void (*usb_test_between_chunks)() = nullptr;
+#endif
+static bool read_run(uint32_t lba, uint32_t n, uint8_t *buf, uint32_t *good, bool *at_start) {
+    *good = 0;
+    *at_start = false;
+    while (*good < n) {
+#if ATABOY_HOST_TEST
+        if (*good && usb_test_between_chunks) usb_test_between_chunks();
+#endif
+        // Unmounted since the last chunk (core 1): nothing more is sent, as
+        // Off mode's next callback would send nothing. It fails there.
+        if (*good && !is_mounted) return false;
+        uint32_t k = n - *good;
+        if (k > USB_ATA_CHUNK / 512) k = USB_ATA_CHUNK / 512;
+        uint32_t got = 0;
+        if (ide_read_sectors_partial(lba + *good, k, buf + *good * 512, &got) < 0) {
+            *good += got < k ? got : 0;
+            *at_start = got == 0;
+            return false;
+        }
+        *good += k;
+    }
+    return true;
+}
+
+// On mode's aligned part of a callback. Returns as ide_read_sectors_partial
+// does for Off mode's one command: 0 all n read, or -1 with *got the good
+// sectors before the failure. See rd_pipe for the failure that Off mode would
+// have reported at the start of a later callback.
+static int32_t read_aligned_pipelined(uint32_t lba, uint32_t n, uint8_t *ptr, uint32_t *got) {
+    *got = 0;
+    if (rd_pipe.fail_pending) {
+        bool here = rd_pipe.fail_lba == lba;
+        rd_pipe.fail_pending = false;
+        if (here) return -1;                    // sent and failed already: nothing sent now
+    }
+    uint32_t good;
+    bool at_start, ok;
+    if (rd_pipe.held && rd_pipe.lba == lba && rd_pipe.n == n) {
+        good = rd_pipe.good;
+        ok = !rd_pipe.failed;
+        at_start = rd_pipe.failed_at_chunk_start;
+        memcpy(ptr, ra_buf, good * 512);
+    } else {
+        ok = read_run(lba, n, ptr, &good, &at_start);
+    }
+    rd_pipe.held = false;
+    if (ok) return 0;
+    *got = good;
+    if (good > 0 && at_start) {                 // Off mode: this callback hands over `good`,
+        rd_pipe.fail_pending = true;            // the next one fails without a command
+        rd_pipe.fail_lba = lba + good;
+    }
+    return -1;
+}
+
+// Core 0's main loop, between tud_task() calls: the read ahead, if one is
+// due. Guarded as a callback is (msc_busy, is_mounted), inside the host
+// command it belongs to (its time budget), and only while that READ(10) is
+// still open at exactly the place the read ahead starts.
+void usb_read_ahead_task(void) {
+    if (!rd_pipe.want) return;
+    rd_pipe.want = false;
+    msc_busy_begin();
+    if (is_mounted && rw_cmd.open && !rw_cmd.write && rw_cmd.next_lba == rd_pipe.lba) {
+        ide_host_cmd_enter();
+        obs_set_read_ahead(true);
+        rd_pipe.failed = !read_run(rd_pipe.lba, rd_pipe.n, ra_buf, &rd_pipe.good, &rd_pipe.failed_at_chunk_start);
+        obs_set_read_ahead(false);
+        ide_host_cmd_leave();
+        rd_pipe.held = true;
+    }
+    msc_busy_end();
+}
+
+// After a pipelined callback that handed over all it was asked for: the next
+// part of the same READ(10), if the CBW said there is one, cut at the end of
+// the medium and at one callback's worth.
+static void read_ahead_plan(uint32_t next_lba, uint64_t max) {
+    if (!rd_pipe.end || next_lba >= rd_pipe.end || next_lba >= max) return;
+    uint64_t end = rd_pipe.end < max ? rd_pipe.end : max;
+    uint32_t n = (uint32_t)(end - next_lba);
+    if (n > CFG_TUD_MSC_EP_BUFSIZE / 512) n = CFG_TUD_MSC_EP_BUFSIZE / 512;
+    rd_pipe.lba = next_lba;
+    rd_pipe.n = n;
+    rd_pipe.held = false;
+    rd_pipe.want = true;
+}
+
+// ---------------------------------------------------------------------------
 //  READ10 — block transfer with partial first/last sector handling
 // ---------------------------------------------------------------------------
 
@@ -236,6 +417,8 @@ static int32_t read10(uint8_t lun, uint32_t lba, uint32_t offset,
 #endif
     usb_sense_forget();
     if (!is_mounted) return -1;
+    // F1 stage 2: Off mode takes 4 KB a callback, as every earlier build did.
+    if (!rd_pipe.on && bufsize > USB_ATA_CHUNK) bufsize = USB_ATA_CHUNK;
 
     // TinyUSB derives the block size from the host's CBW (length / count)
     // and never checks it against the 512 we report. With 512-byte blocks
@@ -272,7 +455,9 @@ static int32_t read10(uint8_t lun, uint32_t lba, uint32_t offset,
     if (aligned > 0 && cur_lba < max) {
         if (cur_lba + aligned > max) aligned = (uint32_t)(max - cur_lba);
         uint32_t got = 0;
-        if (ide_read_sectors_partial(cur_lba, aligned, ptr, &got) < 0) {
+        int32_t rr = rd_pipe.on ? read_aligned_pipelined(cur_lba, aligned, ptr, &got)
+                                : ide_read_sectors_partial(cur_lba, aligned, ptr, &got);
+        if (rr < 0) {
             // Issue #13: sectors before the failing one are real data, so hand
             // those back and nothing else. TinyUSB then calls again starting at
             // the failing sector, which is read again on its own and fails
@@ -325,9 +510,18 @@ static int32_t read10(uint8_t lun, uint32_t lba, uint32_t offset,
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                           void *buffer, uint32_t bufsize) {
     msc_busy_begin();
-    host_cmd_enter(true, false, lba);
+    if (host_cmd_enter(true, false, lba)) {
+        // F1 stage 2: the mode for this READ(10), and its end from the CBW.
+        rd_pipe.on = config.pipelined_reads;
+        rd_pipe.end = rd_pipe.on ? cbw_read10_end((const uint8_t *)buffer, lba) : 0;
+    } else if (rd_pipe.on && rd_pipe.end) {
+        uint32_t e = cbw_read10_end((const uint8_t *)buffer, lba);
+        if (e && e < rd_pipe.end) rd_pipe.end = e;     // only ever shorter
+    }
     int32_t r = read10(lun, lba, offset, buffer, bufsize);
     host_cmd_leave(lba, r);
+    if (rd_pipe.on && r > 0 && (uint32_t)r == bufsize && is_mounted)
+        read_ahead_plan(lba + (uint32_t)r / 512, total_sectors());
     msc_busy_end();
     return r;
 }
@@ -344,6 +538,9 @@ static int32_t write10(uint8_t lun, uint32_t lba, uint32_t offset,
 #endif
     usb_sense_forget();
     if (!is_mounted || write_protected()) return -1;
+    // F1 stage 2: 4 KB a callback in both modes, as every earlier build (the
+    // MSC buffer is 16 KB now; TinyUSB keeps the rest and calls again).
+    if (bufsize > USB_ATA_CHUNK) bufsize = USB_ATA_CHUNK;
 
     // TinyUSB derives the block size from the host's CBW (length / count)
     // and never checks it against the 512 we report. With 512-byte blocks

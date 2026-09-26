@@ -27,7 +27,20 @@ if echo "$defs" | grep -q -- '-DATABOY_SAT=1'; then smart="-DATABOY_SAT_SMART_SA
 ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function $defs $smart \
     -I "$here/mock" -I "$here" -I "$src" \
     -o "$out/test_read" "$here/test_read.cpp"
-"$out/test_read"
+ATABOY_TRANSCRIPT="$out/transcript-off.txt" "$out/test_read"
+# F1 stage 2: the same tests with Pipelined Reads On, and what the host got
+# and the drive saw in every READ(10) and WRITE(10) compared with Off.
+${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function $defs $smart -DATABOY_TEST_PIPELINED=1 \
+    -I "$here/mock" -I "$here" -I "$src" \
+    -o "$out/test_read_pipelined" "$here/test_read.cpp"
+ATABOY_TRANSCRIPT="$out/transcript-on.txt" "$out/test_read_pipelined"
+if cmp -s "$out/transcript-off.txt" "$out/transcript-on.txt"; then
+    echo "transcripts Off and On: $(wc -l < "$out/transcript-off.txt") commands, 1 checks, 0 failed"
+else
+    diff "$out/transcript-off.txt" "$out/transcript-on.txt" | head -20
+    echo "transcripts Off and On: 1 checks, 1 failed"
+    exit 1
+fi
 if [ -n "$smart" ]; then
     ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function $defs \
         -I "$here/mock" -I "$here" -I "$src" \

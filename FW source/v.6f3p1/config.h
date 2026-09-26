@@ -7,7 +7,9 @@
 
 // 0x1DE45707 until 0.6f3p10's holistic review (2026-09-26, L-2), which added
 // crc: settings saved by an older build fail the check and load as defaults.
-#define CONFIG_MAGIC 0x1DE45708
+// 0x1DE45708 until F1 stage 2 (2026-09-26) added pipelined_reads: settings
+// saved before it load as defaults once (Pipelined Reads Off).
+#define CONFIG_MAGIC 0x1DE45709
 
 typedef struct {
     uint32_t magic;
@@ -23,6 +25,7 @@ typedef struct {
     uint8_t  spt;
     uint64_t lba_sectors;
     uint8_t  dev_base;            // 0xA0 = master, 0xB0 = slave
+    bool     pipelined_reads;     // F1 stage 2: Features, Pipelined Reads (usb.c); Off by default
     uint32_t crc;                 // config_crc() of everything above (L-2)
 } config_t;
 
@@ -56,6 +59,7 @@ static inline uint32_t config_crc(const config_t *c) {
     CONFIG_CRC_FIELD(crc, c, spt);
     CONFIG_CRC_FIELD(crc, c, lba_sectors);
     CONFIG_CRC_FIELD(crc, c, dev_base);
+    CONFIG_CRC_FIELD(crc, c, pipelined_reads);
     return ~crc;
 }
 static inline bool config_bool_ok(const bool *b) { uint8_t v; memcpy(&v, b, 1); return v <= 1; }
@@ -63,8 +67,8 @@ static inline bool config_valid(const config_t *c) {
     if (c->magic != CONFIG_MAGIC || c->crc != config_crc(c)) return false;
     if (!config_bool_ok(&c->drive_write_protected) || !config_bool_ok(&c->auto_mount) ||
         !config_bool_ok(&c->iordy_enabled) || !config_bool_ok(&c->intrq_enabled) ||
-        !config_bool_ok(&c->use_lba_mode)) return false;
-    if (c->main_selected > 4 || c->feat_selected > 4) return false;
+        !config_bool_ok(&c->use_lba_mode) || !config_bool_ok(&c->pipelined_reads)) return false;
+    if (c->main_selected > 4 || c->feat_selected > 5) return false;
     if (c->dev_base != 0xA0 && c->dev_base != 0xB0) return false;
     if (c->heads > 16) return false;
     bool none = c->cyls == 0 && c->heads == 0 && c->spt == 0;

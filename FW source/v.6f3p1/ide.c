@@ -260,25 +260,27 @@ void ide_id_words(ide_id_words_t *out) {
 //  Bus helpers — address, transceiver, and chip-select (all SIO-managed)
 // ---------------------------------------------------------------------------
 
-static void bus_idle(void) {
+// F1 stage 2 (d): these and the register accessors below run from SCRATCH_X
+// with ide_pio_read and ide_pio_write (ide_pio.c).
+static void __scratch_x("ide_bus") bus_idle(void) {
     sio_hw->gpio_set = (1 << IDE_CS0) | (1 << IDE_CS1);
     sio_hw->gpio_clr = (1 << IDE_DIR) | (1 << IDE_DIR1);   // DIR = read
     sio_hw->gpio_set = (1 << IDE_OE) | (1 << IDE_OE1);     // OE disabled
 }
 
-static void set_address(uint8_t addr) {
+static void __scratch_x("ide_bus") set_address(uint8_t addr) {
     sio_hw->gpio_clr = ADDR_MASK;
     sio_hw->gpio_set = (uint32_t)(addr & 0x07) << IDE_A0;
 }
 
-static void xcvr_read(void) {
+static void __scratch_x("ide_bus") xcvr_read(void) {
     sio_hw->gpio_set = (1 << IDE_OE) | (1 << IDE_OE1);     // disable first
     sio_hw->gpio_clr = (1 << IDE_DIR) | (1 << IDE_DIR1);   // DIR = IDE -> Pico
     busy_wait_at_least_cycles(20);                            // 74HCT245 switch time
     sio_hw->gpio_clr = (1 << IDE_OE) | (1 << IDE_OE1);     // enable
 }
 
-static void xcvr_write(void) {
+static void __scratch_x("ide_bus") xcvr_write(void) {
     sio_hw->gpio_set = (1 << IDE_OE) | (1 << IDE_OE1);     // disable first
     sio_hw->gpio_set = (1 << IDE_DIR) | (1 << IDE_DIR1);   // DIR = Pico -> IDE
     busy_wait_at_least_cycles(20);
@@ -289,7 +291,7 @@ static void xcvr_write(void) {
 //  Register I/O — single 8-bit reads/writes via PIO strobes
 // ---------------------------------------------------------------------------
 
-void ide_write_reg(uint8_t reg, uint8_t val) {
+void __scratch_x("ide_bus") ide_write_reg(uint8_t reg, uint8_t val) {
     if (reg == 7) sentinel_armed = false;   // a command: the registers are the drive's now
     // F1 stage 1: logged before it goes out (obs.h). Every command register
     // write in the firmware comes through here.
@@ -306,7 +308,7 @@ void ide_write_reg(uint8_t reg, uint8_t val) {
     bus_idle();
 }
 
-uint8_t ide_read_reg(uint8_t reg) {
+uint8_t __scratch_x("ide_bus") ide_read_reg(uint8_t reg) {
     set_address(reg);
     xcvr_read();
     sio_hw->gpio_clr = (1 << IDE_CS0);
@@ -322,7 +324,7 @@ uint8_t ide_read_reg(uint8_t reg) {
     return v;
 }
 
-uint8_t ide_read_alt_status(void) {
+uint8_t __scratch_x("ide_bus") ide_read_alt_status(void) {
     set_address(6);
     xcvr_read();
     sio_hw->gpio_clr = (1 << IDE_CS1);
@@ -335,7 +337,7 @@ uint8_t ide_read_alt_status(void) {
     return (uint8_t)(val & 0xFF);
 }
 
-void ide_write_control(uint8_t val) {
+void __scratch_x("ide_bus") ide_write_control(uint8_t val) {
     obs_ctrl(val);                          // F1 stage 1: every Device Control write
     set_address(6);
     xcvr_write();

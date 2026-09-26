@@ -76,6 +76,7 @@ static inline void gpio_set_function(unsigned pin, unsigned fn) {
 }
 #define __uninitialized_ram(name) name
 #define __not_in_flash_func(name) name
+#define __scratch_x(group)
 #define ATABOY_HOST_TEST 1
 static inline uint8_t rp2350_chip_version(void) { return 4; }
 // F1 stage 1: which core a log entry came from (obs.c); tests may set it.
