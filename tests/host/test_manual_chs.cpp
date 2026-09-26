@@ -111,7 +111,7 @@ static void fresh(const char *name) {
     rec.stage = REC_NONE; memset(&last_fail, 0, sizeof last_fail);
     chs_geometry_lost = false;
     manual_chs_active = false; iordy_held = false;
-    native_geo.on = false;
+    native_geo.on = false; idp_written = false; mchs_no_identify = false;
     saves = 0; busy_until_ns = 0; pend_at_ns = 0;
     tty.clear(); rx.clear(); rxi = 0;
     hang_limit_ns = mock_now_ns + 300000000000ull;  // 300 s of mock time
@@ -634,11 +634,14 @@ static void test_mchs_flag() {
     current_screen = SCREEN_DEBUG; debug_key('I'); current_screen = SCREEN_MAIN;   // IDENTIFY refused
     CHECK(ide_manual_chs_active(), "cleared by an IDENTIFY that failed");
 
-    fresh("Ctrl+G flag: cleared by an IDENTIFY that answers");
+    fresh("Ctrl+G flag: cleared by an IDENTIFY that answers (Auto Detect's)");
     sim.identify_ok = true;
     ctrl_g();
     current_screen = SCREEN_DEBUG; debug_key('i'); current_screen = SCREEN_MAIN;
-    CHECK(!ide_manual_chs_active() && sim.id_commands() == 1, "kept after Debug I answered");
+    CHECK(ide_manual_chs_active() && sim.id_commands() == 0, "Debug I sent IDENTIFY after Ctrl+G (review of p10, M-1)");
+    keys("\x1b");
+    run_auto_detect();
+    CHECK(!ide_manual_chs_active() && sim.id_commands() == 1, "kept after Auto Detect's IDENTIFY answered");
 
     fresh("Ctrl+G flag: not set by a refused 0x91");
     sim.reject_idp = true;
@@ -857,7 +860,15 @@ static void test_native_forgotten() {
     ctrl_g_native();
     config.heads = 2;                               // not the one declared
     CHECK(!ide_manual_chs_native_active(), "native with other heads");
-    config.heads = NH; config.use_lba_mode = true;
+    config.heads = NH; config.spt = 17;             // review of p10, I-1
+    CHECK(!ide_manual_chs_native_active(), "native with other sectors per track");
+    debug_reset();                                  // a reset: the old rule then sends 0x91
+    size_t m2 = sim.cmd_log.size();
+    read_right(0);
+    CHECK(cmds_since(m2).size() >= 1 && cmds_since(m2)[0] == 0x91 && sim.spt == 17,
+          "other sectors per track: 0x91 not sent for them (%zu commands)", sim.cmd_log.size() - m2);
+    config.spt = NS; native_geo.on = true;          // put back as it was (the read above sent 0x91)
+    config.use_lba_mode = true;
     CHECK(!ide_manual_chs_native_active(), "native in LBA mode");
     config.use_lba_mode = false; ide_select_device(0xB0);
     CHECK(!ide_manual_chs_native_active(), "native on the other device");
@@ -878,7 +889,7 @@ static void test_native_not_ready() {
           !ide_manual_chs_active(), "geometry set");
     CHECK(chs_geometry_lost, "geometry not lost");
     ide_fail_t f; ide_last_failure(&f);
-    CHECK(f.kind == IDE_FAIL_MANUAL_CHS && f.command == 0x10 && f.status == 0x10, "record kind %u cmd %02X st %02X",
+    CHECK(f.kind == IDE_FAIL_MCHS_NOT_READY && f.command == 0x10 && f.status == 0x10, "record kind %u cmd %02X st %02X",
           f.kind, f.command, f.status);
     tty.clear(); run_debug_errors();
     CHECK(has("[Last Failed I/O] cmd 10, manual CHS: not ready after 10h (no 91h)"), "Debug E");
@@ -912,6 +923,135 @@ static void test_native_trusts_the_declaration() {
     bool right = read_right(1234, &got);
     CHECK(got >= 0 && !right, "read %d right %d: the simulated drive should have answered from another sector",
           (int)got, right);
+}
+
+// ---- 11. review of 0.6f3p10 ----------------------------------------------------
+static void debug(int k) { current_screen = SCREEN_DEBUG; debug_key(k); current_screen = SCREEN_MAIN; }
+
+// M-1: after a Ctrl+G, either mode, accepted or not, Debug I and Debug S
+// send nothing (the seek test starts with IDENTIFY); ide_identify() itself
+// refuses. Auto Detect ends it.
+static void test_p10_m1_no_identify() {
+    const char *modes[] = { "522\r4\r40\ry", "\x07" "522\r4\r40\ry" };
+    for (int native = 0; native < 2; native++)
+        for (int fail = 0; fail < 2; fail++) {
+            native_drive(native ? (fail ? "M-1: native, not ready" : "M-1: native") : (fail ? "M-1: old, refused" : "M-1: old"));
+            sim.identify_ok = true;
+            if (fail) { if (native) sim.drdy_needs_idp = true; else sim.reject_idp = true; }
+            keys(modes[native]);
+            run_manual_chs();
+            CHECK(fail ? cur_cyls == 0 : cur_cyls == NC, "mount %u", cur_cyls);
+            int w = sim.reg_writes, c = sim.commands;
+            tty.clear(); debug('I'); debug('i'); debug('S'); debug('s');
+            CHECK(sim.id_commands() == 0 && sim.reg_writes == w && sim.commands == c,
+                  "Debug I/S sent %d IDENTIFY, %d writes", sim.id_commands(), sim.reg_writes - w);
+            CHECK(has(DEBUG_REFUSED_MCHS), "no refusal shown");
+            uint16_t id[256];
+            CHECK(!ide_identify(id) && sim.id_commands() == 0 && sim.reg_writes == w, "ide_identify sent it");
+            CHECK(ide_manual_chs_active() == !fail && ide_manual_chs_native_active() == (native && !fail),
+                  "flags changed: %d %d", ide_manual_chs_active(), ide_manual_chs_native_active());
+            // The other debug keys still work (R, T, E).
+            debug('T'); debug('E');
+            CHECK(sim.id_commands() == 0, "T or E sent IDENTIFY");
+        }
+    // Auto Detect ends it: IDENTIFY goes out there, and Debug I afterwards.
+    native_drive("M-1: Auto Detect ends the refusal");
+    sim.identify_ok = true;
+    ctrl_g_native();
+    keys("\x1b");
+    run_auto_detect();
+    CHECK(sim.id_commands() == 1 && !ide_mchs_no_identify(), "Auto Detect: %d", sim.id_commands());
+    debug('I');
+    CHECK(sim.id_commands() == 2, "Debug I after Auto Detect: %d", sim.id_commands());
+}
+
+// M-2: an IDENTIFY that answers (only Auto Detect's can, now) ends both
+// Ctrl+G flags together, so native mode is never left on with READ LONG
+// and pass-through unlocked. Forced here past M-1's refusal.
+static void test_p10_m2_consistent() {
+    native_drive("M-2: an IDENTIFY that answers ends native too");
+    sim.identify_ok = true;
+    ctrl_g_native();
+    mchs_no_identify = false;                       // as if M-1 were bypassed
+    uint16_t id[256];
+    CHECK(ide_identify(id), "IDENTIFY did not answer");
+    CHECK(!ide_manual_chs_active() && !ide_manual_chs_native_active(), "native %d with the Ctrl+G flag %d",
+          ide_manual_chs_native_active(), ide_manual_chs_active());
+    // ...and while M-1 holds, nothing unlocks: flag set, words and word 22 not held.
+    native_drive("M-2: locked while the Ctrl+G mode is shown");
+    sim.identify_ok = true;
+    ctrl_g_native();
+    debug('I');
+    uint16_t w22 = 0;
+    CHECK(ide_manual_chs_active() && ide_manual_chs_native_active() && !ide_read_long_word22(&w22), "unlocked");
+#if ATABOY_SAT
+    ide_id_words_t w; ide_id_words(&w);
+    CHECK(!w.valid, "IDENTIFY words held");
+#endif
+}
+
+// L-1: unmount ends native mode and its geometry; Current HDD still says
+// Ctrl+G; Mount has nothing to mount; a read sends nothing.
+static void test_p10_l1_unmount() {
+    native_drive("L-1: unmount ends native mode");
+    ctrl_g_native();
+    is_mounted = true;
+    menu_unmount();
+    CHECK(!ide_manual_chs_native_active() && !native_geo.on, "native kept over unmount");
+    CHECK(cur_cyls == 0 && cur_heads == 0 && cur_spt == 0 && config.heads == 0 && config.spt == 0, "geometry kept %u/%u/%u",
+          cur_cyls, cur_heads, cur_spt);
+    CHECK(strcmp(hdd_model_raw, MCHS_MODEL_NATIVE) == 0 && ide_manual_chs_active() && ide_mchs_no_identify(),
+          "Ctrl+G marks lost: \"%s\"", hdd_model_raw);
+    bool gv = (use_lba_mode && total_lba_sectors > 0) || (!use_lba_mode && cur_cyls > 0 && cur_heads > 0 && cur_spt > 0);
+    CHECK(!gv, "something to mount");
+    // Marked lost as well, or a read would be worked out with no geometry
+    // (a division by zero on the host; on the RP2350 a wrong sector).
+    CHECK(chs_geometry_lost, "geometry not marked lost at unmount");
+    size_t m = sim.cmd_log.size();
+    int32_t got = -1;
+    if (chs_geometry_lost) read_right(1234, &got);
+    CHECK(got < 0 && sim.cmd_log.size() == m && idp_sent() == 0, "read after unmount: %d, %zu commands",
+          (int)got, sim.cmd_log.size() - m);
+    // The old mode is unchanged by it (0.6f3p9 behaviour).
+    native_drive("L-1: unmount leaves the old mode as it was");
+    keys("522\r4\r40\ry"); run_manual_chs();
+    is_mounted = true;
+    menu_unmount();
+    CHECK(cur_cyls == NC && config.heads == NH, "old-mode geometry cleared");
+}
+
+// H-1: after this firmware has sent 91h since boot, the power-up default
+// mode is refused: in the box (not selected, reason shown), and by ide.c,
+// which sends nothing.
+static void test_p10_h1_idp_since_boot() {
+    native_drive("H-1: native refused after an old-mode 91h");
+    keys("522\r4\r40\ry"); run_manual_chs();             // old mode: 91h 4/40
+    CHECK(ide_idp_sent_since_boot(), "0x91 sent, flag not set");
+    size_t m = sim.cmd_log.size();
+    int hw = sim.hw_resets;
+    tty.clear();
+    keys("\x07" "522\r4\r40\r\x1b");
+    CHECK(!run_manual_chs() && sim.cmd_log.size() == m && sim.hw_resets == hw, "sent something");
+    CHECK(has(MCHS_NATIVE_REFUSED) && !has("power-up default, no 91h"), "native offered after 91h");
+    uint8_t st = 0;
+    int r = ide_manual_chs_native(NH, NS, &st);
+    CHECK(r == IDE_MCHS_IDP_SENT && sim.cmd_log.size() == m && sim.hw_resets == hw && ide_manual_chs_active(),
+          "ide.c: %d, %zu commands", r, sim.cmd_log.size() - m);
+
+    native_drive("H-1: a 91h after a reset counts too");
+    ctrl_g_native();
+    CHECK(!ide_idp_sent_since_boot(), "native mount set it");
+    config.heads = 2; config.spt = 17;              // not the native geometry: the old rule applies
+    debug_reset();
+    read_right(0);
+    CHECK(ide_idp_sent_since_boot() && idp_sent() == 1, "0x91 from ide_set_geometry not counted");
+
+    native_drive("H-1: native first is fine, and the old mode after it is not refused");
+    ctrl_g_native();
+    ctrl_g_native();
+    CHECK(ide_manual_chs_native_active() && idp_sent() == 0, "second native refused");
+    keys("522\r4\r40\ry"); run_manual_chs();
+    CHECK(idp_sent() == 1 && !ide_manual_chs_native_active(), "old mode refused");
 }
 
 // ---- 7. through the main loop: Ctrl+G reaches the entry ---------------------
@@ -1048,6 +1188,10 @@ int main() {
     test_native_forgotten();
     test_native_not_ready();
     test_native_trusts_the_declaration();
+    test_p10_m1_no_identify();
+    test_p10_m2_consistent();
+    test_p10_l1_unmount();
+    test_p10_h1_idp_since_boot();
     test_core1();                                   // does not return
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;

@@ -96,6 +96,8 @@ void    ide_host_cmd_leave(void);
 #define IDE_FAIL_BAD_END    7   // SAT: the drive offered data it should not have; aborted
 #define IDE_FAIL_MANUAL_CHS 8   // manual CHS entry: RECALIBRATE never ended, or the drive
                                 // refused INITIALIZE DEVICE PARAMETERS (command says which)
+#define IDE_FAIL_MCHS_NOT_READY 9   // manual CHS, power-up default mode: RECALIBRATE (10h)
+                                // ended but the drive was not ready, no ERR, within 1 s
 typedef struct {
     uint8_t  kind;          // IDE_FAIL_*
     uint8_t  command;       // ATA command that failed
@@ -210,6 +212,8 @@ bool    ide_recovery_pending(void);
 #define IDE_MCHS_BAD_ARGS   5   // heads not 1..16 or sectors 0; nothing done at all
 #define IDE_MCHS_NOT_READY  6   // native only: RECALIBRATE ended but the drive is not
                                 // ready (DRDY clear within 1 s) or shows ERR (recorded)
+#define IDE_MCHS_IDP_SENT   7   // native only: this firmware has sent 91h since it
+                                // booted; nothing done at all (ide_idp_sent_since_boot)
 // A 1990 Conner can take up to 40 s to spin up when its spin recovery
 // starts (CP3044 manual, section 3.3), longer than ATA's 31 s or the
 // probe's 10 s.
@@ -230,6 +234,25 @@ int     ide_manual_chs_native(uint8_t heads, uint8_t spt, uint8_t *status);
 // True while the geometry in use came from ide_manual_chs_native and is
 // still that geometry, on that device, in CHS mode: no 0x91 is sent.
 bool    ide_manual_chs_native_active(void);
+
+// Ends the power-up default mode (menus.c, at unmount: the drive may be
+// swapped on the cable while nothing is mounted). ide_manual_chs_active()
+// and the no-IDENTIFY rule below stay as they are.
+void    ide_manual_chs_native_forget(void);
+
+// True once this firmware has written INITIALIZE DEVICE PARAMETERS (0x91)
+// to the bus since it booted, by any path. A native Ctrl+G is refused
+// while it is true (IDE_MCHS_IDP_SENT): the drive may still hold that 91h's
+// translation if its RESET- does not undo it. It cannot see a 91h sent
+// before this boot (another controller, or this one before a power cycle
+// of the ATAboy alone), so the drive must still be power-cycled first.
+bool    ide_idp_sent_since_boot(void);
+
+// True from the moment a Ctrl+G (either mode) starts sending until Auto
+// Detect's probe. Meanwhile ide_identify() refuses without sending
+// anything: the drive on the cable is one that must not get IDENTIFY,
+// whoever asks (Debug I, the Debug seek test).
+bool    ide_mchs_no_identify(void);
 
 // True from a Ctrl+G whose 0x91 the drive accepted until an IDENTIFY answers
 // (ide_identify). RAM only. While true, sat.c refuses every pass-through

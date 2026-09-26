@@ -73,6 +73,11 @@ void ide_last_failure(ide_fail_t *out) { *out = stub_fail; }
 bool ide_recovery_pending(void) { return false; }
 int ide_manual_chs(uint8_t, uint8_t, uint8_t *st) { bus_use(); *st = 0x50; return IDE_MCHS_OK; }
 int ide_manual_chs_native(uint8_t, uint8_t, uint8_t *st) { bus_use(); *st = 0x50; return IDE_MCHS_OK; }
+// 0.6f3p10, review fixes (unused by older menus.c)
+bool ide_mchs_no_identify(void) { return false; }
+bool ide_manual_chs_native_active(void) { return false; }
+void ide_manual_chs_native_forget(void) {}
+bool ide_idp_sent_since_boot(void) { return false; }
 bool ide_manual_chs_active(void) { return false; }
 // 0.6f3p9: the salvage capture (Debug E).
 static ide_salvage_t stub_salvage;

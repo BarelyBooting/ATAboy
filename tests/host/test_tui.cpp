@@ -55,6 +55,11 @@ bool ide_recovery_pending(void) { return false; }
 int ide_manual_chs(uint8_t, uint8_t, uint8_t *st) { *st = 0x50; return IDE_MCHS_OK; }
 // 0.6f3p10 (unused by older menus.c)
 int ide_manual_chs_native(uint8_t, uint8_t, uint8_t *st) { *st = 0x50; return IDE_MCHS_OK; }
+// 0.6f3p10, review fixes (unused by older menus.c)
+bool ide_mchs_no_identify(void) { return false; }
+bool ide_manual_chs_native_active(void) { return false; }
+void ide_manual_chs_native_forget(void) {}
+bool ide_idp_sent_since_boot(void) { return false; }
 #endif
 #ifdef SAVE_REFUSED_MCHS    // review of 0.6f3p8, L-1
 bool ide_manual_chs_active(void) { return true; }
@@ -228,7 +233,7 @@ int main(int argc, char **argv) {
         reset_state();
         current_screen = SCREEN_DEBUG;
         memset(&stub_fail, 0, sizeof stub_fail);
-        stub_fail.kind = IDE_FAIL_MANUAL_CHS; stub_fail.command = 0x10; stub_fail.status = 0x51;
+        stub_fail.kind = IDE_FAIL_MCHS_NOT_READY; stub_fail.command = 0x10; stub_fail.status = 0x51;
         stub_fail.error = 0x02;
         draw_bios_frame(); draw_debug_overlay(); run_debug_errors();
         save(dir, "debug-errors-mchs-native");

@@ -161,6 +161,7 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     iordy_held = false;
     chs_geometry_lost = false;
     manual_chs_active = false;
+    native_geo.on = false; idp_written = false; mchs_no_identify = false;   // 0.6f3p10: power-up
     memset(&salvage, 0, sizeof salvage);            // power-up: no salvage capture
     tud_mount_cb();
     reset_worst();
@@ -2726,7 +2727,12 @@ static void test_sat_manual_chs_refused() {
     SatResult u = sat_cmd(rows[0].cdb, 512, true);
     CHECK(!u.ok() && sense_is(u.sense, 0x02, 0x04, 0x00), "unmounted: not NOT READY");
     // Detection: the drive answers the firmware's own IDENTIFY. Allowed again.
+    // Since the review of 0.6f3p10 (M-1) IDENTIFY is refused after a Ctrl+G
+    // until Auto Detect's probe, so detection here is the probe, then IDENTIFY.
     uint16_t id[256];
+    int ids0 = sim.id_commands();
+    CHECK(!ide_identify(id) && sim.id_commands() == ids0 && ide_manual_chs_active(), "IDENTIFY sent after Ctrl+G, before a probe");
+    ide_probe_devices();
     CHECK(ide_identify(id) && !ide_manual_chs_active(), "flag kept after IDENTIFY answered");
     is_mounted = true;
     int ids = sim.id_commands();

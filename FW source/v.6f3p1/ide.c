@@ -60,6 +60,21 @@ static bool native_geometry_in_use(void) {
 }
 
 bool ide_manual_chs_native_active(void) { return native_geometry_in_use(); }
+// The geometry is also marked lost, as after a reset: nothing mountable is
+// left, and a CHS read would otherwise go out with no geometry checked.
+void ide_manual_chs_native_forget(void) { native_geo.on = false; chs_geometry_lost = true; }
+
+// Review of 0.6f3p10, H-1: any 0x91 this firmware has written since boot
+// (ide_set_geometry, the old-mode Ctrl+G). A native Ctrl+G is refused
+// after one. RAM only, so an ATAboy power cycle clears it; the drive must be
+// power-cycled as well, which nothing here can see.
+static bool idp_written = false;
+bool ide_idp_sent_since_boot(void) { return idp_written; }
+
+// Review of 0.6f3p10, M-1: a Ctrl+G drive gets no IDENTIFY from anyone.
+// Set when a Ctrl+G starts sending, cleared only by Auto Detect's probe.
+static bool mchs_no_identify = false;
+bool ide_mchs_no_identify(void) { return mchs_no_identify; }
 
 // The geometry in use was set by Ctrl+G (ide_manual_chs), which never sends
 // IDENTIFY: set when its 0x91 is accepted, cleared by the next IDENTIFY that
@@ -524,6 +539,7 @@ uint8_t ide_probe_devices(void) {
     gpio_put(IDE_RESET, 1);
     chs_geometry_lost = true; // RESET- drops 0x91 (review of 0.6f3p8, M-1)
     native_geo.on = false;    // a new detection: the Ctrl+G power-up default no longer applies
+    mchs_no_identify = false; // a deliberate Auto Detect: IDENTIFY follows (review of 0.6f3p10, M-1)
     sleep_ms(2000);           // generous POST delay (not status-based)
     ide_write_control(0x00);  // nIEN=0
 
@@ -594,6 +610,7 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     if (native_geometry_in_use()) { chs_geometry_lost = false; return true; }
     ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
     ide_write_reg(2, spt);
+    idp_written = true;
     ide_write_reg(7, 0x91);
     wait_after_command();
     // Only a clean completion counts. With ABRT the drive keeps its own
@@ -659,9 +676,14 @@ ready:
 static bool identify_once(uint16_t *buf) { return identify_run(buf) > 0; }
 
 bool ide_identify(uint16_t *buf) {
+    // Review of 0.6f3p10, M-1: after a Ctrl+G nothing is sent, and nothing
+    // is changed: it fails as a drive that did not answer would.
+    if (mchs_no_identify) return false;
     bool ok = identify_once(buf);
-    // A drive that answered IDENTIFY is no longer one set up without it.
-    if (ok) manual_chs_active = false;
+    // A drive that answered IDENTIFY is no longer one set up without it, in
+    // either Ctrl+G mode (review of 0.6f3p10, M-2: native mode must not
+    // stay on with READ LONG and pass-through unlocked).
+    if (ok) { manual_chs_active = false; native_geo.on = false; }
     // Word 22 for READ LONG; a failed IDENTIFY forgets it, as below.
     long_words.valid = ok;
     if (ok) { long_words.dev_base = dev_base; long_words.w22 = buf[22]; }
@@ -1138,7 +1160,12 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
     uint8_t st = 0;
     *status = 0;
     if (heads < 1 || heads > 16 || spt < 1) return IDE_MCHS_BAD_ARGS;
+    // Review of 0.6f3p10, H-1: after a 91h from this firmware the drive may
+    // still be in that translation (whether RESET- undoes it on a given drive
+    // is not known). Nothing is sent and nothing changes.
+    if (native && idp_written) return IDE_MCHS_IDP_SENT;
     native_geo.on = false;          // set again below only by a native mount that ends well
+    mchs_no_identify = true;        // from here on this drive gets no IDENTIFY (M-1)
 #if ATABOY_SAT
     id_words.valid = false;         // this drive is never asked who it is
 #endif
@@ -1196,10 +1223,10 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
         }
         *status = st;
         if (!(st & 0x40) || (st & 0x89)) {
-            // Recorded as RECALIBRATE's, since it was the last command sent;
-            // BSY and DRQ clear tell Debug E it ended but left the drive not
-            // ready (a RECALIBRATE that never ended has one of them set).
-            record_failure(IDE_FAIL_MANUAL_CHS, 0x10, st, 0, 0, 0);
+            // Recorded against RECALIBRATE, the last command sent, as a kind
+            // of its own so Debug E says what happened whatever the status
+            // (review of 0.6f3p10, L-2: BSY can come back in this second).
+            record_failure(IDE_FAIL_MCHS_NOT_READY, 0x10, st, 0, 0, 0);
             return IDE_MCHS_NOT_READY;
         }
         chs_geometry_lost = false;  // the power-up default is the geometry in use
@@ -1214,6 +1241,7 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
     ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
     ide_write_reg(2, spt);
     sat_watch_arm(&w);
+    idp_written = true;
     ide_write_reg(7, 0x91);
     wait_after_command();
     bool ended = mchs_wait_end(&w, IDE_MCHS_IDP_MS, &st);

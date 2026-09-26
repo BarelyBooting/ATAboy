@@ -783,9 +783,10 @@ static void run_debug_errors(void) {
                                       "no time", "bad end"};
         if (f.kind == IDE_FAIL_MANUAL_CHS)      // Ctrl+G: no sector was asked for
             debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X, manual CHS: %s", f.command,
-                        f.command == 0x91 ? "drive refused geometry" :
-                        (f.status & 0x88) ? "RECALIBRATE did not end" :
-                        "not ready after 10h (no 91h)");      // 0.6f3p10, power-up default mode
+                        f.command == 0x91 ? "drive refused geometry" : "RECALIBRATE did not end");
+        else if (f.kind == IDE_FAIL_MCHS_NOT_READY)     // 0.6f3p10, power-up default mode
+            debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X, manual CHS: not ready after 10h (no 91h)",
+                        f.command);
         else
             debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
                         f.command, kinds[f.kind < 8 ? f.kind : 0], (unsigned long)f.lba,
@@ -898,10 +899,22 @@ static void features_toggle_iordy(void) {
 
 // Debug screen keys other than Esc. Every one of them reads or drives the
 // bus, so each waits for a running USB command first (bus_free_wait).
+//
+// Review of 0.6f3p10, M-1: I (IDENTIFY) and S (the seek test, which starts
+// with IDENTIFY) are refused after a Ctrl+G, either mode, until Auto Detect.
+// ide_identify() refuses as well; this only says so on the screen.
+#define DEBUG_REFUSED_MCHS "Refused: Ctrl+G drive, no IDENTIFY. Nothing sent."
 static void debug_key(int k) {
     bool known = k == 'i' || k == 'I' || k == 't' || k == 'T' || k == 'e' || k == 'E' ||
                  k == 's' || k == 'S' || k == 'r' || k == 'R';
-    if (!known || !bus_free_wait(true)) return;
+    if (!known) return;
+    if ((k == 'i' || k == 'I' || k == 's' || k == 'S') && ide_mchs_no_identify()) {
+        debug_cls();
+        debug_print(0, "\033[91;1m", DEBUG_REFUSED_MCHS);
+        debug_print(1, FG_WHITE, "Auto Detect ends this (it sends IDENTIFY).");
+        return;
+    }
+    if (!bus_free_wait(true)) return;
     if (k == 'i' || k == 'I') run_debug_identify();
     else if (k == 't' || k == 'T') run_debug_taskfile();
     else if (k == 'e' || k == 'E') run_debug_errors();
@@ -1001,6 +1014,16 @@ static void menu_unmount(void) {
     ide_id_words_forget();          // only SAT builds keep the words
 #endif
     ide_read_long_forget();         // word 22 (READ LONG), kept in every build
+    // Review of 0.6f3p10, L-1: with nothing mounted the drive can be swapped
+    // or power-cycled, so the power-up default mode ends here, and its
+    // geometry with it: Mount then refuses until a new Ctrl+G. Current HDD
+    // keeps saying it was a Ctrl+G drive, so the host tools still refuse
+    // Auto Detect on it.
+    if (ide_manual_chs_native_active()) {
+        ide_manual_chs_native_forget();
+        cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;
+        sync_to_config();
+    }
 }
 
 // Y at the prompt: reboot into the RP2350 ROM bootloader (USB drive and
@@ -1172,6 +1195,9 @@ static bool run_auto_detect(void) {
 #define MCHS_HELP        "0-9: Digits   Enter/Tab: Next field   Esc: Cancel"
 #define MCHS_HELP_NATIVE "0-9: Digits  Enter/Tab: Next  Ctrl+G: 91h mode  Esc: Cancel"
 #define MCHS_NOTE_NATIVE "Only if C/H/S IS the drive's power-up default."
+// Review of 0.6f3p10, H-1: the power-up default mode is not offered after
+// this firmware has sent 91h since it booted.
+#define MCHS_NATIVE_REFUSED "Refused: 91h already sent. Power-cycle drive and ATAboy."
 static const int mchs_field_col[3] = {18, 34, 50};
 
 // One line of the box's interior (62 columns), text centred, in `color`.
@@ -1257,7 +1283,10 @@ static bool run_manual_chs(void) {
         if (ch == KEY_ESC) return false;                      // nothing sent, nothing changed
         // Ctrl+G again, while typing: the power-up default mode, or back.
         // Only here; at the question below it does nothing, as before.
-        if (ch == MANUAL_CHS_KEY) { native = !native; msg = ""; continue; }
+        if (ch == MANUAL_CHS_KEY) {
+            if (!native && ide_idp_sent_since_boot()) { msg = MCHS_NATIVE_REFUSED; continue; }
+            native = !native; msg = ""; continue;
+        }
         if (ch >= '0' && ch <= '9') { if (p < 5) { fields[active][p] = (char)ch; fields[active][p+1] = '\0'; } continue; }
         if ((ch == 8 || ch == 127) && p > 0) { fields[active][p-1] = '\0'; continue; }
         if (ch != KEY_ENTER && ch != '\t') continue;
@@ -1305,7 +1334,8 @@ static bool run_manual_chs(void) {
                       r == IDE_MCHS_RECAL    ? "RECALIBRATE did not end" :
                       r == IDE_MCHS_NO_DEVICE ? "no drive answered" :
                       r == IDE_MCHS_BUSY     ? "drive still busy" :
-                      r == IDE_MCHS_NOT_READY ? "drive not ready, no 91h" : "nothing sent";
+                      r == IDE_MCHS_NOT_READY ? "drive not ready, no 91h" :
+                      r == IDE_MCHS_IDP_SENT ? "91h sent since boot" : "nothing sent";
     snprintf(hdd_status_text, sizeof(hdd_status_text), "\033[91;1mManual CHS: %s (ST:%02X)", why, st);
     hdd_model_raw[0] = '\0';
     cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;
