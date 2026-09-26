@@ -114,6 +114,7 @@ static void fresh(const char *name) {
     native_geo.on = false; idp_written = false; mchs_no_identify = false;
 #ifdef MCHS_MODEL_CLEARED
     native_declared = false;
+    memset(&refused, 0, sizeof refused);
 #endif
     sim_on_read = nullptr;
     saves = 0; busy_until_ns = 0; pend_at_ns = 0;
@@ -1169,6 +1170,52 @@ static void test_p10_n2_marker_kept() {
 }
 #endif
 
+#ifdef MCHS_MODEL_CLEARED
+// ---- 13. each guard layer on its own (mutation run of 2fcc4aa) --------------------
+// The layers hide each other when only the drive is watched, so each is
+// checked by its own refusal count, or called directly.
+static void test_p10_layers() {
+    // ide_identify refuses by itself: the inner layer is never reached.
+    native_drive("layers: ide_identify refuses before identify_run");
+    ctrl_g_native();
+    int w = sim.reg_writes;
+    uint16_t id[256];
+    CHECK(!ide_identify(id) && refused.identify_call == 1 && refused.identify_run == 0 && sim.reg_writes == w,
+          "outer %u inner %u writes %d", refused.identify_call, refused.identify_run, sim.reg_writes - w);
+    // identify_run, the last layer, refuses on its own (the SAT identity
+    // check calls it directly).
+    native_drive("layers: identify_run refuses on its own");
+    mchs_no_identify = true;
+    sim.identify_ok = true;
+    CHECK(identify_run(id) == 0 && refused.identify_run == 1 && sim.id_commands() == 0 && sim.reg_writes == 0,
+          "identify_run: inner %u, %d IDENTIFY", refused.identify_run, sim.id_commands());
+    // The Debug keys refuse before either (screen text, test_p10_m1).
+    native_drive("layers: Debug I refuses before ide_identify");
+    ctrl_g_native();
+    debug('I'); debug('S');
+    CHECK(refused.identify_call == 0 && refused.identify_run == 0, "Debug reached ide_identify: %u %u",
+          refused.identify_call, refused.identify_run);
+    // chs_geometry_ok refuses no geometry by itself: ide_set_geometry's own
+    // zero check is never reached.
+    fresh("layers: chs_geometry_ok refuses no geometry by itself");
+    config.cyls = 0; config.heads = 0; config.spt = 0; chs_geometry_lost = true;
+    CHECK(!chs_geometry_ok() && refused.idp_zero == 0 && sim.cmd_log.empty(), "zero refusals %u, %zu commands",
+          refused.idp_zero, sim.cmd_log.size());
+    config.heads = 4;                               // 0 sectors only
+    CHECK(!chs_geometry_ok() && refused.idp_zero == 0 && sim.cmd_log.empty(), "zero refusals %u (spt 0)", refused.idp_zero);
+    // ide_set_geometry's own zero check.
+    fresh("layers: ide_set_geometry refuses 0 heads or 0 sectors");
+    CHECK(!ide_set_geometry(0, 40) && !ide_set_geometry(4, 0) && refused.idp_zero == 2 && sim.cmd_log.empty(),
+          "zero refusals %u", refused.idp_zero);
+    // ...and its native-drive check, counted apart.
+    native_drive("layers: ide_set_geometry refuses a native-mounted drive");
+    ctrl_g_native();
+    ide_manual_chs_native_forget();                 // the mode ended, the drive still marked
+    CHECK(!ide_set_geometry(NH, NS) && refused.idp_native == 1 && refused.idp_zero == 0 && idp_sent() == 0,
+          "native refusals %u", refused.idp_native);
+}
+#endif
+
 // ---- 7. through the main loop: Ctrl+G reaches the entry ---------------------
 // Last, since core1_entry never returns (on_idle ends the program).
 static void core1_done() {
@@ -1310,6 +1357,7 @@ int main() {
     test_p10_n1_unmount_during_recovery();
 #ifdef MCHS_MODEL_CLEARED
     test_p10_n2_marker_kept();
+    test_p10_layers();
 #endif
     test_core1();                                   // does not return
     printf("%d checks, %d failed\n", checks, failures);

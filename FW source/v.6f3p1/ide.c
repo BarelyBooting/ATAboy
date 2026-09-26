@@ -83,6 +83,18 @@ bool ide_idp_sent_since_boot(void) { return idp_written; }
 // Review of 0.6f3p10, M-1: a Ctrl+G drive gets no IDENTIFY from anyone.
 // Set when a Ctrl+G starts sending, cleared only by Auto Detect's probe.
 static bool mchs_no_identify = false;
+
+// Refusals, counted where each one happens (mutation run of 2fcc4aa): the
+// guards are layered (Debug key, ide_identify, identify_run; chs_geometry_ok,
+// ide_set_geometry), so with only the drive to look at, one layer hides the
+// removal of another. The host tests read these to show each layer works
+// on its own. RAM only, nothing reads them in the firmware itself.
+static struct {
+    uint32_t identify_call;     // ide_identify after a Ctrl+G
+    uint32_t identify_run;      // identify_run after a Ctrl+G (the last layer)
+    uint32_t idp_native;        // ide_set_geometry, drive mounted in the power-up default mode
+    uint32_t idp_zero;          // ide_set_geometry with 0 heads or 0 sectors
+} refused;
 bool ide_mchs_no_identify(void) { return mchs_no_identify; }
 
 // The geometry in use was set by Ctrl+G (ide_manual_chs), which never sends
@@ -622,7 +634,8 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     // default mode and no Ctrl+G or Auto Detect has come since: no 0x91 at
     // all, even with the mode ended. And never a geometry of 0 heads or 0
     // sectors, which would go out as 16 heads and 0 sectors.
-    if (native_declared || heads == 0 || spt == 0) return false;
+    if (native_declared) { refused.idp_native++; return false; }
+    if (heads == 0 || spt == 0) { refused.idp_zero++; return false; }
     ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
     ide_write_reg(2, spt);
     idp_written = true;
@@ -644,7 +657,7 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
 // or ended the command with ERR. -1: IDENTIFY was sent and gave no data in
 // time; the drive may still be working on it.
 static int identify_run(uint16_t *buf) {
-    if (mchs_no_identify) return 0;     // re-review of 0.6f3p10, N-3: every IDENTIFY comes through here
+    if (mchs_no_identify) { refused.identify_run++; return 0; }    // re-review of 0.6f3p10, N-3: every IDENTIFY comes through here
     if (!ide_wait_until_ready(work_ms(1000))) return 0;
     if (ide_read_reg(7) & 0x08) ide_drain_sector();   // drain stranded DRQ before command
     ide_write_reg(6, dev_base);
@@ -694,7 +707,7 @@ static bool identify_once(uint16_t *buf) { return identify_run(buf) > 0; }
 bool ide_identify(uint16_t *buf) {
     // Review of 0.6f3p10, M-1: after a Ctrl+G nothing is sent, and nothing
     // is changed: it fails as a drive that did not answer would.
-    if (mchs_no_identify) return false;
+    if (mchs_no_identify) { refused.identify_call++; return false; }
     bool ok = identify_once(buf);
     // A drive that answered IDENTIFY is no longer one set up without it, in
     // either Ctrl+G mode (review of 0.6f3p10, M-2: native mode must not
