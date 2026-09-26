@@ -19,6 +19,7 @@
 #include "mock_pico.h"
 #include "sim.hpp"
 
+#include "obs.c"
 #include "ide.c"
 #include "usb.c"
 #if ATABOY_SAT
@@ -3880,6 +3881,504 @@ static void test_r3_write_once() {
     }
 }
 
+// ---------------------------------------------------------------------------
+//  F1 stage 1 (owner decision, 2026-09-26): the bus event log and the
+//  per-sector hashes (obs.h, obs.c), read with READ BUFFER 4Ch and 48h
+// ---------------------------------------------------------------------------
+
+// An independent SHA-256 (any length, written apart from obs.c's), checked
+// against the FIPS 180-2 examples before it checks anything else.
+static void ref_sha256(const uint8_t *msg, size_t len, uint8_t out[32]) {
+    static const uint32_t K[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2 };
+    std::vector<uint8_t> m(msg, msg + len);
+    m.push_back(0x80);
+    while (m.size() % 64 != 56) m.push_back(0);
+    uint64_t bits = (uint64_t)len * 8;
+    for (int i = 7; i >= 0; i--) m.push_back((uint8_t)(bits >> (8 * i)));
+    uint32_t H[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+    auto R = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
+    for (size_t o = 0; o < m.size(); o += 64) {
+        uint32_t W[64];
+        for (int t = 0; t < 64; t++) {
+            if (t < 16) W[t] = (uint32_t)m[o + 4 * t] << 24 | (uint32_t)m[o + 4 * t + 1] << 16 | (uint32_t)m[o + 4 * t + 2] << 8 | m[o + 4 * t + 3];
+            else W[t] = (R(W[t - 2], 17) ^ R(W[t - 2], 19) ^ (W[t - 2] >> 10)) + W[t - 7] +
+                        (R(W[t - 15], 7) ^ R(W[t - 15], 18) ^ (W[t - 15] >> 3)) + W[t - 16];
+        }
+        uint32_t v[8];
+        for (int i = 0; i < 8; i++) v[i] = H[i];
+        for (int t = 0; t < 64; t++) {
+            uint32_t T1 = v[7] + (R(v[4], 6) ^ R(v[4], 11) ^ R(v[4], 25)) + ((v[4] & v[5]) ^ (~v[4] & v[6])) + K[t] + W[t];
+            uint32_t T2 = (R(v[0], 2) ^ R(v[0], 13) ^ R(v[0], 22)) + ((v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]));
+            for (int i = 7; i > 0; i--) v[i] = v[i - 1];
+            v[4] += T1; v[0] = T1 + T2;
+        }
+        for (int i = 0; i < 8; i++) H[i] += v[i];
+    }
+    for (int i = 0; i < 8; i++) for (int j = 0; j < 4; j++) out[4 * i + j] = (uint8_t)(H[i] >> (24 - 8 * j));
+}
+static std::string hex32(const uint8_t *d) {
+    std::string s; char b[3];
+    for (int i = 0; i < 32; i++) { snprintf(b, sizeof b, "%02x", d[i]); s += b; }
+    return s;
+}
+static std::vector<uint8_t> medium_sector(uint32_t lba) {
+    std::vector<uint8_t> v(512);
+    for (int i = 0; i < 512; i++) v[i] = sim.byte_at(lba, i);
+    return v;
+}
+
+struct ObsPage {
+    int32_t r = -1;
+    uint32_t first = 0, n = 0, esize = 0, next = 0, oldest = 0, ring = 0;
+    uint8_t flags = 0;
+    std::vector<uint8_t> raw;
+};
+static ObsPage obs_page(uint8_t id, uint32_t cursor, uint32_t alloc = 4096, uint32_t xfer = 4096) {
+    ObsPage p;
+    SatResult s = read_buffer_cmd(rbuf_cdb(0x02, id, cursor, alloc), xfer);
+    p.r = s.r;
+    p.raw = s.data;
+    if (s.data.size() >= 32) {
+        p.first = le32_at(s.data, 8); p.n = s.data[12] | (s.data[13] << 8); p.esize = s.data[14] | (s.data[15] << 8);
+        p.next = le32_at(s.data, 16); p.oldest = le32_at(s.data, 20); p.ring = le32_at(s.data, 24); p.flags = s.data[28];
+    }
+    return p;
+}
+// The log from seq `from` to now, a page at a time with the cursor, as a
+// host would read it. *gap: a page said entries were lost, or a page did
+// not start where the last one ended.
+static std::vector<obs_log_entry_t> obs_log_all(uint32_t from, bool *gap, uint32_t alloc = 32 + 7 * 32) {
+    std::vector<obs_log_entry_t> out;
+    *gap = false;
+    uint32_t want = from;
+    for (int guard = 0; guard < 100000; guard++) {
+        ObsPage p = obs_page(OBS_LOG_BUFFER_ID, want & 0xFFFFFF, alloc);
+        if (p.r < 32 || memcmp(p.raw.data(), "ATBLOG01", 8) != 0 || p.esize != 32) { *gap = true; break; }
+        if (p.flags & 1) *gap = true;
+        if (p.n == 0) break;
+        if (want && p.first != want) *gap = true;
+        for (uint32_t i = 0; i < p.n; i++) {
+            obs_log_entry_t e; memcpy(&e, p.raw.data() + 32 + 32 * i, 32);
+            out.push_back(e);
+        }
+        want = out.back().seq + 1;
+    }
+    return out;
+}
+static std::vector<obs_hash_entry_t> obs_hash_all(bool *gap) {
+    std::vector<obs_hash_entry_t> out;
+    *gap = false;
+    uint32_t want = 0;
+    for (int guard = 0; guard < 100000; guard++) {
+        ObsPage p = obs_page(OBS_HASH_BUFFER_ID, want & 0xFFFFFF, 32 + 5 * 48);
+        if (p.r < 32 || memcmp(p.raw.data(), "ATBSHA01", 8) != 0 || p.esize != 48) { *gap = true; break; }
+        if (p.flags & 1) *gap = true;
+        if (p.n == 0) break;
+        if (want && p.first != want) *gap = true;
+        for (uint32_t i = 0; i < p.n; i++) {
+            obs_hash_entry_t e; memcpy(&e, p.raw.data() + 32 + 48 * i, 48);
+            out.push_back(e);
+        }
+        want = out.back().seq + 1;
+    }
+    return out;
+}
+static std::vector<obs_log_entry_t> only_cmds(const std::vector<obs_log_entry_t> &v) {
+    std::vector<obs_log_entry_t> c;
+    for (auto &e : v) if (e.kind == OBS_EV_CMD) c.push_back(e);
+    return c;
+}
+
+static void test_obs_reference_sha() {
+    current = "F1: the tests' own SHA-256 against FIPS 180-2";
+    uint8_t d[32];
+    ref_sha256((const uint8_t *)"abc", 3, d);
+    CHECK(hex32(d) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "abc: %s", hex32(d).c_str());
+    const char *two = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    ref_sha256((const uint8_t *)two, strlen(two), d);
+    CHECK(hex32(d) == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1", "448 bits: %s", hex32(d).c_str());
+    ref_sha256((const uint8_t *)"", 0, d);
+    CHECK(hex32(d) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "empty: %s", hex32(d).c_str());
+}
+
+// Every command the drive saw is in the log, in order, with the registers it
+// saw, and nothing else is; every reset and every SRST too. A second,
+// differently shaped record (the simulated drive's own) is the reference.
+static void test_obs_log_matches_drive(Mode m) {
+    setup(m == LBA ? "F1: the log against the drive's own record, LBA" : "F1: the log against the drive's own record, CHS", m);
+    if (m == CHS) chs_user_geometry();
+    obs_test_reset(0, 0);
+    size_t c0 = sim.cmd_log.size();
+    int srst0 = sim.srst, hw0 = sim.hw_resets;
+    sim.vary_flawed = true;
+    host_read10(100, 16);                                   // good: two commands of 8
+    sim.bad[5003] = {BAD_ERR_DRQ, 0};
+    host_read10(5000, 8);                                   // ERR with data: salvage, the call again
+    sim.bad.clear();
+    sim.bad[7003] = {BAD_HANG, 0};
+    host_read10(7000, 8);                                   // hang: SRST, recovery
+    sim.bad.clear();
+    config.drive_write_protected = false;
+    std::vector<uint8_t> w = fill512(4, 9);
+    host_write10(3000, w.data(), 4);
+    host_read10(3000, 4);
+    uint8_t lb[516];
+    if (m == LBA) ide_read_long(200, lb);
+    sim.srst_wedges = true;                                 // SRST fails: RESET-, RECALIBRATE, 91h
+    sim.bad[7103] = {BAD_HANG, 0};
+    host_read10(7100, 8);
+    sim.srst_wedges = false; sim.bad.clear();
+    for (int i = 0; i < 3 && rec.stage != REC_NONE; i++) host_read10(10, 1);   // let the recovery finish
+#if ATABOY_SAT
+    if (m == LBA) {
+        sat_taskfile_t id = {}; id.command = 0xEC; id.protocol = SAT_PROTO_PIO_IN; id.sectors = 1;
+        uint8_t ib[512]; ide_sat_regs_t regs;
+        is_mounted = true;
+        ide_sat_pio_in(&id, ib, &regs);
+        sat_taskfile_t rv = {}; rv.command = 0x40; rv.count = 1; rv.lba_low = 5; rv.device = 0x40; rv.protocol = SAT_PROTO_NON_DATA;
+        ide_sat_nondata(&rv, &regs);
+    }
+#endif
+    ide_seek_read_one(10, m == LBA);
+    is_mounted = false;
+    ide_reset_drive();
+    ide_probe_devices();
+    uint16_t id2[256];
+    ide_identify(id2);
+    if (m == CHS) ide_set_geometry(config.heads, config.spt);
+
+    bool gap = true;
+    std::vector<obs_log_entry_t> all = obs_log_all(0, &gap);
+    CHECK(!gap, "the log had a gap");
+    bool contiguous = !all.empty() && all[0].seq == 1 && all[0].kind == OBS_EV_BOOT;
+    for (size_t i = 1; i < all.size(); i++) if (all[i].seq != all[i - 1].seq + 1) contiguous = false;
+    CHECK(contiguous, "not every seq from the boot entry on: %zu entries", all.size());
+    std::vector<obs_log_entry_t> cmds = only_cmds(all);
+    std::vector<uint8_t> want(sim.cmd_log.begin() + c0, sim.cmd_log.end());
+    std::vector<uint8_t> got;
+    for (auto &e : cmds) got.push_back(e.value);
+    CHECK(got == want, "commands in the log %zu, the drive saw %zu", got.size(), want.size());
+    int tf_bad = 0, unfinished = 0;
+    for (size_t i = 0; i < cmds.size() && i < want.size(); i++) {
+        auto &s = sim.cmd_tf_log[c0 + i];
+        for (int r = 0; r < 6; r++)
+            if ((cmds[i].bits & (1u << r)) && cmds[i].tf[r] != s[r]) tf_bad++;
+        for (int r = 0; r < 4; r++)
+            if ((cmds[i].bits & (1u << (6 + r))) && cmds[i].hob[r] != s[6 + r]) tf_bad++;
+        if (!(cmds[i].bits & OBS_B_FINISHED) || cmds[i].outcome == OBS_OUT_OPEN) {
+            unfinished++;
+            if (unfinished < 4) printf("  unfinished: seq %u cmd %02X\n", cmds[i].seq, cmds[i].value);
+        }
+    }
+    CHECK(tf_bad == 0, "%d task file bytes differ from what the drive saw", tf_bad);
+    int mask_bad = 0, sector_cmds = 0;
+    for (auto &e : cmds)
+        if (e.value == 0x20 || e.value == 0x24 || e.value == 0x30 || e.value == 0x23) {
+            sector_cmds++;
+            if ((e.bits & 0x3E) != 0x3E) mask_bad++;         // count, sector, cyl lo, cyl hi, device/head
+        }
+    CHECK(sector_cmds >= 8 && mask_bad == 0, "%d of %d sector commands without their task file", mask_bad, sector_cmds);
+    CHECK(unfinished == 0, "%d commands with no end recorded", unfinished);
+    int resets = 0, srsts = 0;
+    for (auto &e : all) {
+        if (e.kind == OBS_EV_RESET) resets++;
+        if (e.kind == OBS_EV_CTRL && (e.value & 0x04)) srsts++;
+    }
+    CHECK(resets == sim.hw_resets - hw0 && resets >= 3, "RESET- pulses: log %d, drive %d", resets, sim.hw_resets - hw0);
+    CHECK(srsts == sim.srst - srst0 && srsts >= 2, "SRSTs: log %d, drive %d", srsts, sim.srst - srst0);
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+}
+
+// What a command's entry says about it: status, error, blocks, outcome.
+static void test_obs_counts(Mode m) {
+    setup(m == LBA ? "F1: counts and outcomes, LBA" : "F1: counts and outcomes, CHS", m);
+    if (m == CHS) chs_user_geometry();
+    obs_test_reset(0, 0);
+    uint32_t from = 2;
+    bool gap;
+    host_read10(1000, 8);
+    auto c = only_cmds(obs_log_all(from, &gap));
+    CHECK(c.size() == 1 && (c[0].value == 0x20) && c[0].handed == 8 && c[0].witnessed == 8 && c[0].unwitnessed == 0 &&
+          c[0].outcome == OBS_OUT_OK && (c[0].bits & OBS_B_STATUS) && c[0].status == 0x50 && (c[0].bits & OBS_B_HOST),
+          "good read: %zu cmds, handed %u wit %u unwit %u out %02X st %02X", c.size(), c.empty() ? 0 : c[0].handed,
+          c.empty() ? 0 : c[0].witnessed, c.empty() ? 0 : c[0].unwitnessed, c.empty() ? 0 : c[0].outcome, c.empty() ? 0 : c[0].status);
+    from = c.empty() ? from : c.back().seq + 1;
+    sim.bad[2003] = {BAD_ERR, 0};
+    host_read10(2000, 8);
+    sim.bad.clear();
+    c = only_cmds(obs_log_all(from, &gap));
+    // The read that failed at its fourth block, then the host's call again at it.
+    CHECK(c.size() == 2 && c[0].handed == 3 && c[0].witnessed == 3 && c[0].outcome == (0x80 | IDE_FAIL_ERR) &&
+          (c[0].status & 0x01) && c[0].error == 0x40 && (c[0].bits & OBS_B_FROZEN) &&
+          c[1].handed == 0 && c[1].outcome == (0x80 | IDE_FAIL_ERR),
+          "ERR at block 3: %zu cmds, handed %u wit %u out %02X st %02X err %02X", c.size(), c.empty() ? 0 : c[0].handed,
+          c.empty() ? 0 : c[0].witnessed, c.empty() ? 0 : c[0].outcome, c.empty() ? 0 : c[0].status, c.empty() ? 0 : c[0].error);
+    from = c.empty() ? from : c.back().seq + 1;
+    // R3-1: DRQ once after 5002, then ERR at 5006: handed stops at the unwitnessed block.
+    sim_reg_cost_ns = 2000; sim_word_ns = 800; sim.intrq_wired = false;
+    sim.mid_linger = true; sim.mid_linger_once = true; sim.mid_linger_from = 5002; sim.drq_linger = 2000000;
+    sim.bad[5006] = {BAD_ERR, 0};
+    uint8_t pb[8 * 512]; uint32_t pd = 0;
+    uint32_t uw0 = ide_unwitnessed_blocks();
+    int32_t pr = ide_read_sectors_partial(5000, 8, pb, &pd);
+    uint32_t uw = ide_unwitnessed_blocks() - uw0;
+    c = only_cmds(obs_log_all(from, &gap));
+    CHECK(pr < 0 && !c.empty() && c[0].handed == pd && pd <= 3 && uw >= 1 && c[0].unwitnessed == uw &&
+          c[0].witnessed + c[0].unwitnessed >= pd && (c[0].outcome & 0x80),
+          "R3-1: done %u, log handed %u wit %u unwit %u out %02X", pd, c.empty() ? 0 : c[0].handed,
+          c.empty() ? 0 : c[0].witnessed, c.empty() ? 0 : c[0].unwitnessed, c.empty() ? 0 : c[0].outcome);
+    sim.mid_linger = false; sim.bad.clear(); sim_reg_cost_ns = 0; sim_word_ns = 0;
+    from = log_next;
+    config.drive_write_protected = false;
+    std::vector<uint8_t> w = fill512(4, 3);
+    host_write10(3000, w.data(), 4);
+    c = only_cmds(obs_log_all(from, &gap));
+    CHECK(c.size() == 1 && c[0].value == 0x30 && c[0].handed == 4 && c[0].witnessed == 4 && c[0].outcome == OBS_OUT_OK,
+          "write: %zu cmds", c.size());
+    if (m == CHS && !c.empty()) {
+        // A refusal recorded with nothing sent (17 heads: no geometry) is not
+        // put on the last command, which ended well.
+        uint32_t wseq = c[0].seq;
+        uint8_t h0 = config.heads;
+        config.heads = 17;
+        uint8_t b1[512];
+        int32_t rr = ide_read_sectors(10, 1, b1);
+        config.heads = h0;
+        ide_fail_t fr; ide_last_failure(&fr);
+        obs_log_entry_t we = log_ring[wseq % OBS_LOG_ENTRIES];
+        CHECK(rr < 0 && fr.kind == IDE_FAIL_NO_GEOMETRY && we.outcome == OBS_OUT_OK && obs_current_cmd() == wseq,
+              "refusal: r %d kind %u, the write's outcome %02X", rr, fr.kind, we.outcome);
+    }
+    CHECK(!gap, "gap");
+}
+
+// Each block's hash, as it came off the bus: keyed by LBA and command, the
+// medium's bytes, with the flags that say what it was.
+static void test_obs_hashes(Mode m) {
+    setup(m == LBA ? "F1: per-sector hashes, LBA" : "F1: per-sector hashes, CHS", m);
+    if (m == CHS) chs_user_geometry();
+    obs_test_reset(0, 0);
+    CHECK(obs_hash_engine_ok(), "the engine failed its self-test");
+    sim.vary_flawed = true;
+    HostRead h = host_read10(1000, 16);
+    bool gap;
+    auto cmds = only_cmds(obs_log_all(0, &gap));
+    auto hs = obs_hash_all(&gap);
+    CHECK(h.ok && !gap && hs.size() == 16 && cmds.size() == 2, "%zu hashes, %zu commands", hs.size(), cmds.size());
+    int bad = 0;
+    for (size_t i = 0; i < hs.size() && cmds.size() == 2; i++) {
+        uint8_t d[32];
+        std::vector<uint8_t> sec = medium_sector(1000 + (uint32_t)i);
+        ref_sha256(sec.data(), 512, d);
+        bool ok = hs[i].lba == 1000 + i && hs[i].index == i % 8 && hs[i].cmd_seq == cmds[i / 8].seq &&
+                  hs[i].flags == 0 && memcmp(hs[i].digest, d, 32) == 0;
+        std::vector<uint8_t> other = medium_sector(1001 + (uint32_t)i);
+        ref_sha256(other.data(), 512, d);
+        ok = ok && memcmp(hs[i].digest, d, 32) != 0;
+        if (!ok) bad++;
+    }
+    CHECK(bad == 0, "%d hash entries wrong", bad);
+    // ERR with data: the offered block is hashed, flagged, and never handed over.
+    uint32_t hfrom = hash_next;
+    sim.bad[5003] = {BAD_ERR_DRQ, 0};
+    host_read10(5000, 8);
+    sim.bad.clear();
+    hs = obs_hash_all(&gap);
+    int salv = 0, salv_ok = 0;
+    for (auto &e : hs) if (e.seq >= hfrom && (e.flags & OBS_H_SALVAGE)) {
+        salv++;
+        uint8_t d[32];
+        ide_salvage_t sv; ide_salvage_get(&sv);
+        ref_sha256(sv.data, 512, d);
+        if (e.lba == 5003 && memcmp(e.digest, d, 32) == 0) salv_ok++;
+    }
+    CHECK(salv >= 1 && salv_ok >= 1, "salvage hashes %d, right %d", salv, salv_ok);
+    // R-1: the block taken with no drop seen is flagged, and only it.
+    hfrom = hash_next;
+    sim_reg_cost_ns = 2000; sim_word_ns = 800; sim.intrq_wired = false;
+    sim.mid_linger = true; sim.mid_linger_once = true; sim.mid_linger_from = 6002; sim.drq_linger = 2000000;
+    uint32_t uw0 = ide_unwitnessed_blocks();
+    uint8_t pb[8 * 512]; uint32_t pd = 0;
+    ide_read_sectors_partial(6000, 8, pb, &pd);
+    uint32_t uw = ide_unwitnessed_blocks() - uw0;
+    sim.mid_linger = false; sim.drq_linger = 0; sim.intrq_wired = true; sim_reg_cost_ns = 0; sim_word_ns = 0;
+    hs = obs_hash_all(&gap);
+    uint32_t flagged = 0, lowest = 99;
+    for (auto &e : hs) if (e.seq >= hfrom && (e.flags & OBS_H_UNWITNESSED)) { flagged++; if (e.index < lowest) lowest = e.index; }
+    CHECK(uw >= 1 && flagged == uw && lowest == 3, "unwitnessed: %u counted, %u flagged, first at %u", uw, flagged, lowest);
+    if (m == LBA) {
+        hfrom = hash_next;
+        uint8_t lb[516];
+        int r = ide_read_long(200, lb);
+        hs = obs_hash_all(&gap);
+        uint8_t d[32];
+        std::vector<uint8_t> sec = medium_sector(200);
+        ref_sha256(sec.data(), 512, d);
+        CHECK(r == IDE_LONG_OK && !hs.empty() && hs.back().seq >= hfrom && hs.back().flags == OBS_H_READ_LONG &&
+              hs.back().lba == 200 && memcmp(hs.back().digest, d, 32) == 0, "READ LONG hash: r %d", r);
+#if ATABOY_SAT
+        // An ATA PASS-THROUGH data-in block (IDENTIFY here): flagged, and the
+        // bytes the host was handed.
+        hfrom = hash_next;
+        sat_taskfile_t id = {}; id.command = 0xEC; id.protocol = SAT_PROTO_PIO_IN; id.sectors = 1;
+        uint8_t ib[512]; ide_sat_regs_t regs;
+        int sr = ide_sat_pio_in(&id, ib, &regs);
+        hs = obs_hash_all(&gap);
+        ref_sha256(ib, 512, d);
+        CHECK(sr == IDE_SAT_OK && !hs.empty() && hs.back().seq == hfrom && hs.back().flags == OBS_H_SAT &&
+              memcmp(hs.back().digest, d, 32) == 0, "SAT hash: r %d", sr);
+#endif
+    }
+}
+
+// The boot self-test, both ways: a broken engine is found, and then no hash
+// is kept at all.
+static void test_obs_selftest() {
+    setup("F1: hash engine self-test, both ways", LBA);
+    obs_test_engine_broken = true;
+    obs_test_reset(0, 0);
+    bool broken_found = !obs_hash_engine_ok();
+    host_read10(100, 8);
+    ObsPage p = obs_page(OBS_HASH_BUFFER_ID, 0);
+    obs_test_engine_broken = false;
+    CHECK(broken_found && p.n == 0 && (p.flags & 4) && !(p.flags & 2), "broken engine: ok %d, %u hashes, flags %02X",
+          !broken_found, p.n, p.flags);
+    obs_test_reset(0, 0);
+    host_read10(100, 8);
+    p = obs_page(OBS_HASH_BUFFER_ID, 0);
+    CHECK(obs_hash_engine_ok() && p.n == 8 && (p.flags & 2) && !(p.flags & 4), "good engine: %u hashes, flags %02X", p.n, p.flags);
+}
+
+// The cursor: paging, a ring that has wrapped, the 24-bit wrap, the future,
+// short allocation lengths, an entry being written; and READ BUFFER never
+// touches the drive.
+static void test_obs_cursor() {
+    setup("F1: log cursor and paging", LBA);
+    obs_test_reset(0, 0);
+    for (int i = 0; i < 4200; i++) host_read10(100 + i % 50, 1);   // one entry each
+    Quiet q;
+    ObsPage p = obs_page(OBS_LOG_BUFFER_ID, 0);
+    uint32_t next = log_next;
+    CHECK(p.next == next && p.ring == OBS_LOG_ENTRIES && p.oldest == next - OBS_LOG_ENTRIES && p.first == p.oldest &&
+          p.n == (4096 - 32) / 32 && !(p.flags & 1), "cursor 0: first %u oldest %u next %u n %u flags %02X",
+          p.first, p.oldest, p.next, p.n, p.flags);
+    p = obs_page(OBS_LOG_BUFFER_ID, 1);
+    CHECK((p.flags & 1) && p.first == next - OBS_LOG_ENTRIES, "a lost cursor: flags %02X first %u", p.flags, p.first);
+    p = obs_page(OBS_LOG_BUFFER_ID, next - 10);
+    CHECK(p.first == next - 10 && p.n == 10 && !(p.flags & 1), "the last ten: first %u n %u", p.first, p.n);
+    p = obs_page(OBS_LOG_BUFFER_ID, next);
+    CHECK(p.r == 32 && p.n == 0 && p.first == 0, "the future: r %d n %u", p.r, p.n);
+    p = obs_page(OBS_LOG_BUFFER_ID, next + 5);
+    CHECK(p.r == 32 && p.n == 0, "further in the future: r %d n %u", p.r, p.n);
+    for (uint32_t a : { 0u, 1u, 8u, 31u, 32u, 63u, 64u, 65u }) {
+        p = obs_page(OBS_LOG_BUFFER_ID, next - 10, a);
+        uint32_t want = a < 32 ? a : 32 + (a - 32) / 32 * 32;
+        CHECK(p.r == (int32_t)want, "alloc %u: r %d want %u", a, p.r, want);
+    }
+    p = obs_page(OBS_LOG_BUFFER_ID, next - 10, 4096, 100);  // the host's transfer length cuts it
+    CHECK(p.r == 96, "transfer length 100: r %d", p.r);
+    // An entry being written (seq 0 until it is filled) ends the page there.
+    uint32_t s5 = next - 5;
+    log_ring[s5 % OBS_LOG_ENTRIES].seq = 0;
+    p = obs_page(OBS_LOG_BUFFER_ID, next - 10);
+    log_ring[s5 % OBS_LOG_ENTRIES].seq = s5;
+    CHECK(p.n == 5 && !(p.flags & 1), "a torn entry: n %u flags %02X", p.n, p.flags);
+    // ...and one a writer starts on while it is being copied.
+    static uint32_t torn_at;
+    torn_at = next - 3;
+    obs_test_mid_copy = [](uint32_t s) { if (s == torn_at) log_ring[s % OBS_LOG_ENTRIES].seq = 0; };
+    p = obs_page(OBS_LOG_BUFFER_ID, next - 10);
+    obs_test_mid_copy = nullptr;
+    log_ring[torn_at % OBS_LOG_ENTRIES].seq = torn_at;
+    CHECK(p.n == 7 && !(p.flags & 1), "torn while copied: n %u flags %02X", p.n, p.flags);
+    CHECK(q.held(), "READ BUFFER of the log touched the drive");
+    // Paging the whole ring with a small page loses nothing.
+    bool gap;
+    auto all = obs_log_all(next - OBS_LOG_ENTRIES, &gap, 32 + 3 * 32);
+    CHECK(!gap && all.size() == OBS_LOG_ENTRIES && all.front().seq == next - OBS_LOG_ENTRIES, "paged %zu", all.size());
+    // Across the 24-bit wrap of the cursor.
+    obs_test_reset(0x00FFFFF0u, 0x00FFFFFAu);
+    for (int i = 0; i < 40; i++) host_read10(100, 1);
+    next = log_next;
+    CHECK(next > 0x01000010u, "next %X", next);
+    p = obs_page(OBS_LOG_BUFFER_ID, 0xFFFFF8u);
+    CHECK(p.first == 0x00FFFFF8u && !(p.flags & 1), "cursor FFFFF8h: first %X", p.first);
+    p = obs_page(OBS_LOG_BUFFER_ID, 0x000005u);
+    CHECK(p.first == 0x01000005u, "cursor 5 after the wrap: first %X", p.first);
+    auto wrapped = obs_log_all(0x00FFFFF0u, &gap);
+    CHECK(!gap && wrapped.size() == next - 0x00FFFFF0u, "across the wrap: %zu of %u", wrapped.size(), next - 0x00FFFFF0u);
+    auto hs = obs_hash_all(&gap);
+    CHECK(!gap && hs.size() == 40 && hs.front().seq == 0x00FFFFFAu, "hashes across the wrap: %zu", hs.size());
+}
+
+// Who wrote an entry: inside a host command or not, core 0 or core 1; and the
+// markers never become the "current" command.
+static void test_obs_flags() {
+    setup("F1: host and core flags, markers", LBA);
+    obs_test_reset(0, 0);
+    host_read10(100, 1);
+    uint32_t in_host = obs_current_cmd();
+    is_mounted = false;
+    ide_reset_drive();
+    uint32_t outside = obs_current_cmd();
+    mock_core_num = 1;
+    obs_marker(OBS_EV_MOUNT, OBS_MNT_MENU, OBS_MODE_LBA, 17, 10, 980, 0xA0);
+    mock_core_num = 0;
+    CHECK(obs_current_cmd() == outside, "a marker became the current command");
+    obs_log_entry_t a = log_ring[in_host % OBS_LOG_ENTRIES], b = log_ring[outside % OBS_LOG_ENTRIES];
+    obs_log_entry_t mk = log_ring[(log_next - 1) % OBS_LOG_ENTRIES];
+    CHECK((a.bits & OBS_B_HOST) && !(a.bits & OBS_B_CORE1), "the read's bits %04X", a.bits);
+    CHECK(!(b.bits & OBS_B_HOST) && b.value == 0x10, "RECALIBRATE outside a host command: bits %04X", b.bits);
+    CHECK(mk.kind == OBS_EV_MOUNT && (mk.bits & OBS_B_CORE1) && mk.tf[1] == 17 && mk.tf[2] == 10 &&
+          mk.tf[3] == (980 & 0xFF) && mk.tf[4] == (980 >> 8) && mk.tf[5] == 0xA0, "marker bits %04X", mk.bits);
+    is_mounted = true;
+}
+
+// What the hashes cost (the owner: throughput must not drop measurably in
+// the simulator). Each hash is given a CPU cost on the mock clock: the
+// modelled time the RP2350 spends starting the DMA and collecting the
+// digest, 2 us (about 300 cycles at 150 MHz, an upper estimate; not measured
+// on hardware). The hashes run in the read loop's 10 us waits for a busy
+// drive (ide.c, read_bsy_wait), so the only time they add is the last
+// block's, hashed at the end of each ATA command: at most one hash per
+// command. Held to that exactly, with the drive slow (200 us a sector) and
+// with it ready 12 us after each block (faster than the bus: 256 words at
+// 800 ns take 205 us), and printed.
+static void test_obs_cost() {
+    const uint64_t modelled_ns = 2000;
+    for (int fast = 0; fast < 2; fast++) {
+        uint64_t took[2] = { 0, 0 };
+        for (int on = 0; on < 2; on++) {
+            setup(fast ? "F1: hash cost, drive ready 12 us after a block" : "F1: hash cost, drive 200 us a sector", LBA);
+            obs_test_reset(0, 0);
+            sim_reg_cost_ns = 1000; sim_word_ns = 800;
+            if (fast) sim.t_sector = 12000;
+            obs_test_hash_cpu_ns = on ? modelled_ns : 0;
+            uint64_t t0 = mock_now_ns;
+            HostRead h = host_read10(0, 128);
+            took[on] = mock_now_ns - t0;
+            CHECK(h.ok && matches_medium(h, 0), "the read");
+        }
+        obs_test_hash_cpu_ns = 0;
+        const uint64_t commands = 128 / 8;
+        double drop = 100.0 * ((double)took[1] - (double)took[0]) / (double)took[0];
+        printf("hash cost, %s: READ(10) of 128 sectors %.3f ms without, %.3f ms with a %llu ns hash: %.3f%% slower\n",
+               fast ? "drive ready 12 us" : "drive 200 us     ", took[0] / 1e6, took[1] / 1e6,
+               (unsigned long long)modelled_ns, drop);
+        CHECK(took[1] >= took[0] && took[1] - took[0] <= commands * modelled_ns,
+              "%llu ns more, over one hash per command (%llu ns)", (unsigned long long)(took[1] - took[0]),
+              (unsigned long long)(commands * modelled_ns));
+    }
+}
+
 int main() {
     // The budget is a design number, not only what the helpers measure
     // against: 10 s under the 30 s that Linux and the project's tools give a
@@ -3974,6 +4473,18 @@ int main() {
     test_salvage_capture(CHS);
     test_salvage_lba48();
     test_read_buffer_cdb();
+    // F1 stage 1: the bus event log and the per-sector hashes
+    test_obs_reference_sha();
+    test_obs_log_matches_drive(LBA);
+    test_obs_log_matches_drive(CHS);
+    test_obs_counts(LBA);
+    test_obs_counts(CHS);
+    test_obs_hashes(LBA);
+    test_obs_hashes(CHS);
+    test_obs_selftest();
+    test_obs_cursor();
+    test_obs_flags();
+    test_obs_cost();
     // 0.6f3p9: READ LONG
     test_read_long_ok(LBA);
     test_read_long_ok(CHS);

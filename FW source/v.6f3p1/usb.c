@@ -4,6 +4,7 @@
 #include "tusb.h"
 #include "class/msc/msc_device.h"
 #include "ide.h"
+#include "obs.h"
 #include "config.h"
 #include <string.h>
 #if ATABOY_SAT
@@ -437,6 +438,13 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
 //           the self-reset counts are in Debug E only)
 //   32..543 the 512 bytes as the drive offered them
 // It does not touch the drive, and works mounted or not.
+//
+// Since F1 stage 1 (owner decision, 2026-09-26) two more buffer IDs, never
+// used before, in the same mode 02h: 4Ch the bus event log and 48h the
+// per-sector hashes (obs.h, obs.c). BUFFER OFFSET is their cursor: the low
+// 24 bits of the first sequence number wanted, 0 for the oldest held. The
+// answer is a 32-byte header and whole entries, cut to the allocation
+// length and to the MSC buffer. The salvage answer above is unchanged.
 #define SALV_BUFFER_ID  0x5A
 #define SALV_LEN        (32 + IDE_SALVAGE_BYTES)
 _Static_assert(SALV_LEN <= CFG_TUD_MSC_EP_BUFSIZE, "the salvage answer must fit the MSC buffer");
@@ -446,6 +454,14 @@ static void put_le32(uint8_t *p, uint32_t v) {
 }
 
 static int32_t read_buffer(uint8_t lun, uint8_t const cdb[16], uint8_t *buf, uint16_t bufsize) {
+    if ((cdb[1] & 0x1F) == 0x02 && (cdb[2] == OBS_LOG_BUFFER_ID || cdb[2] == OBS_HASH_BUFFER_ID)) {
+        uint32_t cursor = ((uint32_t)cdb[3] << 16) | ((uint32_t)cdb[4] << 8) | cdb[5];
+        uint32_t cap = ((uint32_t)cdb[6] << 16) | ((uint32_t)cdb[7] << 8) | cdb[8];
+        if (cap > bufsize) cap = bufsize;               // never past the host's transfer length
+        if (cap > CFG_TUD_MSC_EP_BUFSIZE) cap = CFG_TUD_MSC_EP_BUFSIZE;
+        return (int32_t)(cdb[2] == OBS_LOG_BUFFER_ID ? obs_log_page(cursor, buf, cap)
+                                                     : obs_hash_page(cursor, buf, cap));
+    }
     if ((cdb[1] & 0x1F) != 0x02 || cdb[2] != SALV_BUFFER_ID || cdb[3] || cdb[4] || cdb[5]) {
         tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
         return -1;
@@ -624,7 +640,7 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
     case 0x35: return 0;  // SYNCHRONIZE CACHE
     case 0x1E: return 0;  // PREVENT ALLOW MEDIUM REMOVAL
 
-    case 0x3C:  // READ BUFFER(10): the salvage capture only; no drive access
+    case 0x3C:  // READ BUFFER(10): salvage, log, hashes; no drive access
 #if ATABOY_SAT
         sat_sense_forget();
 #endif

@@ -8,6 +8,7 @@
 #include "tusb.h"
 #include "class/cdc/cdc_device.h"
 #include "ide.h"
+#include "obs.h"
 #include "config.h"
 #include "fault.h"
 
@@ -96,6 +97,7 @@ bool core1_stack_intact(void) {
 int main(void) {
     // No pico_stdio — all console I/O goes through TinyUSB CDC via queues
     config_load();
+    obs_init();             // F1 stage 1: before the first bus event
     ide_hw_init();
 
     // Init CDC queues

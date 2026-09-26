@@ -28,6 +28,7 @@ static inline bool queue_try_remove(queue_t *, void *out) {
 static inline absolute_time_t make_timeout_time_us(uint64_t us) { return get_absolute_time() + us; }
 static inline bool time_reached(absolute_time_t t) { return get_absolute_time() >= t; }
 
+#include "obs.c"
 #include "menus.c"
 
 uint64_t mock_now_ns = 0;

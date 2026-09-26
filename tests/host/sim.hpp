@@ -58,6 +58,7 @@
 #include <stdint.h>
 #include <map>
 #include <vector>
+#include <array>
 #include <cstdio>
 
 enum BadMode {
@@ -153,6 +154,9 @@ struct SimDrive {
     int      long_bad_count = 0;            // READ LONG sent with a sector count other than 1
     uint32_t long_lba = 0xFFFFFFFFu;        // the sector the last READ LONG named
     std::vector<uint8_t> cmd_log;           // every command byte, in order
+    // F1 stage 1: registers 1 to 6 as each command found them, then the
+    // previous values of 2 to 5 (HOB), in the order of cmd_log.
+    std::vector<std::array<uint8_t, 10>> cmd_tf_log;
     int      reg_writes = 0;                // any task file or Device Control write
     uint8_t idle_status() const { return (drdy_needs_idp && !geo_valid) ? 0x10 : 0x50; }
 
@@ -505,6 +509,7 @@ struct SimDrive {
     void command(uint8_t c, uint64_t now) {
         clobber_at = 0;                        // round 3: only idle registers are clobbered
         commands++; cmd_count[c]++; cmd_log.push_back(c);
+        cmd_tf_log.push_back({ reg[1], reg[2], reg[3], reg[4], reg[5], reg[6], hob[2], hob[3], hob[4], hob[5] });
         if (busy_probe && !busy_probe()) cmds_while_not_busy++;
         if (status & 0x88) violations++;       // command written while BSY or DRQ
         status_at_cmd = status; cmd_at = now;

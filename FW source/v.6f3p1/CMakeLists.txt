@@ -49,7 +49,8 @@ add_executable(ATAboy
         usb.c
         usb_descriptors.c
         config.c
-        fault.c)
+        fault.c
+        obs.c)
 
 pico_set_program_name(ATAboy "ATAboy")
 
@@ -70,6 +71,7 @@ target_link_libraries(ATAboy
         hardware_sync
         hardware_pio
         hardware_dma
+        hardware_sha256
         hardware_clocks
         tinyusb_device
         tinyusb_board

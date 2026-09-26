@@ -1,6 +1,7 @@
 #include "ide.h"
 #include "ide_pio.h"
 #include "config.h"
+#include "obs.h"
 #include "hardware/gpio.h"
 #include "hardware/structs/sio.h"
 #if !ATABOY_HOST_TEST
@@ -290,6 +291,10 @@ static void xcvr_write(void) {
 
 void ide_write_reg(uint8_t reg, uint8_t val) {
     if (reg == 7) sentinel_armed = false;   // a command: the registers are the drive's now
+    // F1 stage 1: logged before it goes out (obs.h). Every command register
+    // write in the firmware comes through here.
+    if (reg == 7) (void)obs_cmd(val);
+    else obs_tf_write(reg, val);
     set_address(reg);
     xcvr_write();
     sio_hw->gpio_clr = (1 << IDE_CS0);
@@ -311,7 +316,10 @@ uint8_t ide_read_reg(uint8_t reg) {
 
     sio_hw->gpio_set = (1 << IDE_CS0);
     bus_idle();
-    return (uint8_t)(val & 0xFF);
+    uint8_t v = (uint8_t)(val & 0xFF);
+    if (reg == 7) obs_status(v);            // F1 stage 1: the log keeps the last
+    else if (reg == 1) obs_error(v);        // Status and Error of a command
+    return v;
 }
 
 uint8_t ide_read_alt_status(void) {
@@ -328,6 +336,7 @@ uint8_t ide_read_alt_status(void) {
 }
 
 void ide_write_control(uint8_t val) {
+    obs_ctrl(val);                          // F1 stage 1: every Device Control write
     set_address(6);
     xcvr_write();
     sio_hw->gpio_clr = (1 << IDE_CS1);
@@ -499,8 +508,9 @@ void ide_host_cmd_begin(void) {
 void ide_host_cmd_enter(void) {
     host.on = true;
     ide_iordy_follow_config();
+    obs_set_host(true);
 }
-void ide_host_cmd_leave(void) { host.on = false; }
+void ide_host_cmd_leave(void) { host.on = false; obs_set_host(false); }
 
 // What is left of the host command's time; no limit outside one.
 static uint32_t host_left_ms(void) {
@@ -638,6 +648,7 @@ void ide_reset_drive(void) {
     // comes back to the configured setting once the drive shows ready.
     iordy_hold();
 
+    obs_reset(OBS_RST_RESET_DRIVE);
     gpio_put(IDE_RESET, 0);
     sleep_ms(50);
     gpio_put(IDE_RESET, 1);
@@ -649,8 +660,9 @@ void ide_reset_drive(void) {
     // Recalibrate — seek heads to track 0 (required by some pre-ATA drives)
     ide_write_reg(6, dev_base);
     ide_write_reg(7, 0x10);
+    uint32_t lseq = obs_current_cmd();
     wait_after_command();
-    ide_wait_until_ready(10000);
+    obs_finish(lseq, 0, 0, 0, ide_wait_until_ready(10000));
 }
 
 uint8_t ide_probe_devices(void) {
@@ -662,6 +674,7 @@ uint8_t ide_probe_devices(void) {
     iordy_hold();
 
     // Single hardware reset — both devices see it
+    obs_reset(OBS_RST_PROBE);
     gpio_put(IDE_RESET, 0);
     sleep_ms(50);
     gpio_put(IDE_RESET, 1);
@@ -697,8 +710,9 @@ uint8_t ide_probe_devices(void) {
         // Recalibrate (required by some pre-ATA drives)
         ide_write_reg(6, addrs[i]);
         ide_write_reg(7, 0x10);
+        uint32_t lseq = obs_current_cmd();
         wait_after_command();
-        ide_wait_until_ready(10000);
+        obs_finish(lseq, 0, 0, 0, ide_wait_until_ready(10000));
 
         iordy_release();          // BSY has cleared: the drive is past its POST
         return addrs[i];
@@ -763,6 +777,7 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     (void)ide_read_reg(7);                  // releases INTRQ before the command
     sat_watch_arm(&w);
     ide_write_reg(7, 0x91);
+    uint32_t lseq = obs_current_cmd();
     wait_after_command();
     // Only a clean completion counts. With ABRT the drive keeps its own
     // default translation, which is not the geometry we address it with.
@@ -770,6 +785,7 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     uint8_t st = 0;
     bool ended = mchs_wait_end(&w, recovery_ms(IDE_GEOMETRY_TIMEOUT_MS), &st);
     bool ok = ended && (st & 0x40) && !(st & 0x01);
+    obs_finish(lseq, 0, 0, 0, ok);
     chs_geometry_lost = !ok;
     if (ok) sentinel_arm();
     return ok;
@@ -782,7 +798,16 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
 // IDENTIFY, once. 1: the 256 words are in buf. 0: the drive was not ready,
 // or ended the command with ERR. -1: IDENTIFY was sent and gave no data in
 // time; the drive may still be working on it.
+static struct { uint32_t seq; bool taken; } id_obs;    // F1 stage 1
+static int identify_send(uint16_t *buf);
 static int identify_run(uint16_t *buf) {
+    id_obs.seq = 0;
+    id_obs.taken = false;
+    int r = identify_send(buf);
+    obs_finish(id_obs.seq, r > 0 ? 1 : 0, id_obs.taken ? 1 : 0, 0, r > 0);
+    return r;
+}
+static int identify_send(uint16_t *buf) {
     if (mchs_no_identify) { refused.identify_run++; return 0; }    // re-review of 0.6f3p10, N-3: every IDENTIFY comes through here
     if (!ide_wait_until_ready(work_ms(1000))) return 0;
     if (ide_read_reg(7) & 0x08) ide_drain_sector();   // drain stranded DRQ before command
@@ -795,6 +820,7 @@ static int identify_run(uint16_t *buf) {
     sat_watch_t w;
     sat_watch_arm(&w);
     ide_write_reg(7, 0xEC);
+    id_obs.seq = obs_current_cmd();
     busy_wait_us_32(1);             // give drive time to assert BSY
 
     // Poll for DRQ. Status is read through sat_poll(), which samples INTRQ
@@ -825,6 +851,7 @@ ready:
 
     sio_hw->gpio_set = (1 << IDE_CS0);
     bus_idle();
+    id_obs.taken = true;
     // Holistic review L-3: the end of the command, as for a read (review C,
     // C-2): BSY and DRQ clear, no ERR or DF, a status that is not floating,
     // within a second; otherwise these words are not taken.
@@ -961,7 +988,7 @@ void ide_salvage_get(ide_salvage_t *out) { *out = salvage; }
 // words it offers, exactly as the drain did, but into the salvage buffer
 // instead of throwing them away. Never into the caller's buffer.
 static void salvage_sector(uint8_t cmd, uint8_t st, uint8_t err, uint32_t lba) {
-    uint16_t words[256];
+    uint16_t __attribute__((aligned(4))) words[256];
     set_address(0);
     xcvr_read();
     sio_hw->gpio_clr = (1 << IDE_CS0);
@@ -979,6 +1006,10 @@ static void salvage_sector(uint8_t cmd, uint8_t st, uint8_t err, uint32_t lba) {
     salvage.ms      = ms_now();
     salvage.seq++;
     salvage.valid   = true;
+    // F1 stage 1: hashed as it came off the bus. `words` holds the same bytes
+    // in memory order; obs_hash_flush before it goes out of scope.
+    obs_hash_sector(obs_current_cmd(), lba, 0, OBS_H_SALVAGE, (const uint8_t *)words);
+    obs_hash_flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,6 +1044,7 @@ static void record_failure(uint8_t kind, uint8_t cmd, uint8_t st,
     last_fail.done    = done;
     last_fail.count   = count;
     host.recorded = true;
+    obs_fail(kind, st);             // F1 stage 1: the current command, if still open
 }
 
 #define IDE_SRST_TIMEOUT_MS 31000   // ATA allows a device up to 31 s after SRST
@@ -1062,6 +1094,7 @@ static struct {
     bool        selected;   // our device selected again since the reset
     uint32_t    since;
     sat_watch_t recal;      // REC_RECAL: has the RECALIBRATE visibly started?
+    uint32_t    recal_seq;  // F1 stage 1: its log entry
 } rec;
 
 static uint32_t stage_left_ms(uint32_t window_ms) {
@@ -1142,6 +1175,7 @@ static int after_reset_wait(uint32_t budget_ms) {
 // depends on another having run before it (review of 0.6f3p8, M-1).
 static void hw_reset_start(void) {
     iordy_hold();
+    obs_reset(OBS_RST_RECOVERY);
     gpio_put(IDE_RESET, 0);
     busy_wait_us_32(IDE_HW_RESET_LOW_US);
     gpio_put(IDE_RESET, 1);
@@ -1172,6 +1206,7 @@ static void recal_start(void) {
     ide_write_reg(7, 0x10);
     wait_after_command();
     rec.stage = REC_RECAL;
+    rec.recal_seq = obs_current_cmd();
     rec.since = ms_now();
 }
 
@@ -1217,6 +1252,7 @@ static int recovery_run(void) {
     }
     if (rec.stage == REC_RECAL) {
         int r = recal_wait(recovery_ms(IDE_RECAL_TIMEOUT_MS));
+        if (r != 0) obs_finish(rec.recal_seq, 0, 0, 0, r > 0);    // F1 stage 1
         if (r == 0) return 0;
         if (r < 0) return recovery_end(false);
     }
@@ -1420,6 +1456,7 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
     long_words.valid = false;       // no word 22 either: no READ LONG
     recovery_forget();              // RESET- supersedes any recovery (none is pending: menus.c)
     iordy_hold();
+    obs_reset(OBS_RST_MANUAL_CHS);
     gpio_put(IDE_RESET, 0);
     sleep_ms(IDE_HW_RESET_LOW_US / 1000);
     gpio_put(IDE_RESET, 1);
@@ -1457,9 +1494,11 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
     wait_after_command();
     if (!mchs_wait_end(&w, IDE_RECAL_TIMEOUT_MS, &st)) {
         record_failure(IDE_FAIL_MANUAL_CHS, 0x10, st, 0, 0, 0);
+        obs_finish(obs_current_cmd(), 0, 0, 0, false);     // F1 stage 1: the RECALIBRATE
         *status = st;
         return IDE_MCHS_RECAL;
     }
+    uint32_t recal_seq = obs_current_cmd();
 
     if (native) {
         // No 0x91: the drive keeps the translation it came out of RESET-
@@ -1480,8 +1519,10 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
             // of its own so Debug E says what happened whatever the status
             // (review of 0.6f3p10, L-2: BSY can come back in this second).
             record_failure(IDE_FAIL_MCHS_NOT_READY, 0x10, st, 0, 0, 0);
+            obs_finish(recal_seq, 0, 0, 0, false);
             return IDE_MCHS_NOT_READY;
         }
+        obs_finish(recal_seq, 0, 0, 0, true);
         chs_geometry_lost = false;  // the power-up default is the geometry in use
         native_geo.on = true;
         native_declared = true;
@@ -1493,16 +1534,19 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
         return IDE_MCHS_OK;
     }
 
+    obs_finish(recal_seq, 0, 0, 0, true);
     ide_write_reg(6, dev_base | (uint8_t)(heads - 1));   // 1 to 16, checked above
     ide_write_reg(2, spt);
     sat_watch_arm(&w);
     idp_written = true;
     ide_write_reg(7, 0x91);
     wait_after_command();
+    uint32_t idp_seq = obs_current_cmd();
     bool ended = mchs_wait_end(&w, IDE_MCHS_IDP_MS, &st);
     bool ok = ended && (st & 0x40) && !(st & 0x01);
     chs_geometry_lost = !ok;
     *status = st;
+    obs_finish(idp_seq, 0, 0, 0, ok);
     if (!ok) {
         record_failure(IDE_FAIL_MANUAL_CHS, 0x91, st, 0, 0, 0);
         return IDE_MCHS_REFUSED;
@@ -1616,6 +1660,16 @@ uint32_t ide_unwitnessed_blocks(void) { return unwitnessed_blocks; }
 #define IDE_READ_SETTLE_US 1000
 static uint64_t us_now(void);
 
+// F1 stage 1: a BSY wait of the read loop, 10 us as it always was. A block
+// hash waiting to be started (obs.c) is started in it, so a drive that is
+// busy between blocks spends no more time on a command for the hashes.
+static void read_bsy_wait(void) {
+    uint64_t t0 = us_now();
+    obs_hash_step();
+    uint64_t used = us_now() - t0;
+    busy_wait_us_32(used < 10 ? (uint32_t)(10 - used) : 0);
+}
+
 // The status now, and whether it stays floating for IDE_FLOAT_MS.
 static bool floating_persists(uint8_t *st) {
     uint32_t t0 = ms_now();
@@ -1671,8 +1725,23 @@ int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
 // earlier command is still pending (recovery_gate) or when the command would
 // not have a fair window with the recovery reserve after it (time_to_send;
 // checked before and after waiting for the drive to be ready).
+// F1 stage 1: what the log records for this command (read_partial_run).
+static struct { uint32_t seq, taken, unwit; } rd_obs;
+static int32_t read_partial_run(uint32_t lba, uint32_t count, uint8_t *buf, uint32_t *done);
+
 int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
                                  uint32_t *done) {
+    uint32_t d = 0;
+    rd_obs.seq = 0; rd_obs.taken = 0; rd_obs.unwit = 0;
+    int32_t r = read_partial_run(lba, count, buf, &d);
+    if (done) *done = d;
+    obs_hash_flush();                   // before the caller's buffer is handed on
+    obs_finish(rd_obs.seq, r >= 0 ? count : d, rd_obs.taken, rd_obs.unwit, r >= 0);
+    return r;
+}
+
+static int32_t read_partial_run(uint32_t lba, uint32_t count, uint8_t *buf,
+                                uint32_t *done) {
     uint32_t s = 0;
     uint8_t st = 0;
     uint8_t cmd = 0;
@@ -1741,6 +1810,7 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
     cmd = use_lba48 ? 0x24 : 0x20;
     ide_write_reg(7, cmd);                                 // READ SECTORS EXT / READ SECTORS
     wait_after_command();
+    rd_obs.seq = obs_current_cmd();
     uint32_t start = ms_now();                             // the whole command: IDE_CMD_TIMEOUT_MS,
     uint32_t limit = work_ms(IDE_CMD_TIMEOUT_MS);          // or what the host command has left
     uint32_t sector_start = start;                         // when the drive began on sector s
@@ -1759,6 +1829,7 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
     uint32_t first_unwit = UINT32_MAX;
 #define CLAMP_DONE(x) ((uint32_t)(x) < first_unwit ? (uint32_t)(x) : first_unwit)
     uint32_t stalls = ide_pio_stalls();                    // review C, C-7: IORDY held too long
+    uint32_t unwit_block = UINT32_MAX;                     // F1 stage 1: the block taken with no drop seen
 
     for (s = 0; s < count; s++) {
         // Poll for DRQ — INTRQ provides early-exit if enabled, otherwise pure polling
@@ -1776,7 +1847,7 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
             vouched = true;
             // While BSY is set the other status bits are not valid (ATA), so a
             // leftover ERR must not end a command the drive is still working on.
-            if (st & 0x80) { busy_wait_us_32(10); continue; }
+            if (st & 0x80) { read_bsy_wait(); continue; }
             // Holistic review L-8: DF (device fault) with DRQ is not a block
             // to take; it ends the read like ERR.
             if (st & 0x21) goto read_err;
@@ -1796,6 +1867,8 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
         if (ide_pio_stalls() != stalls) goto read_stall;
         sector_start = ms_now();
         vouched = false;
+        rd_obs.taken = s + 1;
+        bool h_unwit = unwit_block == s;
         // Between blocks (holistic review H-1, then round 2, R-1). A drive
         // whose DRQ lingers after a block used to have that same status read
         // as the next block's DRQ: FFFFh words taken as a sector and handed
@@ -1829,8 +1902,13 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
             if (!seen) {
                 unwitnessed_blocks++;
                 if (first_unwit == UINT32_MAX) first_unwit = s + 1;
+                rd_obs.unwit++;
+                unwit_block = s + 1;
             }
         }
+        // F1 stage 1: queued after the look for the drop, so its timing is as
+        // before; hashed in a later BSY wait or at the end (obs_hash_step).
+        obs_hash_sector(rd_obs.seq, lba + s, s, h_unwit ? OBS_H_UNWITNESSED : 0, buf + s * 512);
     }
 
     // Review C, C-2: the end of the command. Its final status was never
@@ -2006,6 +2084,8 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
 
     uint8_t cmd = use_lba48 ? 0x34 : 0x30;
     ide_write_reg(7, cmd);                                 // WRITE SECTORS EXT / WRITE SECTORS
+    uint32_t w_seq = obs_current_cmd();                    // F1 stage 1
+    uint32_t w_unwit = 0;
     wait_after_command();
     uint32_t start = ms_now();                             // the whole command: IDE_CMD_TIMEOUT_MS,
     uint32_t limit = work_ms(IDE_CMD_TIMEOUT_MS);          // or what the host command has left
@@ -2056,6 +2136,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
             if (!seen) {
                 unwitnessed_blocks++;
                 if (w_first_unwit == UINT32_MAX) w_first_unwit = s + 1;
+                w_unwit++;
             }
         }
     }
@@ -2081,6 +2162,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
                 write_ok = false; fail_kind = IDE_FAIL_BAD_END; break;
             }
             sentinel_arm();                         // review C round 2, C2-1
+            obs_finish(w_seq, count, count, w_unwit, true);
             return (int32_t)(count * 512);
         }
     }
@@ -2092,8 +2174,10 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     // Round 3 (R3-1): sent means sent to the sector the firmware meant, so
     // not past the first block taken with no drop seen (after a stale DRQ,
     // a block's data may have gone to the sector before it).
+    uint32_t w_taken = s;
     if (s > w_first_unwit) s = w_first_unwit;
     record_failure(fail_kind, cmd, st, lba + s, s, count);
+    obs_finish(w_seq, s, w_taken, w_unwit, false);
     soft_reset_restore();
     return -1;
 }
@@ -2156,7 +2240,17 @@ static uint32_t read_long_ecc(uint8_t *out, uint32_t n, uint8_t *st) {
     return n;
 }
 
+static struct { uint32_t seq; bool taken; } rl_obs;    // F1 stage 1
+static int read_long_run(uint32_t lba, uint8_t *buf);
 int ide_read_long(uint32_t lba, uint8_t *buf) {
+    rl_obs.seq = 0;
+    rl_obs.taken = false;
+    int r = read_long_run(lba, buf);
+    obs_hash_flush();
+    obs_finish(rl_obs.seq, r == IDE_LONG_OK ? 1 : 0, rl_obs.taken ? 1 : 0, 0, r == IDE_LONG_OK);
+    return r;
+}
+static int read_long_run(uint32_t lba, uint8_t *buf) {
     uint8_t st = 0;
     const uint8_t cmd = 0x23;                               // READ LONG WITHOUT RETRIES
     const uint32_t ecc = IDE_LONG_ECC_BYTES;
@@ -2199,6 +2293,7 @@ int ide_read_long(uint32_t lba, uint8_t *buf) {
         ide_write_reg(6, dev_base | head);                 // head < heads <= 16 (chs_geometry_ok)
     }
     ide_write_reg(7, cmd);
+    rl_obs.seq = obs_current_cmd();
     wait_after_command();
     uint32_t start = ms_now();                              // as a read: the whole command,
     uint32_t limit = work_ms(IDE_CMD_TIMEOUT_MS);           // or what the host command has left
@@ -2227,6 +2322,8 @@ int ide_read_long(uint32_t lba, uint8_t *buf) {
             buf[2 * i]     = (uint8_t)(words[i] & 0xFF);
             buf[2 * i + 1] = (uint8_t)(words[i] >> 8);
         }
+        rl_obs.taken = true;
+        obs_hash_sector(rl_obs.seq, lba, 0, OBS_H_READ_LONG, buf);   // F1 stage 1
     }
     if (read_long_ecc(buf + 512, ecc, &st) < ecc) goto long_bad_end;   // fewer than 4
     if (ide_pio_stalls() != stalls) goto long_bad_end;      // review C, C-7: IORDY held too long
@@ -2344,6 +2441,7 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba) {
         ide_write_reg(6, dev_base);                            // head 0, CHS
     }
     ide_write_reg(7, use_lba48 ? 0x24 : 0x20);                // READ SECTORS EXT / READ SECTORS
+    uint32_t lseq = obs_current_cmd();                        // F1 stage 1
     wait_after_command();
 
     // Wait for BSY to clear
@@ -2355,9 +2453,12 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba) {
     }
 
     // Drain DRQ data if present
-    if (ide_read_reg(7) & 0x08) ide_drain_sector();
+    bool drained = false;
+    if (ide_read_reg(7) & 0x08) { ide_drain_sector(); drained = true; }
 
-    return ide_read_reg(7);
+    uint8_t end = ide_read_reg(7);
+    obs_finish(lseq, 0, drained ? 1 : 0, 0, !(end & 0x89));
+    return end;
 }
 
 #if ATABOY_SAT
@@ -2478,7 +2579,17 @@ static void sat_read_outputs(const sat_taskfile_t *tf, uint8_t st, ide_sat_regs_
     }
 }
 
+static struct { uint32_t seq, taken; } sat_obs;       // F1 stage 1
+static int sat_pio_in_run(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs);
 int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs) {
+    sat_obs.seq = 0;
+    sat_obs.taken = 0;
+    int r = sat_pio_in_run(tf, buf, regs);
+    obs_hash_flush();
+    obs_finish(sat_obs.seq, r == IDE_SAT_OK ? tf->sectors : 0, sat_obs.taken, 0, r == IDE_SAT_OK);
+    return r;
+}
+static int sat_pio_in_run(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs) {
     memset(regs, 0, sizeof(*regs));
     if (tf->protocol != SAT_PROTO_PIO_IN) return IDE_SAT_NOT_ISSUED;
     if (tf->sectors == 0 || tf->sectors > SAT_MAX_SECTORS) return IDE_SAT_NOT_ISSUED;
@@ -2487,6 +2598,7 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
     sat_watch_t w;
     sat_watch_arm(&w);
     sat_write_taskfile(tf);
+    sat_obs.seq = obs_current_cmd();
 
     uint16_t *wbuf = (uint16_t *)buf;
     uint32_t start = to_ms_since_boot(get_absolute_time());
@@ -2521,6 +2633,8 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
 
         sio_hw->gpio_set = (1 << IDE_CS0);
         bus_idle();
+        sat_obs.taken = s + 1;
+        obs_hash_sector(sat_obs.seq, sat_tf_lba(tf) + s, s, OBS_H_SAT, buf + s * 512);
     }
 
     // All blocks read. The drive must now end the command cleanly: not busy,
@@ -2548,7 +2662,14 @@ int ide_sat_pio_in(const sat_taskfile_t *tf, uint8_t *buf, ide_sat_regs_t *regs)
 // that answers a non-data command with DRQ is confused; its data is never
 // read (the data register is not touched on this path at all), and a soft
 // reset ends the command so nothing is left stranded for the next one.
+static int sat_nondata_run(const sat_taskfile_t *tf, ide_sat_regs_t *regs);
 int ide_sat_nondata(const sat_taskfile_t *tf, ide_sat_regs_t *regs) {
+    sat_obs.seq = 0;
+    int r = sat_nondata_run(tf, regs);
+    obs_finish(sat_obs.seq, 0, 0, 0, r == IDE_SAT_OK);
+    return r;
+}
+static int sat_nondata_run(const sat_taskfile_t *tf, ide_sat_regs_t *regs) {
     memset(regs, 0, sizeof(*regs));
     if (tf->protocol != SAT_PROTO_NON_DATA || tf->sectors != 0) return IDE_SAT_NOT_ISSUED;
     if (!sat_can_issue(tf)) return IDE_SAT_NOT_ISSUED;
@@ -2556,6 +2677,7 @@ int ide_sat_nondata(const sat_taskfile_t *tf, ide_sat_regs_t *regs) {
     sat_watch_t w;
     sat_watch_arm(&w);
     sat_write_taskfile(tf);
+    sat_obs.seq = obs_current_cmd();
 
     uint32_t start = to_ms_since_boot(get_absolute_time());
     uint32_t limit = work_ms(SAT_CMD_TIMEOUT_MS);

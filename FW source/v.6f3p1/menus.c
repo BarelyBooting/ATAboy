@@ -11,6 +11,7 @@
 #include "pico/stdlib.h"
 #include "pico/bootrom.h"
 #include "ide.h"
+#include "obs.h"
 #include "config.h"
 #include "fwupdate.h"
 #include "manualchs.h"
@@ -993,6 +994,16 @@ static void sync_to_config(void) {
 // It resets the drive and sends IDENTIFY whenever a geometry is saved, so a
 // Ctrl+G geometry is not saved with Auto Mount on (save_setup, review of
 // 0.6f3p8 L-1).
+// F1 stage 1: mount and unmount markers in the bus event log (obs.h), with
+// the geometry and how it was set up, so a host can tell which commands
+// belong to which mount. The log itself is never cleared (obs.c).
+static void log_mount(uint8_t kind, uint8_t value) {
+    uint8_t mode = config.use_lba_mode ? OBS_MODE_LBA
+                 : ide_manual_chs_native_active() ? OBS_MODE_MCHS_NATIVE
+                 : ide_manual_chs_active() ? OBS_MODE_MCHS_91 : OBS_MODE_CHS;
+    obs_marker(kind, value, mode, config.spt, config.heads, config.cyls, config.dev_base);
+}
+
 static void try_auto_mount(void) {
     if (!config.auto_mount) return;
 
@@ -1030,6 +1041,7 @@ static void try_auto_mount(void) {
     if (!config.use_lba_mode)
         ide_set_geometry(config.heads, config.spt);
 
+    log_mount(OBS_EV_MOUNT, OBS_MNT_AUTO);
     is_mounted = true;
     media_changed_waiting = true;
 }
@@ -1051,6 +1063,7 @@ static bool fwupdate_key(int k) {
 // detection must not let the SAT policy judge the new drive by the old one's
 // IDENTIFY (a donor's SMART support would then admit SMART on a specimen).
 static void menu_unmount(void) {
+    if (is_mounted) log_mount(OBS_EV_UNMOUNT, OBS_UNM_MENU);
     is_mounted = false;
     media_changed_waiting = true;
 #if ATABOY_SAT
@@ -1433,6 +1446,7 @@ static bool run_manual_chs(void) {
 static void detect_result_dismiss(void) {
     show_detect_result = false; hdd_status_text[0] = '\0'; hdd_model_raw[0] = '\0';
     if (ide_mchs_no_identify()) strcpy(hdd_model_raw, MCHS_MODEL_CLEARED);
+    if (is_mounted) log_mount(OBS_EV_UNMOUNT, OBS_UNM_DISMISS);
     cur_cyls = 0; cur_heads = 0; cur_spt = 0;
     total_lba_sectors = 0; use_lba_mode = false; is_mounted = false;
     media_changed_waiting = true;   // as every other unmount path does
@@ -1450,6 +1464,7 @@ static void mount_nothing_to_mount(void) {
         snprintf(hdd_status_text, sizeof(hdd_status_text), "\033[91;1mDetect drive and set geometry first!");
         hdd_model_raw[0] = '\0';
     }
+    if (is_mounted) log_mount(OBS_EV_UNMOUNT, OBS_UNM_NOTHING);
     cur_cyls = 0; cur_heads = 0; cur_spt = 0;
     total_lba_sectors = 0; use_lba_mode = false; is_mounted = false;
     show_detect_result = true; needs_full_redraw = true;
@@ -1640,7 +1655,7 @@ void core1_entry(void) {
                     current_screen = SCREEN_MAIN;
                 }
                 else if (confirm_type == 1) { (void)save_setup(); current_screen = confirm_return_screen; }
-                else if (confirm_type == 3) { is_mounted = true; media_changed_waiting = true; current_screen = SCREEN_MOUNTED; }
+                else if (confirm_type == 3) { log_mount(OBS_EV_MOUNT, OBS_MNT_MENU); is_mounted = true; media_changed_waiting = true; current_screen = SCREEN_MOUNTED; }
                 else if (confirm_type == 4) { menu_unmount(); current_screen = SCREEN_MAIN; }
                 else if (confirm_type == 5) {
                     // Reboot into the ROM bootloader, so new firmware can be

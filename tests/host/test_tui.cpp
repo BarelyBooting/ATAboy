@@ -15,6 +15,9 @@ static inline bool queue_try_remove(queue_t *, void *) { return false; }
 static inline absolute_time_t make_timeout_time_us(uint64_t us) { return get_absolute_time() + us; }
 static inline bool time_reached(absolute_time_t t) { return get_absolute_time() >= t; }
 
+#if __has_include("obs.c")          // F1 stage 1; tui_compare builds older trees too
+#include "obs.c"
+#endif
 #include "menus.c"
 
 uint64_t mock_now_ns = 0;

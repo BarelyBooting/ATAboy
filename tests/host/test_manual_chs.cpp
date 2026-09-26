@@ -18,6 +18,7 @@
 // Build and run: see run.sh. Exit status is the number of failed checks.
 #include "mock_pico.h"
 #include "sim.hpp"
+#include "obs.c"
 #include "ide.c"
 
 #include <stdio.h>
@@ -1467,6 +1468,17 @@ static void core1_done() {
     CHECK(has("Ctrl+G: Manual CHS") && has("Manual CHS (no IDENTIFY)") && has("1045 Cyl / 2 Hd / 40 SPT"), "screens");
     CHECK(saves == 0, "EEPROM written %d times", saves);
     CHECK(has(SAVE_REFUSED_MCHS), "F10 with Auto Mount on: no refusal shown (L-1)");
+    // F1 stage 1: Mount (Enter, Y) and Unmount (U, Y) wrote their markers.
+    int mounts = 0, unmounts = 0;
+    obs_log_entry_t mk{};
+    for (uint32_t s = 1; s < log_next; s++) {
+        obs_log_entry_t e = log_ring[s % OBS_LOG_ENTRIES];
+        if (e.kind == OBS_EV_MOUNT) { mounts++; mk = e; }
+        if (e.kind == OBS_EV_UNMOUNT && mounts == 1) unmounts++;
+    }
+    CHECK(mounts == 1 && unmounts == 1 && mk.value == OBS_MNT_MENU && mk.tf[0] == OBS_MODE_MCHS_91 &&
+          mk.tf[1] == S && mk.tf[2] == H && (mk.tf[3] | (mk.tf[4] << 8)) == C && !is_mounted,
+          "mounts %d unmounts %d, marker mode %u, mounted %d", mounts, unmounts, mk.tf[0], is_mounted);
     printf("%d checks, %d failed\n", checks, failures);
     exit(failures > 255 ? 255 : failures);
 }
@@ -1480,9 +1492,145 @@ static void test_core1() {
     for (char c : std::string("\x1b[21~")) { rx.push_back({ t, c }); t += 1000; }
     rx.push_back({ t + 20000, 'y' });
     rx.push_back({ t + 40000, 'x' });
+    // F1 stage 1: then Mount (down to it, Enter, Y) and Unmount (U, Y).
+    t += 60000;
+    for (char c : std::string("\x1b[B")) { rx.push_back({ t, c }); t += 1000; }
+    rx.push_back({ t + 20000, '\r' });
+    rx.push_back({ t + 40000, 'y' });
+    rx.push_back({ t + 60000, 'u' });
+    rx.push_back({ t + 80000, 'y' });
+    obs_test_reset(0, 0);
     idle_after_ns = mock_now_ns + 20000000000ull;
     on_idle = core1_done;
     core1_entry();
+}
+
+// ---- F1 stage 1: proof from the log that no ECh and no 91h went out -----------
+// What a host tool does with the log (READ BUFFER 4Ch; obs.c): take every
+// entry from the last MOUNT marker to now. The proof holds only when that
+// run is complete (no seq missing, none lost), and then it counts the ECh
+// and 91h commands in it. Read here with obs_log_page, as usb.c answers.
+struct Proof { bool mount = false, complete = false; int ec = 0, idp = 0, cmds = 0; };
+static Proof proof_since_mount() {
+    Proof p;
+    std::vector<obs_log_entry_t> all;
+    uint32_t want = 0;
+    bool lost = false;
+    static uint8_t pg[4096];
+    for (int guard = 0; guard < 10000; guard++) {
+        uint32_t r = obs_log_page(want & 0xFFFFFF, pg, sizeof pg);
+        if (r < 32 || memcmp(pg, "ATBLOG01", 8) != 0) return p;
+        if (pg[28] & 1) lost = true;
+        uint32_t n = pg[12] | (pg[13] << 8);
+        if (n == 0) break;
+        uint32_t first = pg[8] | (pg[9] << 8) | (pg[10] << 16) | ((uint32_t)pg[11] << 24);
+        if (want && first != want) lost = true;
+        for (uint32_t i = 0; i < n; i++) { obs_log_entry_t e; memcpy(&e, pg + 32 + 32 * i, 32); all.push_back(e); }
+        want = all.back().seq + 1;
+    }
+    size_t m = all.size();
+    for (size_t i = 0; i < all.size(); i++) if (all[i].kind == OBS_EV_MOUNT) m = i;
+    if (m == all.size()) return p;
+    p.mount = true;
+    // The mount marker must still be the oldest part of a gapless run: if
+    // the ring had wrapped past it, the first page would have said "lost".
+    p.complete = !lost;
+    for (size_t i = m + 1; i < all.size(); i++) {
+        if (all[i].seq != all[i - 1].seq + 1) p.complete = false;
+        if (all[i].kind != OBS_EV_CMD) continue;
+        p.cmds++;
+        if (all[i].value == 0xEC) p.ec++;
+        if (all[i].value == 0x91) p.idp++;
+    }
+    return p;
+}
+// The drive's own count of a command since a point in cmd_log.
+static int sim_count_since(size_t from, uint8_t c) {
+    int n = 0;
+    for (size_t i = from; i < sim.cmd_log.size(); i++) if (sim.cmd_log[i] == c) n++;
+    return n;
+}
+
+static void test_obs_proof() {
+    // Native mode through everything that resets the drive: the log proves
+    // no ECh and no 91h, and the drive agrees.
+    native_drive("F1 proof: native mode, resets and recoveries");
+    obs_test_reset(0, 0);
+    ctrl_g_native();
+    log_mount(OBS_EV_MOUNT, OBS_MNT_MENU);           // as Mount's Y does (menus.c)
+    is_mounted = true;
+    size_t m = sim.cmd_log.size();
+    read_right(1234);
+    debug_reset();
+    read_right(1234);
+    sim.bad[4321] = {BAD_HANG, 0};
+    read_right(4321);
+    sim.bad.clear();
+    read_right(1234);
+    sim.srst_wedges = true;
+    sim.bad[4321] = {BAD_HANG, 0};
+    read_right(4321);
+    sim.srst_wedges = false; sim.bad.clear();
+    bool right = false;
+    for (int i = 0; i < 4; i++) host_read(1234 + i, &right);
+    Proof p = proof_since_mount();
+    CHECK(p.mount && p.complete && p.ec == 0 && p.idp == 0 && p.cmds >= 8, "mount %d complete %d ECh %d 91h %d cmds %d",
+          p.mount, p.complete, p.ec, p.idp, p.cmds);
+    CHECK(sim_count_since(m, 0xEC) == 0 && sim_count_since(m, 0x91) == 0 && p.cmds == (int)(sim.cmd_log.size() - m),
+          "the drive: ECh %d 91h %d, commands %zu against the log's %d", sim_count_since(m, 0xEC),
+          sim_count_since(m, 0x91), sim.cmd_log.size() - m, p.cmds);
+    obs_log_entry_t mk{};
+    for (uint32_t s = log_next - 1; s > 0; s--) if (log_ring[s % OBS_LOG_ENTRIES].kind == OBS_EV_MOUNT) { mk = log_ring[s % OBS_LOG_ENTRIES]; break; }
+    // Every RESET- is in the log, with where it came from: Ctrl+G's, Debug R's, the recovery's.
+    int rs[5] = {0, 0, 0, 0, 0};
+    for (uint32_t s = 1; s < log_next; s++)
+        if (log_ring[s % OBS_LOG_ENTRIES].kind == OBS_EV_RESET && log_ring[s % OBS_LOG_ENTRIES].value < 5) rs[log_ring[s % OBS_LOG_ENTRIES].value]++;
+    CHECK(rs[OBS_RST_MANUAL_CHS] == 1 && rs[OBS_RST_RESET_DRIVE] == 1 && rs[OBS_RST_RECOVERY] == 1 &&
+          rs[1] + rs[2] + rs[3] + rs[4] == sim.hw_resets, "RESET- in the log: Ctrl+G %d, Debug R %d, recovery %d; the drive saw %d",
+          rs[OBS_RST_MANUAL_CHS], rs[OBS_RST_RESET_DRIVE], rs[OBS_RST_RECOVERY], sim.hw_resets);
+    CHECK(mk.tf[0] == OBS_MODE_MCHS_NATIVE && mk.tf[1] == NS && mk.tf[2] == NH && (mk.tf[3] | (mk.tf[4] << 8)) == NC &&
+          mk.tf[5] == 0xA0, "the marker: mode %u, %u/%u/%u", mk.tf[0], mk.tf[3] | (mk.tf[4] << 8), mk.tf[2], mk.tf[1]);
+
+    // The other way: a 91h that does go out is seen. The old mode sends one
+    // after a soft reset; and one planted straight on the bus in native mode.
+    native_drive("F1 proof: the 91h mode shows its 91h");
+    obs_test_reset(0, 0);
+    keys("522\r4\r40\ry"); run_manual_chs();
+    log_mount(OBS_EV_MOUNT, OBS_MNT_MENU);
+    is_mounted = true;
+    m = sim.cmd_log.size();
+    sim.bad[4321] = {BAD_HANG, 0};
+    read_right(4321);
+    sim.bad.clear();
+    p = proof_since_mount();
+    CHECK(p.complete && p.idp >= 1 && p.idp == sim_count_since(m, 0x91), "91h mode: log %d, drive %d", p.idp,
+          sim_count_since(m, 0x91));
+    native_drive("F1 proof: a 91h planted in native mode");
+    obs_test_reset(0, 0);
+    ctrl_g_native();
+    log_mount(OBS_EV_MOUNT, OBS_MNT_MENU);
+    is_mounted = true;
+    read_right(1234);
+    ide_write_reg(6, 0xA0 | (NH - 1)); ide_write_reg(2, NS); ide_write_reg(7, 0x91);   // no firmware path does this
+    mock_now_ns += 10000000;
+    p = proof_since_mount();
+    CHECK(p.complete && p.idp == 1, "planted 91h: log %d", p.idp);
+
+    // No proof from a log that has lost the mount: the run is not complete.
+    native_drive("F1 proof: the mount marker overwritten");
+    obs_test_reset(0, 0);
+    ctrl_g_native();
+    log_mount(OBS_EV_MOUNT, OBS_MNT_MENU);
+    is_mounted = true;
+    for (int i = 0; i < OBS_LOG_ENTRIES + 10; i++) read_right(1234 + i % 40);
+    p = proof_since_mount();
+    CHECK(!p.mount || !p.complete, "a proof from a log that wrapped: mount %d complete %d", p.mount, p.complete);
+    native_drive("F1 proof: no mount marker");
+    obs_test_reset(0, 0);
+    ctrl_g_native();
+    read_right(1234);
+    p = proof_since_mount();
+    CHECK(!p.mount && !p.complete, "a proof with no mount");
 }
 
 // ---- 9. 0.6f3p9: the IORDY advisory --------------------------------------------
@@ -1610,6 +1758,7 @@ int main() {
 #ifdef IDE_FAULT_MAGIC
     test_holistic_menus();
 #endif
+    test_obs_proof();                               // F1 stage 1
     test_core1();                                   // does not return
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;
