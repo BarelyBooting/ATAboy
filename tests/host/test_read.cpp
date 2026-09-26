@@ -172,6 +172,8 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     memset(&salvage, 0, sizeof salvage);            // power-up: no salvage capture
     tud_mount_cb();
     reset_worst();
+    sim_reg_cost_ns = 0; sim_word_ns = 0;                  // the instant bus, unless a test says
+    unwitnessed_blocks = 0;
     mock_gpio_out = (1u << 24) | (1u << 25);      // CS0/CS1 idle high
     memset(&config, 0, sizeof(config));
     config.dev_base = 0xA0;
@@ -3638,8 +3640,11 @@ static void test_h1_mid_linger(Mode m) {
     uint8_t buf[8 * 512]; uint32_t done = 99;
     int32_t r = ide_read_sectors_partial(5000, 8, buf, &done);
     ide_fail_t f; ide_last_failure(&f);
-    CHECK(r < 0 && done == 0 && f.kind == IDE_FAIL_BAD_END && f.done == 0 && f.lba == 5004 && sim.srst >= 1 && sim.violations == 0,
-          "r %d done %u kind %u lba %u srst %d violations %d", r, done, f.kind, f.lba, sim.srst, sim.violations);
+    // Round 2 (R-1): with no drop seen in the settle time, DRQ is taken as the
+    // next block (ATA's host rule); it was stale, so the blocks are one out and
+    // the drive still offers data at the end, which rejects the whole command.
+    CHECK(r < 0 && done == 0 && f.kind == IDE_FAIL_BAD_END && f.done == 0 && sim.srst >= 1,
+          "r %d done %u kind %u lba %u srst %d", r, done, f.kind, f.lba, sim.srst);
     n = std::string("H-1: DRQ stuck 5 ms between blocks, READ(10), ") + mn;
     setup(n.c_str(), m);
     if (m == CHS) chs_user_geometry();
@@ -3672,13 +3677,34 @@ static void test_l7_write_linger() {
         int32_t r = ide_write_sectors(3000, 2, w.data());
         CHECK(r < 0, "a write ending with %02X taken as done", es);
     }
+    // Round 2: a compliant writer with a short commit between blocks (1 us),
+    // at board-like register times: written, no reset.
+    for (uint64_t cost : { 0ull, 2000ull })
+        for (bool irq : { true, false })
+            for (uint64_t extra : { 0ull, 500ull }) {
+                std::string n = std::string("R-1 write: ") + std::to_string(1000 + extra) + " ns between blocks, " +
+                                std::to_string(cost) + " ns a read, INTRQ " + (irq ? "wired" : "not wired");
+                setup(n.c_str(), LBA);
+                config.drive_write_protected = false;
+                sim_reg_cost_ns = cost; sim_word_ns = cost ? 800 : 0;
+                sim.intrq_wired = irq;
+                for (uint32_t l = 3000; l < 3004; l++) if (extra) sim.pause[l] = extra;
+                std::vector<uint8_t> w = fill512(4, 7);
+                int32_t r = ide_write_sectors(3000, 4, w.data());
+                bool all = true;
+                for (int i = 0; i < 4; i++) all = all && written_is(3000 + i, w.data() + i * 512);
+                CHECK(r == 4 * 512 && all && sim.srst == 0, "r %d written %d srst %d", r, all, sim.srst);
+                // The first look after a block counts (1.5 us BSY, 2 us reads).
+                if (!irq && cost == 2000 && extra == 500)
+                    CHECK(ide_unwitnessed_blocks() == 0, "write: the first look did not count: %u", ide_unwitnessed_blocks());
+            }
     setup("L-7: write, DRQ stuck 5 ms after a block", LBA);
     config.drive_write_protected = false;
     sim.write_linger = 5000000; sim.violations = 0;
     std::vector<uint8_t> w = fill512(4, 9);
     int32_t r = ide_write_sectors(3000, 4, w.data());
     ide_fail_t f; ide_last_failure(&f);
-    CHECK(r < 0 && f.kind == IDE_FAIL_BAD_END && sim.violations == 0 && sim.srst >= 1, "r %d kind %u violations %d",
+    CHECK(r < 0 && f.kind == IDE_FAIL_BAD_END && sim.srst >= 1, "r %d kind %u violations %d",
           r, f.kind, sim.violations);
 }
 
@@ -3741,6 +3767,70 @@ static void test_l3_identify_end() {
     CHECK(ide_identify_lba48(w) == 0x11234ull, "words 100-103 not used with word 83 bit 10");
     w[83] = 0xC400;
     CHECK(ide_identify_lba48(w) == 0, "word 83 with a bad signature believed");
+}
+
+// ---- holistic review round 2: R-1, both directions ------------------------------
+// A compliant drive: BSY between blocks for gap ns, however short, and no
+// DRQ left over. It must read with no failure and no reset, at the mock's
+// instant bus and at board-like register times (2 and 4 us a read, 800 ns a
+// word), with INTRQ wired or not.
+static void test_r1_compliant(Mode m) {
+    for (uint64_t cost : { 0ull, 2000ull, 4000ull })
+        for (bool irq : { true, false })
+            for (uint64_t gap : { 0ull, 100ull, 300ull, 1000ull, 1500ull, 2000ull, 3000ull, 5000ull, 10000ull }) {
+                std::string n = std::string("R-1 compliant: BSY ") + std::to_string(gap) + " ns between blocks, " +
+                                std::to_string(cost) + " ns a read, INTRQ " + (irq ? "wired, " : "not wired, ") +
+                                (m == CHS ? "CHS" : "LBA");
+                setup(n.c_str(), m);
+                if (m == CHS) chs_user_geometry();
+                sim_reg_cost_ns = cost; sim_word_ns = cost ? 800 : 0;
+                sim.t_sector = gap; sim.intrq_wired = irq;
+                sim.violations = 0; sim.srst = 0;
+                HostRead h = host_read10(5000, 8);
+                CHECK(h.ok && h.data.size() == 8 * 512 && matches_medium(h, 5000) && sim.srst == 0 && sim.violations == 0,
+                      "ok %d, %zu bytes, right %d, srst %d, violations %d", h.ok, h.data.size(), matches_medium(h, 5000),
+                      sim.srst, sim.violations);
+                // With INTRQ wired every block has a witness (its INTRQ); a
+                // gap the reads can see is a witness too.
+                if (irq || gap >= 3 * cost + 2000)
+                    CHECK(ide_unwitnessed_blocks() == 0, "%u blocks taken with no witness", ide_unwitnessed_blocks());
+                // The first read after a block counts: at 2 us a read it samples
+                // 1 us after the last word, so a 1.5 us BSY is seen there and
+                // nowhere else.
+                if (!irq && cost == 2000 && gap == 1500)
+                    CHECK(ide_unwitnessed_blocks() == 0, "the first look did not count: %u unwitnessed", ide_unwitnessed_blocks());
+            }
+}
+
+// A drive that breaks the protocol: DRQ stays up (58h) linger ns after a
+// block, then busy for the next. Whatever happens, the host never gets a
+// sector that is not the medium's: real data, or the whole command failed.
+static void test_r1_linger(Mode m) {
+    for (uint64_t cost : { 0ull, 2000ull })
+        for (int irq = 0; irq < 3; irq++)               // wired, not wired, stuck high
+            for (uint64_t linger : { 200ull, 2000ull, 20000ull, 200000ull, 900000ull, 2000000ull, 5000000ull }) {
+                std::string n = std::string("R-1 linger: DRQ ") + std::to_string(linger) + " ns after blocks, " +
+                                std::to_string(cost) + " ns a read, INTRQ " +
+                                (irq == 0 ? "wired, " : irq == 1 ? "not wired, " : "stuck high, ") + (m == CHS ? "CHS" : "LBA");
+                setup(n.c_str(), m);
+                if (m == CHS) chs_user_geometry();
+                sim_reg_cost_ns = cost; sim_word_ns = cost ? 800 : 0;
+                sim.intrq_wired = irq != 1; sim.intrq_stuck = irq == 2;
+                sim.mid_linger = true; sim.drq_linger = linger;
+                HostRead h = host_read10(5000, 8);
+                bool real = matches_medium(h, 5000);
+                bool whole_fail = !h.ok && h.data.empty();
+                CHECK(real && (h.ok ? h.data.size() == 8 * 512 : true) && (h.ok || whole_fail),
+                      "ok %d, %zu bytes, right %d", h.ok, h.data.size(), real);
+                // A linger the settle time outlasts can only end one way.
+                if (linger > IDE_READ_SETTLE_US * 1000ull) {
+                    CHECK(whole_fail, "a stuck DRQ read as good: %zu bytes", h.data.size());
+                    CHECK(ide_unwitnessed_blocks() > 0, "a stuck DRQ not counted as unwitnessed");
+                }
+                // One the settle time sees end must read, with no reset.
+                if (linger < IDE_READ_SETTLE_US * 1000ull / 2) CHECK(h.ok && sim.srst == 0, "a short linger failed: ok %d srst %d",
+                                                                     h.ok, sim.srst);
+            }
 }
 
 int main() {
@@ -3850,6 +3940,10 @@ int main() {
     test_c4_ctrlg_write_protect();
     test_c2r_once_per_mount();
     test_h1_mid_linger(LBA);
+    test_r1_compliant(LBA);
+    test_r1_compliant(CHS);
+    test_r1_linger(LBA);
+    test_r1_linger(CHS);
     test_h1_mid_linger(CHS);
     test_l7_write_linger();
     test_l8_df_mid_read(LBA);

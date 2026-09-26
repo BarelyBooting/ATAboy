@@ -72,9 +72,9 @@ void ide_pio_init(void) {
 static volatile uint32_t stalls = 0;
 uint32_t ide_pio_stalls(void) { return stalls; }
 
-void ide_pio_stop(void) {
-    pio_sm_set_enabled(pio, sm_read, false);
-    pio_sm_set_enabled(pio, sm_write, false);
+// From the fault handler: in RAM, register writes only (round 2, N-4).
+void __not_in_flash_func(ide_pio_stop)(void) {
+    hw_clear_bits(&pio0_hw->ctrl, (1u << sm_read) | (1u << sm_write));
 }
 
 static void iordy_unstick(void) {

@@ -158,6 +158,13 @@ static inline uint64_t ide_identify_lba48(const uint16_t *id) {
            ((uint64_t)id[101] << 16) | (uint64_t)id[100];
 }
 
+// Holistic review round 2, R-1: data blocks since power-up taken as the
+// next block with no sign between them that the drive had finished the one
+// before (no drop of DRQ, no rise of BSY, no fresh INTRQ seen within
+// IDE_READ_SETTLE_US). ATA lets a host take DRQ then; the end-of-command
+// check rejects the command if it was a stale DRQ. Debug E shows it.
+uint32_t ide_unwitnessed_blocks(void);
+
 // Copy of the last failure record (kind == IDE_FAIL_NONE if none yet).
 void    ide_last_failure(ide_fail_t *out);
 

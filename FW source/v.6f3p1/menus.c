@@ -833,6 +833,9 @@ static void run_debug_errors(void) {
     if (sv.valid)
         debug_print(5, FG_WHITE, "Salvaged #%lu: LBA %lu ST:%02X ERR:%02X, READ BUFFER 5Ah",
                     (unsigned long)sv.seq, (unsigned long)sv.lba, sv.status, sv.error);
+    // Holistic review round 2, R-1: blocks taken with no gap seen before them.
+    if (ide_unwitnessed_blocks())
+        debug_print(10, FG_YELLOW, "Blocks taken with no drop seen before: %lu", (unsigned long)ide_unwitnessed_blocks());
     // Holistic review: a fault from before this (warm) boot.
     ide_fault_t fr;
     if (ide_fault_last(&fr))

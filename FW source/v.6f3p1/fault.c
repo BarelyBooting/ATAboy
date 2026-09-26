@@ -17,8 +17,9 @@
 
 #define FAULT_STACK_WORDS 256
 static uint32_t fault_stack[2][FAULT_STACK_WORDS] __attribute__((aligned(8)));
-// Read by the handler's assembly: the top of each core's fault stack.
-uint32_t *const fault_stack_tops[2] = { &fault_stack[0][FAULT_STACK_WORDS], &fault_stack[1][FAULT_STACK_WORDS] };
+// Read by the handler's assembly: the top of each core's fault stack. In RAM
+// (not const, which would put it in flash), like the whole handler.
+uint32_t *fault_stack_tops[2] = { &fault_stack[0][FAULT_STACK_WORDS], &fault_stack[1][FAULT_STACK_WORDS] };
 
 static void __not_in_flash_func(fault_park)(uint32_t pc, uint32_t lr, uint32_t cfsr) __attribute__((noreturn));
 static void __not_in_flash_func(fault_park)(uint32_t pc, uint32_t lr, uint32_t cfsr) {
@@ -41,13 +42,13 @@ void __not_in_flash_func(fault_from_handler)(uint32_t *frame) {
     fault_park(pc, lr, cfsr);
 }
 
-void fault_stop(uint32_t code) {
+void __not_in_flash_func(fault_stop)(uint32_t code) {
     (void)save_and_disable_interrupts();
     fault_park(0, 0, code);
 }
 
 // Replaces the SDK's weak default (crt0.S: a breakpoint).
-void __attribute__((naked)) isr_hardfault(void) {
+void __attribute__((naked)) __not_in_flash_func(isr_hardfault)(void) {
     __asm volatile(
         "movs r0, #4            \n"
         "mov  r1, lr            \n"

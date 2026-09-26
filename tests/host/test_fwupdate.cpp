@@ -81,6 +81,7 @@ void ide_manual_chs_native_forget(void) {}
 // Holistic review (fault handling, core 1 stack, chip stepping)
 bool ide_fault_last(ide_fault_t *) { return false; }
 bool core1_stack_intact(void) { return true; }
+uint32_t ide_unwitnessed_blocks(void) { return 0; }
 void fault_stop(uint32_t) { abort(); }
 #endif
 #ifdef IDE_FAIL_SELF_RESET

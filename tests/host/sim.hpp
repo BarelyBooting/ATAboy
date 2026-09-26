@@ -762,16 +762,23 @@ uint32_t ide_pio_stalls(void) { return sim.pio_stalls; }
 // Holistic review: the fault handler stops the state machines.
 inline bool mock_pio_stopped = false;
 void ide_pio_stop(void) { mock_pio_stopped = true; }
+// Holistic review round 2: board time per register access (half before the
+// sample, as the reviewer's probe did) and per data word; 0 = the mock's
+// instant bus, which every older test uses.
+inline uint64_t sim_reg_cost_ns = 0;
+inline uint64_t sim_word_ns = 0;
 void ide_pio_read(uint32_t count, uint16_t *buf) {
     if (sim_on_read) sim_on_read();
+    mock_now_ns += (count == 1 ? sim_reg_cost_ns / 2 : 0);
     iordy_check();
     bool cs1; int r = bus_reg(cs1);
     for (uint32_t i = 0; i < count; i++) {
         if (r < 0) { buf[i] = 0xFFFF; continue; }
         if (cs1) buf[i] = (r == 6) ? sim.read_status(mock_now_ns, true) : 0xFF;  // alt status
-        else if (r == 0) buf[i] = sim.read_data(mock_now_ns);
+        else if (r == 0) { mock_now_ns += sim_word_ns; buf[i] = sim.read_data(mock_now_ns); }
         else buf[i] = sim.read_reg(r, mock_now_ns);
     }
+    mock_now_ns += (count == 1 ? sim_reg_cost_ns - sim_reg_cost_ns / 2 : 0);
 }
 void ide_pio_write(uint32_t count, const uint16_t *buf) {
     iordy_check();

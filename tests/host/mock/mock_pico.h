@@ -75,6 +75,8 @@ static inline void gpio_set_function(unsigned pin, unsigned fn) {
     }
 }
 #define __uninitialized_ram(name) name
+#define __not_in_flash_func(name) name
+#define ATABOY_HOST_TEST 1
 static inline uint8_t rp2350_chip_version(void) { return 4; }
 static inline void gpio_set_dir(unsigned, bool) {}
 static inline void gpio_pull_down(unsigned) {}

@@ -3,6 +3,9 @@
 #include "config.h"
 #include "hardware/gpio.h"
 #include "hardware/structs/sio.h"
+#if !ATABOY_HOST_TEST
+#include "hardware/structs/io_bank0.h"
+#endif
 #include "pico/stdlib.h"
 #include "pico/time.h"
 
@@ -148,7 +151,19 @@ void ide_select_device(uint8_t base) { dev_base = base; }
 // firmware, a flash) keeps it for Debug E; a power cycle loses it.
 static ide_fault_t __uninitialized_ram(fault_rec);
 
-void ide_fault_record(uint32_t core, uint32_t pc, uint32_t lr, uint32_t cfsr) {
+// Holistic review round 2, N-4: everything the fault handler runs is in RAM,
+// so a fault while the flash is not readable (core 1 inside a settings save,
+// XIP off) still releases the bus. No SDK function is called from here: the
+// pin function is set by writing the IO bank register itself.
+static void __not_in_flash_func(pin_to_sio)(unsigned pin) {
+#if ATABOY_HOST_TEST
+    gpio_set_function(pin, GPIO_FUNC_SIO);
+#else
+    io_bank0_hw->io[pin].ctrl = GPIO_FUNC_SIO << IO_BANK0_GPIO0_CTRL_FUNCSEL_LSB;   // no overrides
+#endif
+}
+
+void __not_in_flash_func(ide_fault_record)(uint32_t core, uint32_t pc, uint32_t lr, uint32_t cfsr) {
     fault_rec.core = core;
     fault_rec.pc = pc;
     fault_rec.lr = lr;
@@ -165,17 +180,17 @@ bool ide_fault_last(ide_fault_t *out) {
 // Leave the bus as nothing drives it: no strobe, no chip select, no reset,
 // the data lines inputs behind both transceivers disabled. Plain register
 // writes and SDK pin calls only; nothing waits.
-void ide_fault_release_bus(void) {
+void __not_in_flash_func(ide_fault_release_bus)(void) {
     ide_pio_stop();
     uint32_t high = (1u << IDE_OE) | (1u << IDE_OE1) | (1u << IDE_CS0) | (1u << IDE_CS1) |
                     (1u << IDE_RESET) | (1u << IDE_DIOR) | (1u << IDE_DIOW);
     sio_hw->gpio_set = high;
     sio_hw->gpio_oe_set = high;
-    gpio_set_function(IDE_DIOR, GPIO_FUNC_SIO);        // from the PIO: now a plain high output
-    gpio_set_function(IDE_DIOW, GPIO_FUNC_SIO);
+    pin_to_sio(IDE_DIOR);                               // from the PIO: now a plain high output
+    pin_to_sio(IDE_DIOW);
     sio_hw->gpio_clr = (1u << IDE_DIR) | (1u << IDE_DIR1);   // B to A (disabled anyway)
     sio_hw->gpio_oe_clr = 0xFFFFu;                      // DD0-15: inputs
-    for (unsigned pin = 0; pin < 16; pin++) gpio_set_function(pin, GPIO_FUNC_SIO);
+    for (unsigned pin = 0; pin < 16; pin++) pin_to_sio(pin);
 }
 
 // IDENTIFY word 22 for READ LONG (0.6f3p9, ide.h), in every build. Set only
@@ -1592,6 +1607,10 @@ static bool time_to_send(uint32_t lba, uint32_t count) {
 // is used only to label a READ LONG that has already gone wrong.
 #define IDE_FLOAT_MS 50
 static inline bool status_floating(uint8_t st) { return st == 0xFF || st == 0x7F; }
+
+// Holistic review round 2, R-1 (ide.h).
+static uint32_t unwitnessed_blocks = 0;
+uint32_t ide_unwitnessed_blocks(void) { return unwitnessed_blocks; }
 // Review C round 2, C2-2: after a read's last word, how long DRQ may take to
 // fall (as IDE_LONG_SETTLE_US for READ LONG).
 #define IDE_READ_SETTLE_US 1000
@@ -1731,6 +1750,7 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
     // has followed it: the drive losing power right after offering one
     // leaves FFFFh words and status FFh behind.
     bool vouched = true;
+    bool irq_low = false;                                  // R-1: INTRQ low after the block's Status read
     uint32_t stalls = ide_pio_stalls();                    // review C, C-7: IORDY held too long
 
     for (s = 0; s < count; s++) {
@@ -1753,7 +1773,7 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
             // Holistic review L-8: DF (device fault) with DRQ is not a block
             // to take; it ends the read like ERR.
             if (st & 0x21) goto read_err;
-            if (st & 0x08) goto drq_read;
+            if (st & 0x08) { irq_low = !gpio_get(IDE_INTRQ); goto drq_read; }
             busy_wait_us_32(10);
         }
 
@@ -1769,24 +1789,37 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
         if (ide_pio_stalls() != stalls) goto read_stall;
         sector_start = ms_now();
         vouched = false;
-        // Holistic review H-1: DRQ must fall after each block before the next
-        // one is taken. A drive whose DRQ lingers a moment after a block
-        // used to have that same status read as the next block's DRQ: 256
-        // words read with nothing driving the bus (FFFFh here), every later
-        // block one out, and all of it handed over as good. Now Alternate
-        // Status once, then up to IDE_READ_SETTLE_US for DRQ low or BSY high.
-        // DRQ still up with BSY clear after that fails the whole command: no
-        // sector of it is handed over, since the drive and the firmware no
-        // longer agree which block is which.
+        // Between blocks (holistic review H-1, then round 2, R-1). A drive
+        // whose DRQ lingers after a block used to have that same status read
+        // as the next block's DRQ: FFFFh words taken as a sector and handed
+        // over as good. ATA-6 9.5: after a block the device drops DRQ and
+        // raises BSY, for no set time, and a polling host waits one PIO cycle
+        // (600 ns in mode 0) and then takes BSY clear with DRQ set as the
+        // next block. So:
+        //  - the first Alternate Status read counts (it comes microseconds
+        //    after the last word, well past that cycle): BSY set or DRQ clear
+        //    in any read is the drop;
+        //  - a fresh INTRQ counts too: INTRQ read low right after the Status
+        //    read that gave this block (that read released it), high now. A
+        //    line stuck high or not wired never counts;
+        //  - with neither within IDE_READ_SETTLE_US, DRQ is taken as the next
+        //    block, as ATA's host does, and counted (Debug E). If it was a
+        //    stale DRQ, the blocks are one out and the drive still has data
+        //    on offer at the end: the end check rejects the whole command.
+        // 696f350 failed the command when nothing was seen, which failed
+        // compliant drives whose gap between blocks was shorter than its
+        // first look (it threw that look away), with a soft reset each time.
         if (s + 1 < count) {
-            (void)ide_read_alt_status();
             uint64_t t0 = us_now();
+            bool seen = false;
             for (;;) {
                 uint8_t a = ide_read_alt_status();
-                if ((a & 0x80) || !(a & 0x08)) break;
-                if (us_now() - t0 >= IDE_READ_SETTLE_US) { st = a; s++; goto mid_drq; }
+                if ((a & 0x80) || !(a & 0x08)) { seen = true; break; }
+                if (irq_low && gpio_get(IDE_INTRQ)) { seen = true; break; }
+                if (us_now() - t0 >= IDE_READ_SETTLE_US) break;
                 busy_wait_us_32(1);                        // polled closely: a short BSY is seen
             }
+            if (!seen) unwitnessed_blocks++;
         }
     }
 
@@ -1844,15 +1877,6 @@ end_drq:
     // so none of it is trusted. Reset it.
     note_failed_sector(lba, ms_now() - sector_start);
     record_failure(IDE_FAIL_BAD_END, cmd, st, lba + count - 1, 0, count);
-    soft_reset_restore();
-    if (done) *done = 0;
-    return -1;
-
-mid_drq:
-    // Holistic review H-1: DRQ did not fall after block s-1. Nothing of
-    // this command is handed over.
-    note_failed_sector(lba, ms_now() - sector_start);
-    record_failure(IDE_FAIL_BAD_END, cmd, st, lba + s, 0, count);
     soft_reset_restore();
     if (done) *done = 0;
     return -1;
@@ -1978,6 +2002,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     const uint16_t *wbuf = (const uint16_t *)buf;
 
     bool write_ok = true;
+    bool w_irq_low = false;                                // R-1: INTRQ low after the block's Status read
 
     for (s = 0; s < count; s++) {
         // Poll for DRQ — INTRQ not asserted for first sector of PIO write per ATA spec;
@@ -1989,7 +2014,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
             st = ide_read_reg(7);
             if (st & 0x80) { busy_wait_us_32(10); continue; }   // BSY: other bits not valid
             if (st & 0x01) { write_ok = false; fail_kind = IDE_FAIL_ERR; break; }
-            if (st & 0x08) { got_drq = true; break; }
+            if (st & 0x08) { got_drq = true; w_irq_low = !gpio_get(IDE_INTRQ); break; }
             busy_wait_us_32(10);
         }
         if (!write_ok || !got_drq) { write_ok = false; break; }
@@ -2002,32 +2027,44 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
 
         sio_hw->gpio_set = (1 << IDE_CS0);
         bus_idle();
-        // Holistic review L-7, as H-1 for reads: DRQ must fall (or BSY rise)
-        // after each block before the next DRQ is believed.
-        {
-            (void)ide_read_alt_status();
+        // Holistic review L-7 and round 2 (N-1), as for reads: between
+        // blocks the first Alternate Status read counts, so does a fresh
+        // INTRQ, and with neither DRQ is taken (counted). A stale DRQ then
+        // leaves the drive wanting data at the end, which fails the write.
+        if (s + 1 < count) {
             uint64_t t0 = us_now();
-            bool fell = false;
+            bool seen = false;
             for (;;) {
                 uint8_t a = ide_read_alt_status();
-                if ((a & 0x80) || !(a & 0x08)) { fell = true; break; }
-                if (us_now() - t0 >= IDE_READ_SETTLE_US) { st = a; break; }
+                if ((a & 0x80) || !(a & 0x08)) { seen = true; break; }
+                if (w_irq_low && gpio_get(IDE_INTRQ)) { seen = true; break; }
+                if (us_now() - t0 >= IDE_READ_SETTLE_US) break;
                 busy_wait_us_32(1);
             }
-            if (!fell) { write_ok = false; fail_kind = IDE_FAIL_BAD_END; s++; break; }
+            if (!seen) unwitnessed_blocks++;
         }
     }
 
     // Wait for drive to commit the last sector to media (BSY=0). This is the
     // wait the ST380011A outlasted (IDE_CMD_TIMEOUT_MS above).
     if (write_ok) {
+        bool drq_up = false;
+        uint64_t drq_since = 0;
         for (;;) {
             if (ms_passed(start, limit)) break;   // write commit: still busy
             if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);
             st = ide_read_reg(7);
             if (st & 0x80) { busy_wait_us_32(10); continue; }   // BSY: other bits not valid
             if (st & 0x21) { write_ok = false; fail_kind = IDE_FAIL_ERR; break; }     // ERR or DF (L-7)
-            if (st & 0x08) { write_ok = false; fail_kind = IDE_FAIL_BAD_END; break; } // wants more data (L-7)
+            // DRQ still up: the drive wants more data (L-7), unless it only
+            // lingers after the last word; it gets IDE_READ_SETTLE_US to fall,
+            // as a read's end does (review C round 2, C2-2; round 2 of the
+            // holistic review).
+            if (st & 0x08) {
+                if (!drq_up) { drq_up = true; drq_since = us_now(); }
+                if (us_now() - drq_since < IDE_READ_SETTLE_US) { busy_wait_us_32(1); continue; }
+                write_ok = false; fail_kind = IDE_FAIL_BAD_END; break;
+            }
             sentinel_arm();                         // review C round 2, C2-1
             return (int32_t)(count * 512);
         }

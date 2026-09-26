@@ -1448,8 +1448,11 @@ static void test_holistic_menus() {
           "out %08X oe %08X pio stopped %d", (unsigned)mock_gpio_out, (unsigned)mock_gpio_oe, mock_pio_stopped);
     ide_fault_t fr;
     CHECK(ide_fault_last(&fr) && fr.core == 1 && fr.pc == 0x10001234u && fr.cfsr == 0x00020000u, "record");
+    unwitnessed_blocks = 42;
     tty.clear(); run_debug_errors();
     CHECK(has("Fault before this boot: core 1 PC 10001234 CFSR 00020000"), "Debug E does not show the fault");
+    CHECK(has("Blocks taken with no drop seen before: 42"), "Debug E does not show the unwitnessed blocks");
+    unwitnessed_blocks = 0;
     fault_rec.magic = 0;
     (void)busy_now;
 }
