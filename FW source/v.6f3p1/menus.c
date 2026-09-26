@@ -670,8 +670,20 @@ static void debug_print(int line_idx, const char *color, const char *fmt, ...) {
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    // Review C round 3, LOW: never wider than the box (68 columns).
-    cdc_printf("\033[%d;%dH\033[40m%s%-*.*s", 4 + line_idx, 7, color, 68, 68, buf);
+    // Review C round 3, LOW: never wider than the box (68 columns). A line
+    // that fits is printed exactly as before; a longer one is cut after its
+    // 68th visible character, never inside an escape sequence.
+    int vis = 0, cut = -1;
+    for (int i = 0; buf[i]; i++) {
+        if (buf[i] == '\033') {
+            while (buf[i + 1] && !(buf[i + 1] >= '@' && buf[i + 1] <= '~' && buf[i + 1] != '[')) i++;
+            if (buf[i + 1]) i++;
+            continue;
+        }
+        if (++vis > 68) { cut = i; break; }
+    }
+    if (cut >= 0) buf[cut] = '\0';
+    cdc_printf("\033[%d;%dH\033[40m%s%-*s", 4 + line_idx, 7, color, 68, buf);
     cdc_puts(RESET);
 }
 

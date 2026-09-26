@@ -1066,7 +1066,7 @@ MUTANTS = [
      '    uint32_t n = alloc < SALV_LEN ? alloc : SALV_LEN;',
      '    { ide_self_resets_t s_; ide_self_resets(&s_); put_le32(r + 24, s_.detected); }\n    uint32_t n = alloc < SALV_LEN ? alloc : SALV_LEN;'),
     ('C3 LOW: Debug E rows wider than the box (the old code)', 'menus.c',
-     '%-*.*s", 4 + line_idx, 7, color, 68, 68, buf);', '%-*s", 4 + line_idx, 7, color, 68, buf);'),
+     '    if (cut >= 0) buf[cut] = \'\\0\';\n', ''),
     ('C-7: IORDY believed for a Ctrl+G drive', 'ide.c',
      '    if (mchs_no_identify) enabled = false;\n', ''),
     ('C-8: FFh after RESET- taken as no drive at once (the old code)', 'ide.c',
