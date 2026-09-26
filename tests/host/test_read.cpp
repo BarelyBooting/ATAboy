@@ -163,7 +163,7 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     manual_chs_active = false;
     native_geo.on = false; idp_written = false; mchs_no_identify = false;   // 0.6f3p10: power-up
 #ifdef IDE_SENTINEL_SC
-    memset(&self_resets, 0, sizeof self_resets); sentinel_armed = false;
+    memset(&self_resets, 0, sizeof self_resets); sentinel_armed = false; sentinel_proven = 0;
 #endif
     memset(&salvage, 0, sizeof salvage);            // power-up: no salvage capture
     tud_mount_cb();
@@ -3483,9 +3483,13 @@ static void test_c2r_once_per_mount() {
           sim.init_params);
     CHECK(sr.detected == 1 && sr.idp_resent == 1 && sr.native_failed == 0 && sr.last_lba == 5000 && f.kind == IDE_FAIL_SELF_RESET,
           "counts %u %u %u lba %u, record %u", sr.detected, sr.idp_resent, sr.native_failed, sr.last_lba, f.kind);
+    // Round 3, C3-3: READ BUFFER keeps imagelba's layout exactly: with no
+    // capture, every byte after the magic is 0 (bytes 24 to 31 too), even
+    // after a self-reset. The counts are in Debug E only.
     SatResult b = sat_cmd({ 0x3C, 0x02, 0x5A, 0, 0, 0, 0x00, 0x02, 0x20, 0 }, 544, true);
-    CHECK(b.r == 544 && le32_at(b.data, 24) == 1 && le32_at(b.data, 28) == 1, "READ BUFFER counts %u %u",
-          b.data.size() >= 32 ? le32_at(b.data, 24) : 0, b.data.size() >= 32 ? le32_at(b.data, 28) : 0);
+    bool zero = b.r == 544 && b.data.size() == 544 && memcmp(b.data.data(), "ATBSALV1", 8) == 0;
+    for (size_t i = 8; zero && i < 544; i++) zero = b.data[i] == 0;
+    CHECK(zero, "READ BUFFER is not the unchanged no-capture layout after a self-reset (r %d)", b.r);
     h = host_read10(5008, 8);
     CHECK(h.ok && sim.init_params == 1, "and not again: 0x91 %d", sim.init_params);
 
@@ -3503,6 +3507,23 @@ static void test_c2r_once_per_mount() {
     CHECK(ide_set_geometry(5, 34) && sim.geo_valid, "91h taken as refused: the stale ERR read as its answer");
     int32_t r = ide_read_sectors_partial(6000, 8, buf, &done);
     CHECK(r == 8 * 512 && sim.violations == 0, "read after: r %d, %d task file writes while busy", r, sim.violations);
+}
+
+// Round 3, C3-1: a drive that does not keep SC/SN (late register writes):
+// the sentinel is not armed, nothing fails and no 91h is re-sent because of
+// it, and the check is shown as off.
+static void test_c3_sentinel_unheld() {
+    for (uint64_t late : { 0ull, 100000ull }) {       // at once, and 100 us after the write
+        std::string n = std::string("C3-1: drive does not keep SC/SN, 91h mode, ") + (late ? "late" : "at once");
+        setup(n.c_str(), CHS);
+        sim.clobber_after = late ? late : 1;
+        chs_user_geometry();
+        int ok = 0;
+        for (uint32_t lba = 0; lba < 160; lba += 8) { HostRead h = host_read10(lba, 8); ok += h.ok && matches_medium(h, lba); }
+        ide_self_resets_t sr; ide_self_resets(&sr);
+        CHECK(ok == 20 && sim.init_params == 0 && sr.detected == 0 && sr.unavailable && sr.unheld == 1,
+              "%d of 20 reads, 0x91 %d, detected %u, unavailable %d unheld %u", ok, sim.init_params, sr.detected, sr.unavailable, sr.unheld);
+    }
 }
 
 // C2-2: DRQ that drops a moment after the last word is not a bad end.
@@ -3643,6 +3664,7 @@ int main() {
     test_c1_outside_reset();
     test_c4_ctrlg_write_protect();
     test_c2r_once_per_mount();
+    test_c3_sentinel_unheld();
     test_c2r_drq_settle(LBA);
     test_c2r_drq_settle(CHS);
     test_c2r_ff_while_busy(LBA);

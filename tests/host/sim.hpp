@@ -189,6 +189,11 @@ struct SimDrive {
     bool     dead = false;
     uint8_t  err_end_cmd = 0;
     uint8_t  end_status = 0;                   // round 2: a READ SECTORS ends with this status instead
+    // Round 3 (C3-1): a drive that does not keep host-written Sector Count
+    // and Sector Number while idle: clobber_after ns after such a write,
+    // both read 00h. 0 = keeps them (the default).
+    uint64_t clobber_after = 0;
+    uint64_t clobber_at = 0;
     bool     df_before_data = false;
     // INTRQ. intrq is the drive's interrupt pending; the line is high when
     // it is, the drive is selected and nIEN (Device Control bit 1) is 0.
@@ -451,6 +456,7 @@ struct SimDrive {
     uint16_t read_reg(int r, uint64_t now) {
         if (r == 7) return read_status(now);
         if (dead) return 0xFF;
+        if ((r == 2 || r == 3) && clobber_at && now >= clobber_at) { reg[2] = 0; reg[3] = 0; clobber_at = 0; }
         if (r == 1) return error;
         if ((devctl & 0x80) && r >= 2 && r <= 5) return hob[r];   // HOB: previous content
         return reg[r];
@@ -477,9 +483,11 @@ struct SimDrive {
         devctl &= ~0x80;                       // ATA: a register write clears HOB
         if (r >= 2 && r <= 5) hob[r] = reg[r];
         reg[r] = v;
+        if (clobber_after && (r == 2 || r == 3) && phase == IDLE) clobber_at = now + clobber_after;
     }
 
     void command(uint8_t c, uint64_t now) {
+        clobber_at = 0;                        // round 3: only idle registers are clobbered
         commands++; cmd_count[c]++; cmd_log.push_back(c);
         if (busy_probe && !busy_probe()) cmds_while_not_busy++;
         if (status & 0x88) violations++;       // command written while BSY or DRQ

@@ -116,7 +116,7 @@ static void fresh(const char *name) {
     native_declared = false;
     memset(&refused, 0, sizeof refused);
 #ifdef IDE_SENTINEL_SC
-    memset(&self_resets, 0, sizeof self_resets); sentinel_armed = false;
+    memset(&self_resets, 0, sizeof self_resets); sentinel_armed = false; sentinel_proven = 0;
 #endif
 #endif
     sim_on_read = nullptr;
@@ -1277,8 +1277,47 @@ static void test_c3_c5_c8() {
           srs.native_failed == 1 && srs.idp_resent == 0, "read %d, 0x91 %d, kind %u, counts %u %u", (int)g, idp_sent(), fr.kind,
           srs.detected, srs.native_failed);
     tty.clear(); run_debug_errors();
-    CHECK(has("drive reset itself at LBA 1234") && has("Drive reset itself: 1, last before LBA 1234; 91h again 0, failed 1"), "Debug E");
+    CHECK(has("drive reset itself at LBA 1234") && has("Self-resets 1, last LBA 1234; 91h again 0, failed 1"), "Debug E");
     CHECK(read_right(1234) && idp_sent() == 0, "the next read");
+
+    // Round 3, C3-1: in the power-up default mode, a drive that does not keep
+    // SC/SN must not fail every other command: the check is off, shown so.
+    native_drive("C3-1: native, drive does not keep SC/SN");
+    sim.clobber_after = 100000;
+    ctrl_g_native();
+    int good = 0;
+    for (uint32_t l = 0; l < 20; l++) good += read_right(l * 8);
+    ide_self_resets(&srs);
+    CHECK(good == 20 && srs.detected == 0 && srs.native_failed == 0 && srs.unavailable && idp_sent() == 0,
+          "%d of 20 reads, detected %u failed %u unavailable %d", good, srs.detected, srs.native_failed, srs.unavailable);
+    tty.clear(); run_debug_errors();
+    CHECK(has("Self-reset check OFF: drive does not keep SC/SN (x1)"), "Debug E does not say the check is off");
+    // A new Ctrl+G tries again (a drive that keeps them).
+    sim.clobber_after = 0;
+    ctrl_g_native();
+    ide_self_resets(&srs);
+    CHECK(!srs.unavailable && srs.unheld == 1, "not tried again at the next mount");
+
+    // Round 3, LOW: Debug E rows never run past the 68-column box.
+    native_drive("C3: Debug E rows stay in the box");
+    self_resets.detected = 4294967295u; self_resets.last_lba = 4294967295u;
+    self_resets.idp_resent = 4294967295u; self_resets.native_failed = 4294967295u;
+    self_resets.unavailable = true; self_resets.unheld = 4294967295u;
+    tty.clear(); run_debug_errors();
+    bool inbox = true;
+    for (int row = 4; row <= 20; row++) {
+        std::string at = "\033[" + std::to_string(row) + ";7H\033[40m";
+        size_t p = tty.find(at);
+        while (p != std::string::npos) {
+            size_t e = tty.find("\033[0m", p + at.size());
+            std::string seg = tty.substr(p + at.size(), e == std::string::npos ? std::string::npos : e - p - at.size());
+            int vis = 0; bool esc = false;
+            for (char c : seg) { if (c == '\033') esc = true; else if (esc) { if (c == 'm') esc = false; } else vis++; }
+            if (vis > 68) inbox = false;
+            p = tty.find(at, p + 1);
+        }
+    }
+    CHECK(inbox, "a Debug E row is wider than the box");
 #endif
     // C-8: a drive that floats the bus (FFh) for 5 s after RESET- is waited for.
     native_drive("C-8: FFh for 5 s after RESET-");

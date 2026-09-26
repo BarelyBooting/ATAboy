@@ -134,13 +134,17 @@ void    ide_last_failure(ide_fail_t *out);
 
 // Review C round 2, C2-1: drive self-resets seen since power-up (the
 // sentinel in Sector Count and Sector Number gone before a CHS command),
-// what was done about each, and the last sector concerned. Debug E and
-// READ BUFFER (bytes 24 to 31) show them.
+// what was done about each, and the last sector concerned. Debug E shows
+// them (round 3, C3-3: not READ BUFFER, whose layout imagelba checks).
+// Round 3, C3-1: unavailable is true when, this mount, the drive did not
+// keep the sentinel when it was written, so no self-reset can be seen.
 typedef struct {
     uint32_t detected;      // self-resets seen
     uint32_t idp_resent;    // 91h mode: 91h sent again after one, and accepted
     uint32_t native_failed; // power-up default mode: the command failed instead
     uint32_t last_lba;
+    bool     unavailable;   // this mount: the drive does not keep SC/SN, no check
+    uint32_t unheld;        // times since power-up a mount found that
 } ide_self_resets_t;
 void    ide_self_resets(ide_self_resets_t *out);
 

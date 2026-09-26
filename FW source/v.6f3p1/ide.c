@@ -114,7 +114,19 @@ bool ide_mchs_no_identify(void) { return mchs_no_identify; }
 #define IDE_SENTINEL_SC 0xA5
 #define IDE_SENTINEL_SN 0x5A
 static bool sentinel_armed = false;
+// Review C round 3, C3-1: the sentinel is read back when it is written.
+// A drive that does not keep it (at once, or 1 ms later, which is checked
+// on the first IDE_SENTINEL_PROVE arms of a mount) gets no self-reset check
+// for the rest of that mount: recorded once, shown in Debug E, and nothing
+// fails or is re-sent because of it. A new Ctrl+G or Auto Detect tries again.
+#define IDE_SENTINEL_PROVE 8
+static uint32_t sentinel_proven = 0;        // arms this mount that held 1 ms later
 static ide_self_resets_t self_resets;
+static void sentinel_new_mount(void) {
+    sentinel_armed = false;
+    sentinel_proven = 0;
+    self_resets.unavailable = false;
+}
 void ide_self_resets(ide_self_resets_t *out) { *out = self_resets; }
 
 // The geometry in use was set by Ctrl+G (ide_manual_chs), which never sends
@@ -592,6 +604,7 @@ uint8_t ide_probe_devices(void) {
     chs_geometry_lost = true; // RESET- drops 0x91 (review of 0.6f3p8, M-1)
     native_geo.on = false;    // a new detection: the Ctrl+G power-up default no longer applies
     native_declared = false;
+    sentinel_new_mount();     // review C round 3, C3-1
     mchs_no_identify = false; // a deliberate Auto Detect: IDENTIFY follows (review of 0.6f3p10, M-1)
     sleep_ms(2000);           // generous POST delay (not status-based)
     ide_write_control(0x00);  // nIEN=0
@@ -1184,10 +1197,33 @@ static void soft_reset_restore(void) {
 // default is the geometry in use, and a reset restores it).
 // Leave the sentinel (CHS mode, the drive idle after a command that ended
 // well); see self_resets.
+static bool sentinel_reads_back(void) {
+    return ide_read_reg(2) == IDE_SENTINEL_SC && ide_read_reg(3) == IDE_SENTINEL_SN;
+}
+
 static void sentinel_arm(void) {
-    if (config.use_lba_mode) return;
+    sentinel_armed = false;
+    if (config.use_lba_mode || self_resets.unavailable) return;
+    // Round 3, C3-1: only with BSY clear, bounded: a drive still busy now
+    // would own its registers.
+    uint32_t t0 = ms_now();
+    while (ide_read_reg(7) & 0x80) {
+        if (ms_passed(t0, 2)) return;       // not armed; nothing is judged against it
+        busy_wait_us_32(10);
+    }
     ide_write_reg(2, IDE_SENTINEL_SC);
     ide_write_reg(3, IDE_SENTINEL_SN);
+    bool held = sentinel_reads_back();
+    if (held && sentinel_proven < IDE_SENTINEL_PROVE) {
+        busy_wait_us_32(1000);              // a drive that writes its registers late
+        held = sentinel_reads_back();
+        if (held) sentinel_proven++;
+    }
+    if (!held) {
+        self_resets.unavailable = true;
+        self_resets.unheld++;
+        return;
+    }
     sentinel_armed = true;
 }
 
@@ -1293,6 +1329,7 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
     if (native && idp_written) return IDE_MCHS_IDP_SENT;
     native_geo.on = false;          // set again below only by a native mount that ends well
     native_declared = false;
+    sentinel_new_mount();           // review C round 3, C3-1
     mchs_no_identify = true;        // from here on this drive gets no IDENTIFY (M-1)
 #if ATABOY_SAT
     id_words.valid = false;         // this drive is never asked who it is

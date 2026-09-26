@@ -670,7 +670,8 @@ static void debug_print(int line_idx, const char *color, const char *fmt, ...) {
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    cdc_printf("\033[%d;%dH\033[40m%s%-*s", 4 + line_idx, 7, color, 68, buf);
+    // Review C round 3, LOW: never wider than the box (68 columns).
+    cdc_printf("\033[%d;%dH\033[40m%s%-*.*s", 4 + line_idx, 7, color, 68, 68, buf);
     cdc_puts(RESET);
 }
 
@@ -817,9 +818,13 @@ static void run_debug_errors(void) {
     ide_self_resets_t sr;
     ide_self_resets(&sr);
     if (sr.detected)
-        debug_print(6, FG_YELLOW, "Drive reset itself: %lu, last before LBA %lu; 91h again %lu, failed %lu",
+        debug_print(6, FG_YELLOW, "Self-resets %lu, last LBA %lu; 91h again %lu, failed %lu",
                     (unsigned long)sr.detected, (unsigned long)sr.last_lba,
                     (unsigned long)sr.idp_resent, (unsigned long)sr.native_failed);
+    // Review C round 3, C3-1: the check is off for this mount.
+    if (sr.unavailable)
+        debug_print(7, FG_YELLOW, "Self-reset check OFF: drive does not keep SC/SN (x%lu)",
+                    (unsigned long)sr.unheld);
 }
 
 static void run_seek_test(void) {
