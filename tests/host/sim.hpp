@@ -181,9 +181,14 @@ struct SimDrive {
     uint32_t stall_at = 0xFFFFFFFFu;           // C-7: IORDY holds a cycle of this block too long
     uint32_t pio_stalls = 0;
     uint64_t t_float = 0;                      // C-8: status FFh this long after RESET- goes high
+    // Review C round 2: DRQ lingers after the last word of a READ SECTORS
+    // too (drq_linger, as for READ LONG), and a busy drive shows FFh.
+    bool     linger_reads = false;
+    bool     ff_while_busy = false;
     uint64_t float_until = 0;
     bool     dead = false;
     uint8_t  err_end_cmd = 0;
+    uint8_t  end_status = 0;                   // round 2: a READ SECTORS ends with this status instead
     bool     df_before_data = false;
     // INTRQ. intrq is the drive's interrupt pending; the line is high when
     // it is, the drive is selected and nIEN (Device Control bit 1) is 0.
@@ -432,6 +437,7 @@ struct SimDrive {
         tick(now);
         if (!alt) intrq = false;                   // ...including one raised by that tick
         if ((status & 0x80) && garbage_while_busy) return 0x81;
+        if ((status & 0x80) && ff_while_busy) return 0xFF;
         return status;
     }
 
@@ -668,8 +674,9 @@ struct SimDrive {
                     if (left == 0) {
                         phase = IDLE; status = (df_cmd && cmd == df_cmd) ? 0x70 : 0x50;
                         if (err_end_cmd && cmd == err_end_cmd) { status = 0x51; error = 0x04; }
+                        if (end_status && cmd == 0x20) status = end_status;
                         if (busy_after.count(cur - 1)) { status = 0x80; ready_at = now + busy_after[cur - 1]; }
-                        if (is_long() && drq_linger) { status = 0x58; lingering = true; linger_until = now + drq_linger; }
+                        if ((is_long() || linger_reads) && drq_linger) { status = 0x58; lingering = true; linger_until = now + drq_linger; }
                     }
                     else { phase = BUSY_IN; status = 0x80; ready_at = now + sector_delay(cur); }
                 }

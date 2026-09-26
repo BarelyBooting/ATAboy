@@ -97,6 +97,26 @@ static struct {
 } refused;
 bool ide_mchs_no_identify(void) { return mchs_no_identify; }
 
+// Review C round 2, C2-1: a drive that resets on its own. 91h goes out once
+// per mount again (0.6f3p10's first design sent it before every CHS command,
+// up to 30,000 times a pass, and some Conners save every 91h to EEPROM).
+// Instead, after a CHS command ends well, Sector Count and Sector Number
+// are left holding A5h and 5Ah, which an idle drive keeps; any reset puts
+// the diagnostic signature (01h, 01h) there, and a floating bus reads FFh.
+// Before the next CHS command they are read back. A mismatch is a
+// self-reset: recorded (Debug E, READ BUFFER), and in the 91h mode the
+// geometry is marked lost, so one 91h goes out; in the power-up default
+// mode no 91h ever goes out and the command fails instead. Any command
+// written disarms it (ide_write_reg), so only the state after a good end
+// is compared. Not seen: a reset between the check and the command (that
+// command then fails or reads through the default), or after a failed
+// command (nothing armed); the procedure's verify pass covers both.
+#define IDE_SENTINEL_SC 0xA5
+#define IDE_SENTINEL_SN 0x5A
+static bool sentinel_armed = false;
+static ide_self_resets_t self_resets;
+void ide_self_resets(ide_self_resets_t *out) { *out = self_resets; }
+
 // The geometry in use was set by Ctrl+G (ide_manual_chs), which never sends
 // IDENTIFY: set when its 0x91 is accepted, cleared by the next IDENTIFY that
 // answers (ide_identify: Auto Detect, auto-mount, the debug screen). While it
@@ -205,6 +225,7 @@ static void xcvr_write(void) {
 // ---------------------------------------------------------------------------
 
 void ide_write_reg(uint8_t reg, uint8_t val) {
+    if (reg == 7) sentinel_armed = false;   // a command: the registers are the drive's now
     set_address(reg);
     xcvr_write();
     sio_hw->gpio_clr = (1 << IDE_CS0);
@@ -634,12 +655,15 @@ bool ide_wait_until_ready(uint32_t timeout_ms) {
 // recovery reserve left), so the cut below does not bite there.
 #define IDE_GEOMETRY_TIMEOUT_MS 1000
 
+static bool mchs_wait_end(sat_watch_t *w, uint32_t limit_ms, uint8_t *st);
+static void sentinel_arm(void);
+
 bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     // 0.6f3p10: in Ctrl+G's power-up default mode the drive is never sent
     // 0x91 (native_geo). This is the only place 0x91 goes out apart from
     // Ctrl+G itself, so every path after a reset (recovery_run,
     // chs_geometry_ok, the menus) comes through here.
-    if (native_geometry_in_use()) { chs_geometry_lost = false; return true; }
+    if (native_geometry_in_use()) { chs_geometry_lost = false; sentinel_arm(); return true; }
     // Re-review of 0.6f3p10, N-1: the drive was mounted in the power-up
     // default mode and no Ctrl+G or Auto Detect has come since: no 0x91 at
     // all, even with the mode ended. And never a geometry of 0 heads or 0
@@ -649,13 +673,25 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
     ide_write_reg(2, spt);
     idp_written = true;
+    // Review C round 2, C2-1: the answer is only read once the drive has
+    // visibly started the command (BSY or INTRQ seen) or stayed idle for the
+    // grace time, as Ctrl+G's own 91h does. Before, the first status 1 us
+    // after the command was taken as the answer, so a drive slow to raise
+    // BSY had its next command written while it was still busy, and an ERR
+    // left by a failed read was taken as 91h refused.
+    sat_watch_t w;
+    (void)ide_read_reg(7);                  // releases INTRQ before the command
+    sat_watch_arm(&w);
     ide_write_reg(7, 0x91);
     wait_after_command();
     // Only a clean completion counts. With ABRT the drive keeps its own
     // default translation, which is not the geometry we address it with.
     // Inside a host command the wait is cut to what is left of its time.
-    bool ok = ide_wait_until_ready(recovery_ms(IDE_GEOMETRY_TIMEOUT_MS)) && !(ide_read_reg(7) & 0x01);
+    uint8_t st = 0;
+    bool ended = mchs_wait_end(&w, recovery_ms(IDE_GEOMETRY_TIMEOUT_MS), &st);
+    bool ok = ended && (st & 0x40) && !(st & 0x01);
     chs_geometry_lost = !ok;
+    if (ok) sentinel_arm();
     return ok;
 }
 
@@ -1146,14 +1182,57 @@ static void soft_reset_restore(void) {
 // good status. Sending 91h each time costs one short command per chunk of
 // at most 8 sectors. In the power-up default mode none is ever sent (the
 // default is the geometry in use, and a reset restores it).
-static bool chs_geometry_ok(void) {
+// Leave the sentinel (CHS mode, the drive idle after a command that ended
+// well); see self_resets.
+static void sentinel_arm(void) {
+    if (config.use_lba_mode) return;
+    ide_write_reg(2, IDE_SENTINEL_SC);
+    ide_write_reg(3, IDE_SENTINEL_SN);
+    sentinel_armed = true;
+}
+
+// True when chs_geometry_ok() has written the failure record itself (a
+// self-reset in the power-up default mode), so the caller does not
+// overwrite it with "no geometry".
+static bool geometry_refusal_recorded = false;
+
+static bool chs_geometry_ok(uint32_t lba) {
+    geometry_refusal_recorded = false;
     if (config.use_lba_mode) return true;
-    if (native_geometry_in_use()) { chs_geometry_lost = false; return true; }
+    bool native = native_geometry_in_use();
+    bool resend = false;
+    // Review C round 2, C2-1: did the drive reset itself since the last
+    // command ended well? (After a reset of the firmware's own the geometry
+    // is already marked lost, and nothing is armed.)
+    if (!chs_geometry_lost && sentinel_armed) {
+        uint8_t sc = ide_read_reg(2), sn = ide_read_reg(3);
+        if (sc != IDE_SENTINEL_SC || sn != IDE_SENTINEL_SN) {
+            sentinel_armed = false;
+            self_resets.detected++;
+            self_resets.last_lba = lba;
+            record_failure(IDE_FAIL_SELF_RESET, 0, ide_read_reg(7), lba, 0, 0);
+            if (native) {
+                // Never 91h in this mode. The default a reset restores is the
+                // geometry in use, but the reset is still news: this command
+                // fails, and the next one goes ahead.
+                self_resets.native_failed++;
+                sentinel_arm();
+                geometry_refusal_recorded = true;
+                return false;
+            }
+            chs_geometry_lost = true;       // one 91h below, as after a reset of our own
+            resend = true;
+        }
+    }
+    if (native) { chs_geometry_lost = false; return true; }
+    if (!chs_geometry_lost) return true;
     // No geometry at all (Auto Detect cleared it, or a Ctrl+G failed): there
     // is nothing to send, and a CHS address could not even be worked out.
     // usb.c refuses before this with nothing mounted; this does not rely on it.
     if (config.heads == 0 || config.spt == 0) return false;
-    return ide_set_geometry(config.heads, config.spt);
+    bool ok = ide_set_geometry(config.heads, config.spt);
+    if (ok && resend) self_resets.idp_resent++;
+    return ok;
 }
 
 bool ide_recovery_pending(void) { return rec.stage != REC_NONE; }
@@ -1290,6 +1369,7 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
         native_geo.heads = heads;
         native_geo.spt = spt;
         manual_chs_active = true;   // no pass-through to this drive, as below
+        sentinel_arm();             // review C round 2, C2-1
         return IDE_MCHS_OK;
     }
 
@@ -1396,13 +1476,21 @@ static bool time_to_send(uint32_t lba, uint32_t count) {
 
 // A sector read failed after the drive had worked on it for ms: kept for the
 // issue #13 call again at it, in this host command only.
-// Review C, C-2: a status no drive gives. FFh is what the Rev .6 board reads
-// when nothing drives the bus (16 pull-ups to +5 V: a drive unpowered,
-// unplugged or dead); 7Fh the same with DD7 pulled down. Taken as floating
-// once it has lasted IDE_FLOAT_MS, since BSY makes the other bits
-// meaningless for a moment.
+// Review C, C-2: FFh is what the Rev .6 board reads when nothing drives the
+// bus (16 pull-ups to +5 V: a drive unpowered, unplugged or dead); 7Fh the
+// same with DD7 pulled down. Round 2, C2-3: but FFh is also a legal status
+// for a BUSY drive (ATA: the other bits mean nothing while BSY is set), and
+// a working drive can show it through a slow sector, so no short window can
+// tell the two apart. A floating status therefore never ends a read early:
+// it vouches for no block and is waited on like BSY, within the command's
+// time, and only labels the failure when that time runs out. IDE_FLOAT_MS
+// is used only to label a READ LONG that has already gone wrong.
 #define IDE_FLOAT_MS 50
 static inline bool status_floating(uint8_t st) { return st == 0xFF || st == 0x7F; }
+// Review C round 2, C2-2: after a read's last word, how long DRQ may take to
+// fall (as IDE_LONG_SETTLE_US for READ LONG).
+#define IDE_READ_SETTLE_US 1000
+static uint64_t us_now(void);
 
 // The status now, and whether it stays floating for IDE_FLOAT_MS.
 static bool floating_persists(uint8_t *st) {
@@ -1485,8 +1573,9 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
         soft_reset_restore();
         return -1;
     }
-    if (!chs_geometry_ok()) {
-        record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);
+    if (!chs_geometry_ok(lba)) {
+        if (!geometry_refusal_recorded)
+            record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);
         return -1;
     }
     // Still a fair window after waiting for the drive to be ready?
@@ -1537,8 +1626,6 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
     // has followed it: the drive losing power right after offering one
     // leaves FFFFh words and status FFh behind.
     bool vouched = true;
-    bool floating = false;
-    uint32_t float_since = 0;
     uint32_t stalls = ide_pio_stalls();                    // review C, C-7: IORDY held too long
 
     for (s = 0; s < count; s++) {
@@ -1547,13 +1634,13 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
             if (ms_passed(start, limit)) goto read_timeout;   // read: no DRQ in time
             if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
             st = ide_read_reg(7);
-            if (status_floating(st)) {
-                if (!floating) { floating = true; float_since = ms_now(); }
-                else if (ms_passed(float_since, IDE_FLOAT_MS)) goto read_float;
-                busy_wait_us_32(10);
-                continue;
-            }
-            floating = false;
+            // Review C round 2, C2-3: FFh is not taken as "no drive" early any
+            // more. BSY makes the other bits meaningless, and a working drive
+            // can show FFh through a slow sector; no window tells the two
+            // apart. It vouches for nothing and is waited on like BSY, within
+            // the command's time; a timeout that ends on it is recorded as
+            // "no drive".
+            if (status_floating(st)) { busy_wait_us_32(10); continue; }
             vouched = true;
             // While BSY is set the other status bits are not valid (ATA), so a
             // leftover ERR must not end a command the drive is still working on.
@@ -1582,21 +1669,36 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
     // with ERR or DF, gave good data. Now BSY must clear (within the
     // command's time) with DRDY, and ERR, DF and DRQ clear, the status not
     // floating; otherwise the last sector fails and is not handed over.
-    floating = false;
-    for (;;) {
-        st = ide_read_reg(7);
-        if (status_floating(st)) {
-            if (!floating) { floating = true; float_since = ms_now(); }
-            else if (ms_passed(float_since, IDE_FLOAT_MS)) { s = count - 1; vouched = true; goto read_float; }
-        } else {
-            floating = false;
-            if (!(st & 0x80) && (st & 0x61)) break;       // not busy: DRDY, or ERR or DF to report
+    // Review C round 2, C2-2: DRQ need not fall the instant the last word is
+    // read (as READ LONG found in 0.6f3p9): Alternate Status once, then BSY
+    // and DRQ both clear within IDE_READ_SETTLE_US, before anything is
+    // judged. DRQ still up after that is a bad end.
+    (void)ide_read_alt_status();
+    {
+        bool drq_up = false;
+        uint64_t drq_since = 0;
+        for (;;) {
+            st = ide_read_reg(7);
+            if (!status_floating(st) && !(st & 0x80)) {
+                if (!(st & 0x08)) {
+                    if (st & 0x61) break;          // BSY and DRQ clear: DRDY, or ERR or DF to report
+                } else if (!drq_up) {
+                    drq_up = true;
+                    drq_since = us_now();
+                } else if (us_now() - drq_since >= IDE_READ_SETTLE_US) {
+                    goto end_drq;                  // still offering data
+                }
+            }
+            if (ms_passed(start, limit)) {
+                if (status_floating(st)) { s = count - 1; vouched = true; goto read_float; }
+                if (!(st & 0x80) && (st & 0x08)) goto end_drq;
+                goto end_busy;
+            }
+            busy_wait_us_32(10);
         }
-        if (ms_passed(start, limit)) goto end_busy;
-        busy_wait_us_32(10);
     }
     if (st & 0x21) goto end_err;                           // ERR or DF at the end
-    if (st & 0x08) goto end_drq;                           // still offering data
+    sentinel_arm();                                        // review C round 2, C2-1
 
     if (done) *done = count;
     return (int32_t)(count * 512);
@@ -1638,9 +1740,11 @@ read_stall:
     return -1;
 
 read_float:
-    // Nothing drives the bus. The block before this status, if any, came
-    // with no sane status after it, so it is not counted either. The reset
-    // marks the geometry lost (a drive that lost power lost its 91h too).
+    // The command's time ran out with the status floating: nothing drove the
+    // bus, or a busy drive showed FFh throughout. The block before this
+    // status, if any, came with no sane status after it, so it is not
+    // counted either. The reset marks the geometry lost (a drive that lost
+    // power lost its 91h too).
     if (!vouched && s > 0) s--;
     note_failed_sector(lba + s, ms_now() - sector_start);
     record_failure(IDE_FAIL_NO_DRIVE, cmd, st, lba + s, s, count);
@@ -1670,6 +1774,7 @@ read_timeout:
     // No DRQ in the time allowed: the drive may still be retrying, so abort
     // with SRST (and, if it does not come back, one hardware reset). The
     // sectors before this one are good and go to the host (issue #13).
+    if (status_floating(st)) goto read_float;             // round 2, C2-3: the label only
     if (!vouched && s > 0) s--;                            // review C, C-2, as read_float
     note_failed_sector(lba + s, ms_now() - sector_start);
     record_failure(IDE_FAIL_TIMEOUT, cmd, st, lba + s, s, count);
@@ -1689,8 +1794,9 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
         record_failure(IDE_FAIL_NOT_READY, 0, ide_read_reg(7), lba, 0, count);
         return -1;
     }
-    if (!chs_geometry_ok()) {
-        record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);
+    if (!chs_geometry_ok(lba)) {
+        if (!geometry_refusal_recorded)
+            record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, count);
         return -1;
     }
     if (!time_to_send(lba, count)) return -1;              // as for a read
@@ -1771,6 +1877,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
             st = ide_read_reg(7);
             if (st & 0x80) { busy_wait_us_32(10); continue; }   // BSY: other bits not valid
             if (st & 0x01) { write_ok = false; fail_kind = IDE_FAIL_ERR; break; }
+            sentinel_arm();                         // review C round 2, C2-1
             return (int32_t)(count * 512);
         }
     }
@@ -1859,8 +1966,9 @@ int ide_read_long(uint32_t lba, uint8_t *buf) {
         soft_reset_restore();
         return IDE_LONG_NOT_SENT;
     }
-    if (!chs_geometry_ok()) {
-        record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, 1);
+    if (!chs_geometry_ok(lba)) {
+        if (!geometry_refusal_recorded)
+            record_failure(IDE_FAIL_NO_GEOMETRY, 0x91, ide_read_reg(7), lba, 0, 1);
         return IDE_LONG_NOT_SENT;
     }
     if (!time_to_send(lba, 1)) return IDE_LONG_NOT_SENT;
@@ -1888,20 +1996,12 @@ int ide_read_long(uint32_t lba, uint8_t *buf) {
     uint32_t start = ms_now();                              // as a read: the whole command,
     uint32_t limit = work_ms(IDE_CMD_TIMEOUT_MS);           // or what the host command has left
 
-    bool floating = false;                                  // review C, C-2, as a read
-    uint32_t float_since = 0;
     uint32_t stalls = ide_pio_stalls();                     // review C, C-7
     for (;;) {
         if (ms_passed(start, limit)) goto long_timeout;     // no DRQ in time
         if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
         st = ide_read_reg(7);
-        if (status_floating(st)) {
-            if (!floating) { floating = true; float_since = ms_now(); }
-            else if (ms_passed(float_since, IDE_FLOAT_MS)) goto long_float;
-            busy_wait_us_32(10);
-            continue;
-        }
-        floating = false;
+        if (status_floating(st)) { busy_wait_us_32(10); continue; }   // round 2, C2-3: as BSY
         if (st & 0x80) { busy_wait_us_32(10); continue; }  // BSY: other bits not valid yet
         if (st & 0x01) goto long_err;
         if (st & 0x08) break;
@@ -1928,19 +2028,16 @@ int ide_read_long(uint32_t lba, uint8_t *buf) {
     {
         uint32_t end_start = ms_now();
         uint32_t end_limit = recovery_ms(IDE_LONG_END_MS);
-        floating = false;
         for (;;) {
             st = ide_read_reg(7);
-            // Review C, C-2: a floating bus at the end is a drive gone, not
-            // an end; DF is an error like ERR.
+            // Review C, C-2: a floating bus at the end is not an end; DF is an
+            // error like ERR. Round 2, C2-3: waited on like BSY, up to the
+            // time for the end.
             if (status_floating(st)) {
-                if (!floating) { floating = true; float_since = ms_now(); }
-                else if (ms_passed(float_since, IDE_FLOAT_MS)) goto long_float;
                 if (ms_passed(end_start, end_limit)) goto long_float;
                 busy_wait_us_32(10);
                 continue;
             }
-            floating = false;
             if (!(st & 0x80)) {
                 if (st & 0x08) {
                     // DRQ still up: let it settle, polling Alternate Status,
@@ -1954,6 +2051,7 @@ int ide_read_long(uint32_t lba, uint8_t *buf) {
                     // Dropped: read Status again, below, within the same limit.
                 } else {
                     if (st & 0x21) goto long_err;           // ERR, or DF (review C, C-2)
+                    sentinel_arm();                         // review C round 2, C2-1
                     return IDE_LONG_OK;
                 }
             }
@@ -1990,6 +2088,7 @@ long_bad_end:
     return IDE_LONG_ABORTED;
 
 long_timeout:
+    if (status_floating(st)) goto long_float;               // round 2, C2-3: the label only
     record_failure(IDE_FAIL_TIMEOUT, cmd, st, lba, 0, 1);
     soft_reset_restore();
     return IDE_LONG_ABORTED;

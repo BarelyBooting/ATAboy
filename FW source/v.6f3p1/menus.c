@@ -780,7 +780,7 @@ static void run_debug_errors(void) {
         debug_print(2, FG_WHITE, "[Last Failed I/O] none since power-up");
     } else {
         static const char *kinds[] = {"?", "not ready", "ERR", "timeout", "stale data", "no geometry",
-                                      "no time", "bad end", "?", "?", "no drive"};   // 10: review C, C-2
+                                      "no time", "bad end", "?", "?", "no drive", "drive reset itself"};   // 10, 11: review C
         if (f.kind == IDE_FAIL_MANUAL_CHS)      // Ctrl+G: no sector was asked for
             debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X, manual CHS: %s", f.command,
                         f.command == 0x91 ? "drive refused geometry" : "RECALIBRATE did not end");
@@ -789,7 +789,7 @@ static void run_debug_errors(void) {
                         f.command);
         else
             debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
-                        f.command, kinds[f.kind < 11 ? f.kind : 0], (unsigned long)f.lba,
+                        f.command, kinds[f.kind < 12 ? f.kind : 0], (unsigned long)f.lba,
                         (unsigned long)f.done, (unsigned long)f.count);
         // "HW reset": the soft reset did not bring the drive back, so RESET-
         // was used as well (both devices on the cable). The longest row,
@@ -813,6 +813,13 @@ static void run_debug_errors(void) {
     if (sv.valid)
         debug_print(5, FG_WHITE, "Salvaged #%lu: LBA %lu ST:%02X ERR:%02X, READ BUFFER 5Ah",
                     (unsigned long)sv.seq, (unsigned long)sv.lba, sv.status, sv.error);
+    // Review C round 2, C2-1: every drive self-reset seen, and what was done.
+    ide_self_resets_t sr;
+    ide_self_resets(&sr);
+    if (sr.detected)
+        debug_print(6, FG_YELLOW, "Drive reset itself: %lu, last before LBA %lu; 91h again %lu, failed %lu",
+                    (unsigned long)sr.detected, (unsigned long)sr.last_lba,
+                    (unsigned long)sr.idp_resent, (unsigned long)sr.native_failed);
 }
 
 static void run_seek_test(void) {

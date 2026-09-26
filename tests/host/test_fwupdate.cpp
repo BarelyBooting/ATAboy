@@ -77,6 +77,9 @@ int ide_manual_chs_native(uint8_t, uint8_t, uint8_t *st) { bus_use(); *st = 0x50
 bool ide_mchs_no_identify(void) { return false; }
 bool ide_manual_chs_native_active(void) { return false; }
 void ide_manual_chs_native_forget(void) {}
+#ifdef IDE_FAIL_SELF_RESET
+void ide_self_resets(ide_self_resets_t *o) { memset(o, 0, sizeof *o); }
+#endif
 bool ide_idp_sent_since_boot(void) { return false; }
 bool ide_manual_chs_active(void) { return false; }
 // 0.6f3p9: the salvage capture (Debug E).

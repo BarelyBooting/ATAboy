@@ -115,6 +115,9 @@ static void fresh(const char *name) {
 #ifdef MCHS_MODEL_CLEARED
     native_declared = false;
     memset(&refused, 0, sizeof refused);
+#ifdef IDE_SENTINEL_SC
+    memset(&self_resets, 0, sizeof self_resets); sentinel_armed = false;
+#endif
 #endif
     sim_on_read = nullptr;
     saves = 0; busy_until_ns = 0; pend_at_ns = 0;
@@ -229,8 +232,8 @@ static void test_accepted() {
     bool right = got >= 0;
     for (int i = 0; right && i < 512; i++) right = buf[i] == sim.byte_at(1234, i);
     CHECK(right, "read after manual CHS: %d", (int)got);
-    // Review C, C-1: 0x91 again right before the READ, every time.
-    CHECK(sim.cmd_log == (std::vector<uint8_t>{ 0x10, 0x91, 0x91, 0x20 }), "commands after the read: %zu", sim.cmd_log.size());
+    // No 0x91 before the READ (review C round 2: once per mount).
+    CHECK(sim.cmd_log == (std::vector<uint8_t>{ 0x10, 0x91, 0x20 }), "commands after the read: %zu", sim.cmd_log.size());
     // The main menu shows it.
     tty.clear(); update_main_menu();
     CHECK(has("Manual CHS (no IDENTIFY)") && has("1045 Cyl / 2 Hd / 40 SPT"), "main menu");
@@ -599,7 +602,7 @@ static void test_mchs_after_lba_detect() {
     CHECK(cur_cyls == C && config.heads == H && config.spt == S, "geometry %u/%u/%u", cur_cyls, config.heads, config.spt);
     size_t m = sim.cmd_log.size();
     CHECK(read_right(1234), "read went to another sector");
-    CHECK(cmds_since(m) == (std::vector<uint8_t>{ 0x91, 0x20 }) && !(sim.reg[6] & 0x40),   // 0x91 first: review C, C-1
+    CHECK(cmds_since(m) == std::vector<uint8_t>{ 0x20 } && !(sim.reg[6] & 0x40),
           "not a CHS read: device register %02X", sim.reg[6]);
 }
 
@@ -848,8 +851,7 @@ static void test_native_resets() {
     int base = idp_sent();
     sim.bad[4321] = {BAD_HANG, 0};
     read_right(4321, &got);
-    // One before the READ (review C, C-1), one after the soft reset.
-    CHECK(idp_sent() == base + 2, "old mode: 0x91 not sent after the soft reset (%d)", idp_sent() - base);
+    CHECK(idp_sent() == base + 1, "old mode: 0x91 not sent after the soft reset (%d)", idp_sent() - base);
     native_drive("old mode control: recovery over host commands");
     keys("522\r4\r40\ry"); run_manual_chs();
     base = idp_sent();
@@ -1210,10 +1212,10 @@ static void test_p10_layers() {
     // zero check is never reached.
     fresh("layers: chs_geometry_ok refuses no geometry by itself");
     config.cyls = 0; config.heads = 0; config.spt = 0; chs_geometry_lost = true;
-    CHECK(!chs_geometry_ok() && refused.idp_zero == 0 && sim.cmd_log.empty(), "zero refusals %u, %zu commands",
+    CHECK(!chs_geometry_ok(0) && refused.idp_zero == 0 && sim.cmd_log.empty(), "zero refusals %u, %zu commands",
           refused.idp_zero, sim.cmd_log.size());
     config.heads = 4;                               // 0 sectors only
-    CHECK(!chs_geometry_ok() && refused.idp_zero == 0 && sim.cmd_log.empty(), "zero refusals %u (spt 0)", refused.idp_zero);
+    CHECK(!chs_geometry_ok(0) && refused.idp_zero == 0 && sim.cmd_log.empty(), "zero refusals %u (spt 0)", refused.idp_zero);
     // ide_set_geometry's own zero check.
     fresh("layers: ide_set_geometry refuses 0 heads or 0 sectors");
     CHECK(!ide_set_geometry(0, 40) && !ide_set_geometry(4, 0) && refused.idp_zero == 2 && sim.cmd_log.empty(),
@@ -1259,6 +1261,25 @@ static void test_c3_c5_c8() {
     last_fail.done = 3; last_fail.count = 8;
     tty.clear(); run_debug_errors();
     CHECK(has("[Last Failed I/O] cmd 20 no drive at LBA 5003, 3 of 8 done"), "Debug E");
+#ifdef IDE_FAIL_SELF_RESET
+    // Review C round 2, C2-1: a self-reset in the power-up default mode: the
+    // next command fails, no 91h, and Debug E shows it; the one after reads.
+    native_drive("C2-1: native, the drive resets itself");
+    ctrl_g_native();
+    CHECK(read_right(1234), "before");
+    sim.hw_reset_line(false, mock_now_ns); mock_now_ns += 1000000;
+    sim.hw_reset_line(true, mock_now_ns); mock_now_ns += 2000000000ull;
+    int32_t g = 0;
+    read_right(1234, &g);
+    ide_fail_t fr; ide_last_failure(&fr);
+    ide_self_resets_t srs; ide_self_resets(&srs);
+    CHECK(g < 0 && idp_sent() == 0 && fr.kind == IDE_FAIL_SELF_RESET && fr.lba == 1234 && srs.detected == 1 &&
+          srs.native_failed == 1 && srs.idp_resent == 0, "read %d, 0x91 %d, kind %u, counts %u %u", (int)g, idp_sent(), fr.kind,
+          srs.detected, srs.native_failed);
+    tty.clear(); run_debug_errors();
+    CHECK(has("drive reset itself at LBA 1234") && has("Drive reset itself: 1, last before LBA 1234; 91h again 0, failed 1"), "Debug E");
+    CHECK(read_right(1234) && idp_sent() == 0, "the next read");
+#endif
     // C-8: a drive that floats the bus (FFh) for 5 s after RESET- is waited for.
     native_drive("C-8: FFh for 5 s after RESET-");
     sim.t_float = 5000000000ull;

@@ -428,12 +428,14 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
 // Anything else: CHECK CONDITION, ILLEGAL REQUEST, 24h/00h (invalid field in
 // CDB), no data. The answer is SALV_LEN bytes, cut to the allocation length:
 //   0   "ATBSALV1"
-//   8   valid: 1 a capture exists, 0 none (then everything after is 0)
+//   8   valid: 1 a capture exists, 0 none (then 9 to 23 and 32 on are 0)
 //   9   ATA status at the failure     10  ATA error     11  ATA command
 //   12  u32 LE: the failed sector, as the host numbers it
 //   16  u32 LE: sequence, 1 for the first capture since power-up, +1 each
 //   20  u32 LE: ms since boot at the capture
-//   24..31  0
+//   24  u32 LE: drive self-resets seen since power-up (review C round 2,
+//           C2-1; ide_self_resets), whether there is a capture or not
+//   28  u32 LE: of those, how many were followed by 91h sent again
 //   32..543 the 512 bytes as the drive offered them
 // It does not touch the drive, and works mounted or not.
 #define SALV_BUFFER_ID  0x5A
@@ -465,6 +467,10 @@ static int32_t read_buffer(uint8_t lun, uint8_t const cdb[16], uint8_t *buf, uin
         put_le32(r + 20, sv.ms);
         memcpy(r + 32, sv.data, IDE_SALVAGE_BYTES);
     }
+    ide_self_resets_t srs;
+    ide_self_resets(&srs);
+    put_le32(r + 24, srs.detected);
+    put_le32(r + 28, srs.idp_resent);
     uint32_t n = alloc < SALV_LEN ? alloc : SALV_LEN;
     if (n > bufsize) n = bufsize;           // never past the host's transfer length
     memcpy(buf, r, n);

@@ -162,6 +162,9 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     chs_geometry_lost = false;
     manual_chs_active = false;
     native_geo.on = false; idp_written = false; mchs_no_identify = false;   // 0.6f3p10: power-up
+#ifdef IDE_SENTINEL_SC
+    memset(&self_resets, 0, sizeof self_resets); sentinel_armed = false;
+#endif
     memset(&salvage, 0, sizeof salvage);            // power-up: no salvage capture
     tud_mount_cb();
     reset_worst();
@@ -898,8 +901,7 @@ static void test_lone_slave_hw_reset(Mode m) {
     CHECK(sim.srst == 1 && sim.hw_resets == 1, "srst %d hardware resets %d", sim.srst, sim.hw_resets);
     CHECK(((sim.reg[6] >> 4) & 1) == 1, "slave not selected after the hardware reset (DH %02X)", sim.reg[6]);
     if (m == CHS)
-        // Two since review C, C-1: one before the WRITE, one after the reset.
-        CHECK(sim.geo_valid && sim.heads == 5 && sim.spt == 34 && sim.init_params == 2,
+        CHECK(sim.geo_valid && sim.heads == 5 && sim.spt == 34 && sim.init_params == 1,
               "geometry after the hardware reset: %d %u x %u, %d INITIALIZE", sim.geo_valid, sim.heads, sim.spt, sim.init_params);
     CHECK(sim.cmd_count[0x10] >= 1, "no RECALIBRATE after the hardware reset");
     CHECK(ms_since(t0) < IDE_CMD_TIMEOUT_MS + 2 * 31000 + 5000, "took %llu ms", (unsigned long long)ms_since(t0));
@@ -2257,9 +2259,9 @@ static void test_recal_after_hw_reset() {
     ide_fail_t f; ide_last_failure(&f);
     CHECK(r < 0 && f.hw_reset && f.reset_failed && sim.cmd_count[0x10] == 1, "hw %d failed %d RECAL %d",
           f.hw_reset, f.reset_failed, sim.cmd_count[0x10]);
-    // Review C, C-1: one 0x91 goes out before the READ; none after the
-    // RECALIBRATE that never ended.
-    CHECK(sim.init_params == 1 && sim.cmd_log.back() == 0x10 && sim.violations == 0, "0x91 sent %d times (last %02X), violations %d",
+    // None after the RECALIBRATE that never ended (and, since review C round
+    // 2, none before the READ either: 91h once per mount).
+    CHECK(sim.init_params == 0 && sim.cmd_log.back() == 0x10 && sim.violations == 0, "0x91 sent %d times (last %02X), violations %d",
           sim.init_params, sim.cmd_log.back(), sim.violations);
 
     setup("RECALIBRATE after RESET-: slow to start, no INTRQ", CHS);
@@ -2271,7 +2273,7 @@ static void test_recal_after_hw_reset() {
     sim.bad[5003] = {BAD_HANG, 0};
     r = ide_read_sectors_partial(5000, 8, buf, &done);
     ide_last_failure(&f);
-    CHECK(r < 0 && f.hw_reset && !f.reset_failed && sim.init_params == 2, "hw %d failed %d 0x91 %d", f.hw_reset, f.reset_failed,
+    CHECK(r < 0 && f.hw_reset && !f.reset_failed && sim.init_params == 1, "hw %d failed %d 0x91 %d", f.hw_reset, f.reset_failed,
           sim.init_params);
     CHECK(sim.violations == 0 && sim.geo_valid && sim.heads == 5, "violations %d (0x91 while RECALIBRATE ran)", sim.violations);
 }
@@ -2564,8 +2566,7 @@ static void test_geometry_waits_for_time() {
     CHECK(f.pending && !f.reset_failed, "record: pending %d failed %d", f.pending, f.reset_failed);
     h = host_read10(5000, 8);
     ide_last_failure(&f);
-    // Two since review C, C-1: the recovery's, then the one before the READ.
-    CHECK(h.ok && matches_medium(h, 5000) && sim.init_params == idp + 2, "next command: ok %d, 0x91 %d", h.ok, sim.init_params - idp);
+    CHECK(h.ok && matches_medium(h, 5000) && sim.init_params == idp + 1, "next command: ok %d, 0x91 %d", h.ok, sim.init_params - idp);
     CHECK(!f.pending && !f.reset_failed && sim.geo_valid && sim.heads == 5 && sim.spt == 34, "after: pending %d failed %d geometry %d",
           f.pending, f.reset_failed, sim.geo_valid);
     CHECK(sim.violations == 0 && sim.hw_resets == 1, "violations %d hw %d", sim.violations, sim.hw_resets);
@@ -2970,9 +2971,8 @@ static void test_read_long_ok(Mode m) {
         int reads = sim.data_reads, n = sim.commands;
         SatResult s = read_long_cmd(lba, 516);
         CHECK(long_data_right(s, lba, 4), "lba %u: r %d", lba, s.r);
-        // CHS: 0x91 first, since review C, C-1.
-        CHECK(sim.commands == n + (m == CHS ? 2 : 1) && sim.cmd_log.back() == 0x23 && sim.long_lba == lba && sim.long_bad_count == 0 &&
-              (m != CHS || sim.cmd_log[sim.cmd_log.size() - 2] == 0x91),
+        // One command, no 91h first (review C round 2: once per mount).
+        CHECK(sim.commands == n + 1 && sim.cmd_log.back() == 0x23 && sim.long_lba == lba && sim.long_bad_count == 0,
               "lba %u: %d commands, last %02X, drive read %u", lba, sim.commands - n, sim.cmd_log.back(), sim.long_lba);
         CHECK(sim.data_reads == reads + 256 + 4, "lba %u: %d data reads", lba, sim.data_reads - reads);
         CHECK(((sim.reg[6] & 0x40) != 0) == (m == LBA), "lba %u: device register %02X", lba, sim.reg[6]);
@@ -3345,6 +3345,13 @@ static void test_c2_read_end(Mode m) {
     ide_last_failure(&f);
     CHECK(r < 0 && done == 7 && f.kind == IDE_FAIL_ERR && f.status == 0x51, "ERR: r %d done %u kind %u st %02X", r, done, f.kind, f.status);
 
+    // Round 2: BSY and DRQ clear but DRDY never comes back (10h): not an end.
+    n = std::string("C-2: not ready at the end, ") + mn; setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.end_status = 0x10;
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    CHECK(r < 0 && done == 7, "not ready at the end: r %d done %u", r, done);
+
     n = std::string("C-2: power lost on the last block, ") + mn; setup(n.c_str(), m);
     if (m == CHS) chs_user_geometry();
     sim.dead_at = 5007;
@@ -3446,6 +3453,88 @@ static void test_c4_ctrlg_write_protect() {
     setup("C-4: no Ctrl+G, write protect off", CHS);
     config.drive_write_protected = false;
     CHECK(tud_msc_is_writable_cb(0), "not writable without a Ctrl+G");
+}
+
+// ---- review C, round 2 ---------------------------------------------------------
+// C2-1: 91h once per mount, and a drive self-reset caught by the sentinel.
+static void test_c2r_once_per_mount() {
+    setup("C2-1: 91h once per mount, CHS", CHS);
+    chs_user_geometry();                            // one 91h, not counted (init_params = 0)
+    for (uint32_t lba = 0; lba < 400; lba += 8) {
+        HostRead h = host_read10(lba, 8);
+        CHECK(h.ok && matches_medium(h, lba), "read at %u", lba);
+    }
+    CHECK(sim.init_params == 0, "0x91 sent %d times over 50 reads", sim.init_params);
+    ide_self_resets_t sr; ide_self_resets(&sr);
+    CHECK(sr.detected == 0, "self-resets seen on a quiet drive: %u", sr.detected);
+
+    setup("C2-1: a self-reset between reads, 91h mode", CHS);
+    chs_user_geometry();
+    HostRead h = host_read10(5000, 8);
+    CHECK(h.ok && matches_medium(h, 5000), "before");
+    sim.hw_reset_line(false, mock_now_ns);          // not sent by the firmware
+    mock_now_ns += 1000000;
+    sim.hw_reset_line(true, mock_now_ns);
+    mock_now_ns += 2000000000ull;
+    h = host_read10(5000, 8);
+    ide_self_resets(&sr);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(h.ok && matches_medium(h, 5000) && sim.init_params == 1, "after: ok %d right %d, 0x91 %d", h.ok, matches_medium(h, 5000),
+          sim.init_params);
+    CHECK(sr.detected == 1 && sr.idp_resent == 1 && sr.native_failed == 0 && sr.last_lba == 5000 && f.kind == IDE_FAIL_SELF_RESET,
+          "counts %u %u %u lba %u, record %u", sr.detected, sr.idp_resent, sr.native_failed, sr.last_lba, f.kind);
+    SatResult b = sat_cmd({ 0x3C, 0x02, 0x5A, 0, 0, 0, 0x00, 0x02, 0x20, 0 }, 544, true);
+    CHECK(b.r == 544 && le32_at(b.data, 24) == 1 && le32_at(b.data, 28) == 1, "READ BUFFER counts %u %u",
+          b.data.size() >= 32 ? le32_at(b.data, 24) : 0, b.data.size() >= 32 ? le32_at(b.data, 28) : 0);
+    h = host_read10(5008, 8);
+    CHECK(h.ok && sim.init_params == 1, "and not again: 0x91 %d", sim.init_params);
+
+    // ide_set_geometry no longer takes the status 1 us after 91h as its
+    // answer: a drive slow to raise BSY, with an ERR left by a failed read.
+    setup("C2-1: 91h to a drive slow to start it, after an ERR", CHS);
+    chs_user_geometry();
+    sim.bad[5003] = {BAD_ERR, 0};
+    uint8_t buf[8 * 512]; uint32_t done = 0;
+    ide_read_sectors_partial(5000, 8, buf, &done);  // leaves ERR in the status
+    sim.bad.clear();
+    sim.t_bsy_delay = 5400;
+    sim.t_idp = 2000000;
+    sim.violations = 0;
+    CHECK(ide_set_geometry(5, 34) && sim.geo_valid, "91h taken as refused: the stale ERR read as its answer");
+    int32_t r = ide_read_sectors_partial(6000, 8, buf, &done);
+    CHECK(r == 8 * 512 && sim.violations == 0, "read after: r %d, %d task file writes while busy", r, sim.violations);
+}
+
+// C2-2: DRQ that drops a moment after the last word is not a bad end.
+static void test_c2r_drq_settle(Mode m) {
+    uint8_t buf[8 * 512]; uint32_t done = 0; ide_fail_t f;
+    std::string n = std::string("C2-2: DRQ drops 200 us after the last word, ") + (m == CHS ? "CHS" : "LBA");
+    setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.linger_reads = true; sim.drq_linger = 200000;
+    int32_t r = ide_read_sectors_partial(5000, 8, buf, &done);
+    CHECK(r == 8 * 512 && done == 8 && sim.srst == 0, "r %d done %u srst %d", r, done, sim.srst);
+    n = std::string("C2-2: DRQ still up 5 ms after the last word, ") + (m == CHS ? "CHS" : "LBA");
+    setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.linger_reads = true; sim.drq_linger = 5000000;
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_last_failure(&f);
+    CHECK(r < 0 && done == 7 && f.kind == IDE_FAIL_BAD_END, "r %d done %u kind %u", r, done, f.kind);
+}
+
+// C2-3: a working drive that shows FFh while busy on a slow sector.
+static void test_c2r_ff_while_busy(Mode m) {
+    std::string n = std::string("C2-3: FFh while busy, a 600 ms sector, ") + (m == CHS ? "CHS" : "LBA");
+    setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.ff_while_busy = true;
+    sim.pause[5003] = 600000000ull;
+    uint8_t buf[8 * 512]; uint32_t done = 0;
+    int32_t r = ide_read_sectors_partial(5000, 8, buf, &done);
+    bool right = r == 8 * 512;
+    for (int i = 0; right && i < 8 * 512; i++) right = buf[i] == sim.byte_at(5000 + i / 512, i % 512);
+    CHECK(right && sim.srst == 0, "r %d right %d srst %d", r, right, sim.srst);
 }
 
 int main() {
@@ -3553,6 +3642,11 @@ int main() {
     test_c2_read_long_end();
     test_c1_outside_reset();
     test_c4_ctrlg_write_protect();
+    test_c2r_once_per_mount();
+    test_c2r_drq_settle(LBA);
+    test_c2r_drq_settle(CHS);
+    test_c2r_ff_while_busy(LBA);
+    test_c2r_ff_while_busy(CHS);
     test_read_long_drive_errors();
     test_read_long_ili_delivery();
     test_read_long_recovery_pending();

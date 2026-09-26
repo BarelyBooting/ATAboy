@@ -98,8 +98,12 @@ void    ide_host_cmd_leave(void);
                                 // refused INITIALIZE DEVICE PARAMETERS (command says which)
 #define IDE_FAIL_MCHS_NOT_READY 9   // manual CHS, power-up default mode: RECALIBRATE (10h)
                                 // ended but the drive was not ready, no ERR, within 1 s
-#define IDE_FAIL_NO_DRIVE   10  // status FFh or 7Fh for IDE_FLOAT_MS: nothing drives the bus
-                                // (drive unpowered, unplugged or dead); review C, C-2
+#define IDE_FAIL_NO_DRIVE   10  // no DRQ or end in the command's time, the status FFh or 7Fh
+                                // all along: nothing drove the bus, or a busy drive showed FFh
+                                // (review C, C-2; round 2, C2-3)
+#define IDE_FAIL_SELF_RESET 11  // CHS: before a command, Sector Count and Sector Number no longer
+                                // held what the firmware left there: the drive reset itself
+                                // (review C round 2, C2-1). lba: the sector about to be read
 typedef struct {
     uint8_t  kind;          // IDE_FAIL_*
     uint8_t  command;       // ATA command that failed
@@ -127,6 +131,18 @@ typedef struct {
 
 // Copy of the last failure record (kind == IDE_FAIL_NONE if none yet).
 void    ide_last_failure(ide_fail_t *out);
+
+// Review C round 2, C2-1: drive self-resets seen since power-up (the
+// sentinel in Sector Count and Sector Number gone before a CHS command),
+// what was done about each, and the last sector concerned. Debug E and
+// READ BUFFER (bytes 24 to 31) show them.
+typedef struct {
+    uint32_t detected;      // self-resets seen
+    uint32_t idp_resent;    // 91h mode: 91h sent again after one, and accepted
+    uint32_t native_failed; // power-up default mode: the command failed instead
+    uint32_t last_lba;
+} ide_self_resets_t;
+void    ide_self_resets(ide_self_resets_t *out);
 
 // ---------------------------------------------------------------------------
 //  Salvage capture (0.6f3p9)
