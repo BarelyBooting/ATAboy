@@ -189,7 +189,9 @@ struct SimDrive {
     // for the next one. Data read meanwhile is FFFFh, as on this board.
     bool     mid_linger = false;
     uint32_t mid_linger_from = 0;  // only after the blocks from this LBA on
+    bool     mid_linger_once = false;   // round 3: only after the block at mid_linger_from
     uint64_t write_linger = 0;     // L-7: DRQ stays up this long after each written block
+    uint32_t write_linger_at = 0xFFFFFFFFu;   // round 3: only after the block written to this LBA
     uint32_t df_mid_at = 0xFFFFFFFFu;   // L-8: this block is offered with DF set (status 78h)
     uint8_t  identify_end_status = 0;   // L-3: IDENTIFY ends with this status instead of 50h
     uint8_t  write_end_status = 0;      // L-7: a write ends with this status instead of 50h
@@ -703,7 +705,8 @@ struct SimDrive {
                     }
                     else {
                         phase = BUSY_IN; status = 0x80; ready_at = now + sector_delay(cur);
-                        if (mid_linger && drq_linger && cur - 1 >= mid_linger_from) {
+                        if (mid_linger && drq_linger && cur - 1 >= mid_linger_from &&
+                            (!mid_linger_once || cur - 1 == mid_linger_from)) {
                             status = 0x58; lingering = true; linger_until = now + drq_linger;
                             if (ready_at < linger_until) ready_at = linger_until;
                         }
@@ -728,7 +731,7 @@ struct SimDrive {
             uint64_t extra = p != pause.end() ? p->second : 0;
             cur++; left--;
             phase = BUSY_COMMIT; status = 0x80; ready_at = now + 1000 + extra;
-            if (write_linger) {
+            if (write_linger && (write_linger_at == 0xFFFFFFFFu || cur - 1 == write_linger_at)) {
                 status = 0x58; lingering = true; linger_until = now + write_linger;
                 if (ready_at < linger_until) ready_at = linger_until;
             }

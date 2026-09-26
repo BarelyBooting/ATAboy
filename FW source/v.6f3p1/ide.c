@@ -1751,6 +1751,13 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
     // leaves FFFFh words and status FFh behind.
     bool vouched = true;
     bool irq_low = false;                                  // R-1: INTRQ low after the block's Status read
+    // Holistic review round 3 (R3-1): the first block taken with no drop
+    // seen before it. If a later failure ends the command, only the blocks
+    // before it are handed over: from it on the firmware's block count may be
+    // ahead of the drive's (a stale DRQ read as a block), and those "good"
+    // sectors would be other sectors' data.
+    uint32_t first_unwit = UINT32_MAX;
+#define CLAMP_DONE(x) ((uint32_t)(x) < first_unwit ? (uint32_t)(x) : first_unwit)
     uint32_t stalls = ide_pio_stalls();                    // review C, C-7: IORDY held too long
 
     for (s = 0; s < count; s++) {
@@ -1819,7 +1826,10 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
                 if (us_now() - t0 >= IDE_READ_SETTLE_US) break;
                 busy_wait_us_32(1);                        // polled closely: a short BSY is seen
             }
-            if (!seen) unwitnessed_blocks++;
+            if (!seen) {
+                unwitnessed_blocks++;
+                if (first_unwit == UINT32_MAX) first_unwit = s + 1;
+            }
         }
     }
 
@@ -1868,7 +1878,7 @@ end_err:
     note_failed_sector(lba + count - 1, ms_now() - sector_start);
     record_failure(IDE_FAIL_ERR, cmd, st, lba + count - 1, count - 1, count);
     if ((st & 0x20) || !idle_after_error(2000)) soft_reset_restore();
-    if (done) *done = count - 1;
+    if (done) *done = CLAMP_DONE(count - 1);
     return -1;
 
 end_drq:
@@ -1886,7 +1896,7 @@ end_busy:
     note_failed_sector(lba + count - 1, ms_now() - sector_start);
     record_failure(IDE_FAIL_TIMEOUT, cmd, st, lba + count - 1, count - 1, count);
     soft_reset_restore();
-    if (done) *done = count - 1;
+    if (done) *done = CLAMP_DONE(count - 1);
     return -1;
 
 read_stall:
@@ -1896,7 +1906,7 @@ read_stall:
     note_failed_sector(lba + s, ms_now() - sector_start);
     record_failure(IDE_FAIL_BAD_END, cmd, ide_read_reg(7), lba + s, s, count);
     soft_reset_restore();
-    if (done) *done = s;
+    if (done) *done = CLAMP_DONE(s);
     return -1;
 
 read_float:
@@ -1909,7 +1919,7 @@ read_float:
     note_failed_sector(lba + s, ms_now() - sector_start);
     record_failure(IDE_FAIL_NO_DRIVE, cmd, st, lba + s, s, count);
     soft_reset_restore();
-    if (done) *done = s;
+    if (done) *done = CLAMP_DONE(s);
     return -1;
 
 read_err:
@@ -1927,7 +1937,7 @@ read_err:
         last_fail.salvaged = true;
     }
     if ((st & 0x20) || !idle_after_error(2000)) soft_reset_restore();   // DF: always reset (L-8)
-    if (done) *done = s;
+    if (done) *done = CLAMP_DONE(s);
     return -1;
 
 read_timeout:
@@ -1939,9 +1949,10 @@ read_timeout:
     note_failed_sector(lba + s, ms_now() - sector_start);
     record_failure(IDE_FAIL_TIMEOUT, cmd, st, lba + s, s, count);
     soft_reset_restore();
-    if (done) *done = s;
+    if (done) *done = CLAMP_DONE(s);
     return -1;
 }
+#undef CLAMP_DONE
 
 int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     uint32_t s = 0;
@@ -2003,6 +2014,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
 
     bool write_ok = true;
     bool w_irq_low = false;                                // R-1: INTRQ low after the block's Status read
+    uint32_t w_first_unwit = UINT32_MAX;                   // R3-1, as for reads
 
     for (s = 0; s < count; s++) {
         // Poll for DRQ — INTRQ not asserted for first sector of PIO write per ATA spec;
@@ -2041,7 +2053,10 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
                 if (us_now() - t0 >= IDE_READ_SETTLE_US) break;
                 busy_wait_us_32(1);
             }
-            if (!seen) unwitnessed_blocks++;
+            if (!seen) {
+                unwitnessed_blocks++;
+                if (w_first_unwit == UINT32_MAX) w_first_unwit = s + 1;
+            }
         }
     }
 
@@ -2074,6 +2089,10 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     // For a write, 'done' is the number of sectors sent to the drive. The
     // write is never sent again by the firmware, here or by a later host
     // command's recovery; retrying is the host's decision.
+    // Round 3 (R3-1): sent means sent to the sector the firmware meant, so
+    // not past the first block taken with no drop seen (after a stale DRQ,
+    // a block's data may have gone to the sector before it).
+    if (s > w_first_unwit) s = w_first_unwit;
     record_failure(fail_kind, cmd, st, lba + s, s, count);
     soft_reset_restore();
     return -1;

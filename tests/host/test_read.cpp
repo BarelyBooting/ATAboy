@@ -3833,6 +3833,53 @@ static void test_r1_linger(Mode m) {
             }
 }
 
+// ---- holistic review round 3 (R3-1): one stale DRQ, then a later failure --------
+// DRQ lingers 2 ms after block k only (so the firmware takes it as the next
+// block, unwitnessed, and its count runs one ahead of the drive's), then the
+// command fails at a later sector m (ERR, ERR with data, or a hang). The
+// failure paths hand over "the sectors before the failing one": never past
+// the first unwitnessed block. Every byte the host gets is the medium's.
+static void test_r3_once_then_fail(Mode m) {
+    const BadMode modes[] = { BAD_ERR, BAD_ERR_DRQ, BAD_HANG };
+    const char *mnames[] = { "ERR", "ERR with data", "hang" };
+    for (uint32_t k = 5000; k <= 5005; k++)
+        for (uint32_t bad = k + 1; bad <= 5007; bad++)
+            for (int mi = 0; mi < 3; mi++)
+                for (int irq = 0; irq < 3; irq++) {
+                    if (modes[mi] == BAD_HANG && irq != 0) continue;      // a hang is the same with any INTRQ
+                    std::string n = std::string("R3-1: DRQ once after ") + std::to_string(k) + ", " + mnames[mi] + " at " +
+                                    std::to_string(bad) + ", INTRQ " + (irq == 0 ? "wired, " : irq == 1 ? "not wired, " : "stuck, ") +
+                                    (m == CHS ? "CHS" : "LBA");
+                    setup(n.c_str(), m);
+                    if (m == CHS) chs_user_geometry();
+                    sim_reg_cost_ns = 2000; sim_word_ns = 800;
+                    sim.intrq_wired = irq != 1; sim.intrq_stuck = irq == 2;
+                    sim.mid_linger = true; sim.mid_linger_once = true; sim.mid_linger_from = k; sim.drq_linger = 2000000;
+                    sim.bad[bad] = {modes[mi], 0};
+                    HostRead h = host_read10(5000, 8);
+                    CHECK(matches_medium(h, 5000), "%zu bytes handed over (ok %d), not all the medium's", h.data.size(), h.ok);
+                    CHECK(!h.ok || h.data.size() < 8 * 512 || matches_medium(h, 5000), "GOOD with wrong data");
+                }
+}
+
+// The same for a write: DRQ lingers 2 ms after one block, the next block's
+// data goes in while the drive is not taking it, and the write fails at its
+// end. The record says only the blocks before the unwitnessed one were sent.
+static void test_r3_write_once() {
+    for (uint32_t k = 3000; k <= 3002; k++) {
+        std::string n = std::string("R3-1 write: DRQ once after ") + std::to_string(k);
+        setup(n.c_str(), LBA);
+        config.drive_write_protected = false;
+        sim_reg_cost_ns = 2000; sim_word_ns = 800;
+        sim.intrq_wired = false;
+        sim.write_linger = 2000000; sim.write_linger_at = k;
+        std::vector<uint8_t> w = fill512(4, 5);
+        int32_t r = ide_write_sectors(3000, 4, w.data());
+        ide_fail_t f; ide_last_failure(&f);
+        CHECK(r < 0 && f.done <= k + 1 - 3000, "r %d, recorded %u sent (the first unwitnessed block is %u)", r, f.done, k + 1 - 3000);
+    }
+}
+
 int main() {
     // The budget is a design number, not only what the helpers measure
     // against: 10 s under the 30 s that Linux and the project's tools give a
@@ -3943,6 +3990,9 @@ int main() {
     test_r1_compliant(LBA);
     test_r1_compliant(CHS);
     test_r1_linger(LBA);
+    test_r3_once_then_fail(LBA);
+    test_r3_once_then_fail(CHS);
+    test_r3_write_once();
     test_r1_linger(CHS);
     test_h1_mid_linger(CHS);
     test_l7_write_linger();
