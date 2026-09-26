@@ -53,6 +53,8 @@ void ide_last_failure(ide_fail_t *out) { *out = stub_fail; }
 #ifdef IDE_MCHS_OK          // 0.6f3p8 on
 bool ide_recovery_pending(void) { return false; }
 int ide_manual_chs(uint8_t, uint8_t, uint8_t *st) { *st = 0x50; return IDE_MCHS_OK; }
+// 0.6f3p10 (unused by older menus.c)
+int ide_manual_chs_native(uint8_t, uint8_t, uint8_t *st) { *st = 0x50; return IDE_MCHS_OK; }
 #endif
 #ifdef SAVE_REFUSED_MCHS    // review of 0.6f3p8, L-1
 bool ide_manual_chs_active(void) { return true; }
@@ -197,6 +199,39 @@ int main(int argc, char **argv) {
         stub_fail.error = 0x04; stub_fail.tf[0] = 40; stub_fail.tf[4] = 0xA1;
         draw_bios_frame(); draw_debug_overlay(); run_debug_errors();
         save(dir, "debug-errors-mchs");
+    }
+#endif
+#ifdef MCHS_TITLE_NATIVE
+    // 0.6f3p10: the power-up default mode (no 91h). New screens only.
+    {
+        char f[3][6] = {"522", "4", ""};
+        reset_state();
+        draw_bios_frame(); update_main_menu(); draw_manual_chs_mode(f, 2, MCHS_NOTE_NATIVE, false, true);
+        save(dir, "mchs-native-typing");
+        strcpy(f[2], "40");
+        reset_state();
+        draw_bios_frame(); update_main_menu();
+        draw_manual_chs_mode(f, -1, "Y: reset Master, keep 522/4/40, no 91h   N: edit", true, true);
+        save(dir, "mchs-native-ask");
+        reset_state();
+        draw_bios_frame(); update_main_menu();
+        draw_manual_chs_mode(f, -1, "Resetting the drive, then 10h only (no 91h). Up to a minute.", false, true);
+        save(dir, "mchs-native-working");
+        reset_state();
+        strcpy(hdd_model_raw, MCHS_MODEL_NATIVE); cur_cyls = 522; cur_heads = 4; cur_spt = 40;
+        draw_bios_frame(); update_main_menu();
+        save(dir, "main-mchs-native-set");
+        reset_state();
+        show_detect_result = true; strcpy(hdd_status_text, "\033[91;1mManual CHS: drive not ready, no 91h (ST:51)");
+        draw_bios_frame(); update_main_menu(); draw_error_box(hdd_status_text, false);
+        save(dir, "mchs-native-not-ready");
+        reset_state();
+        current_screen = SCREEN_DEBUG;
+        memset(&stub_fail, 0, sizeof stub_fail);
+        stub_fail.kind = IDE_FAIL_MANUAL_CHS; stub_fail.command = 0x10; stub_fail.status = 0x51;
+        stub_fail.error = 0x02;
+        draw_bios_frame(); draw_debug_overlay(); run_debug_errors();
+        save(dir, "debug-errors-mchs-native");
     }
 #endif
 #ifdef IORDY_NOTE

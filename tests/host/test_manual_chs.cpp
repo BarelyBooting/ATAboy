@@ -22,6 +22,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,7 @@ static void fresh(const char *name) {
     rec.stage = REC_NONE; memset(&last_fail, 0, sizeof last_fail);
     chs_geometry_lost = false;
     manual_chs_active = false; iordy_held = false;
+    native_geo.on = false;
     saves = 0; busy_until_ns = 0; pend_at_ns = 0;
     tty.clear(); rx.clear(); rxi = 0;
     hang_limit_ns = mock_now_ns + 300000000000ull;  // 300 s of mock time
@@ -667,6 +669,251 @@ static void test_save_setup() {
     CHECK(save_setup() && saves == 1 && config.use_lba_mode, "saves %d", saves);
 }
 
+// ---- 10. 0.6f3p10: the power-up default mode (no 0x91 at all) -----------------
+// Ctrl+G pressed again in the box selects it; the drive is then sent RESET-
+// and RECALIBRATE and never INITIALIZE DEVICE PARAMETERS, at the mount or
+// after any reset. The simulated drive's power-up default is its native
+// translation (sim.native_heads/native_spt, used whenever no 0x91 is in
+// force), here the CP3044's documented 522/4/40.
+static const uint32_t NC = 522, NH = 4, NS = 40;
+static int idp_sent() { auto it = sim.cmd_count.find(0x91); return it == sim.cmd_count.end() ? 0 : it->second; }
+static void native_drive(const char *name) {
+    fresh(name);
+    sim.nsect = NC * NH * NS; sim.native_heads = NH; sim.native_spt = NS;
+}
+static void ctrl_g_native(const char *geo = "522\r4\r40\r") {
+    keys(std::string("\x07") + geo + "y");
+    run_manual_chs();
+}
+// A host command as usb.c brackets one (20 s budget), reading one sector.
+static int32_t host_read(uint32_t lba, bool *right) {
+    uint8_t buf[512];
+    ide_host_cmd_begin(); ide_host_cmd_enter();
+    int32_t got = ide_read_sectors(lba, 1, buf);
+    ide_host_cmd_leave();
+    bool ok = got >= 0;
+    for (int i = 0; ok && i < 512; i++) ok = buf[i] == sim.byte_at(lba, i);
+    if (right) *right = ok;
+    return got;
+}
+
+static void test_native_accepted() {
+    native_drive("native: accepted");
+    earlier_setup();
+    keys("\x07" "522\r4\r40\ry");
+    bool overlay = run_manual_chs();
+    CHECK(!overlay && !show_detect_result, "overlay %d (%s)", overlay, hdd_status_text);
+    CHECK(sim.cmd_log == std::vector<uint8_t>{ 0x10 } && sim.hw_resets == 1 && sim.srst == 0,
+          "commands %zu (first %02X), resets %d, SRST %d", sim.cmd_log.size(),
+          sim.cmd_log.empty() ? 0 : sim.cmd_log[0], sim.hw_resets, sim.srst);
+    CHECK(idp_sent() == 0 && sim.init_params == 0 && !sim.geo_valid, "0x91 sent: %d", idp_sent());
+    CHECK(no_identify(), "IDENTIFY sent");
+    CHECK(cur_cyls == NC && cur_heads == NH && cur_spt == NS && !use_lba_mode, "shown %u/%u/%u", cur_cyls, cur_heads, cur_spt);
+    CHECK(config.cyls == NC && config.heads == NH && config.spt == NS && !config.use_lba_mode, "config %u/%u/%u",
+          config.cyls, config.heads, config.spt);
+    CHECK(strcmp(hdd_model_raw, "Manual CHS (no IDENTIFY) no 91h") == 0, "Current HDD: \"%s\"", hdd_model_raw);
+    CHECK(strncmp(hdd_model_raw, MCHS_MODEL, strlen(MCHS_MODEL)) == 0, "Current HDD does not start with the old text");
+    CHECK(ide_manual_chs_active() && ide_manual_chs_native_active(), "flags %d %d",
+          ide_manual_chs_active(), ide_manual_chs_native_active());
+    CHECK(saves == 0, "EEPROM written %d times", saves);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(f.kind == IDE_FAIL_NONE, "a failure recorded: kind %u", f.kind);
+    CHECK(has("Manual CHS (no IDENTIFY) - power-up default, no 91h") && has("Ctrl+G: 91h mode") &&
+          has("Only if C/H/S IS the drive's power-up default.") &&
+          has("Y: reset Master, keep 522/4/40, no 91h   N: edit") &&
+          has("Resetting the drive, then 10h only (no 91h). Up to a minute."), "native screens");
+    CHECK(!has("(91h)   N: edit") && !has("then 10h and 91h"), "the old mode's question or working line shown");
+#if ATABOY_SAT
+    ide_id_words_t w; ide_id_words(&w);
+    CHECK(!w.valid, "IDENTIFY words still held for this drive");
+#endif
+    size_t m = sim.cmd_log.size();
+    CHECK(read_right(1234), "read after the native mount went to another sector");
+    CHECK(cmds_since(m) == std::vector<uint8_t>{ 0x20 }, "commands for the read: %zu", sim.cmd_log.size() - m);
+    tty.clear(); update_main_menu();
+    CHECK(has("Manual CHS (no IDENTIFY) no 91h") && has("522 Cyl / 4 Hd / 40 SPT"), "main menu");
+}
+
+// The mode is chosen in the box and nowhere else: Ctrl+G twice is the old
+// mode again, byte for byte; Esc in the new mode sends nothing; Ctrl+G at the
+// question changes nothing.
+static void test_native_selection() {
+    native_drive("native: Ctrl+G twice is the old mode");
+    keys("\x07" "52\x07" "2\r4\r40\ry");
+    run_manual_chs();
+    CHECK(sent_exactly_recal_idp() && sim.geo_valid && sim.heads == NH && sim.spt == NS, "commands %zu", sim.cmd_log.size());
+    CHECK(strcmp(hdd_model_raw, MCHS_MODEL) == 0 && !ide_manual_chs_native_active(), "\"%s\"", hdd_model_raw);
+    CHECK(has("Y: reset Master, send 522/4/40 (91h)   N: edit"), "old question not shown");
+
+    native_drive("native: Esc sends nothing");
+    earlier_setup();
+    Snap before = snap();
+    keys("\x07" "522\r4\r40\r\x1b");
+    CHECK(!run_manual_chs() && nothing_sent() && same(before, snap()), "writes %d", sim.reg_writes);
+
+    native_drive("native: Ctrl+G at the question does nothing");
+    keys("522\r4\r40\r\x07y");
+    run_manual_chs();
+    CHECK(sent_exactly_recal_idp() && !ide_manual_chs_native_active(), "commands %zu", sim.cmd_log.size());
+
+    native_drive("native: selected only for this Ctrl+G");
+    ctrl_g_native();
+    CHECK(ide_manual_chs_native_active(), "native not set");
+    keys("522\r4\r40\ry");                          // the next Ctrl+G, not selected
+    run_manual_chs();
+    CHECK(cmds_since(1) == (std::vector<uint8_t>{ 0x10, 0x91 }) && !ide_manual_chs_native_active() &&
+          strcmp(hdd_model_raw, MCHS_MODEL) == 0, "commands %zu", sim.cmd_log.size());
+    // ...and the old mode's rule is back: after Debug R the read sends 0x91 first.
+    debug_reset();
+    size_t m = sim.cmd_log.size();
+    CHECK(read_right(1234) && cmds_since(m) == (std::vector<uint8_t>{ 0x91, 0x20 }), "old mode after native: %zu",
+          sim.cmd_log.size() - m);
+}
+
+// Every reset path, and 0x91 never goes out.
+static void test_native_resets() {
+    // Debug R (RESET-, RECALIBRATE), then reads: through chs_geometry_ok.
+    native_drive("native: Debug R");
+    ctrl_g_native();
+    debug_reset();
+    CHECK(sim.hw_resets == 2, "Debug R: %d resets", sim.hw_resets);
+    size_t m = sim.cmd_log.size();
+    CHECK(read_right(1234) && read_right(NC * NH * NS - 1), "read after Debug R went to another sector");
+    CHECK(cmds_since(m) == (std::vector<uint8_t>{ 0x20, 0x20 }) && idp_sent() == 0, "commands %zu, 0x91 %d",
+          sim.cmd_log.size() - m, idp_sent());
+    CHECK(ide_manual_chs_native_active() && !chs_geometry_lost, "native %d lost %d", ide_manual_chs_native_active(), chs_geometry_lost);
+
+    // A read that hangs: soft reset and recovery (soft_reset_restore, recovery_run).
+    native_drive("native: soft reset after a hung read");
+    ctrl_g_native();
+    sim.bad[4321] = {BAD_HANG, 0};
+    int32_t got = 0;
+    read_right(4321, &got);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(got < 0 && sim.srst == 1 && f.kind == IDE_FAIL_TIMEOUT && f.reset && !f.reset_failed && !f.pending,
+          "read %d srst %d kind %u reset %d failed %d pending %d", (int)got, sim.srst, f.kind, f.reset, f.reset_failed, f.pending);
+    CHECK(idp_sent() == 0 && !ide_recovery_pending(), "0x91 %d, pending %d", idp_sent(), ide_recovery_pending());
+    CHECK(read_right(1234) && idp_sent() == 0, "read after the soft reset: 0x91 %d", idp_sent());
+
+    // SRST does not bring it back, RESET- does (hw_reset_start, RECALIBRATE).
+    native_drive("native: hardware reset in the recovery");
+    ctrl_g_native();
+    sim.srst_wedges = true;
+    sim.bad[4321] = {BAD_HANG, 0};
+    read_right(4321, &got);
+    ide_last_failure(&f);
+    CHECK(got < 0 && sim.srst == 1 && sim.hw_resets == 2 && f.hw_reset && !f.reset_failed,
+          "srst %d resets %d hw %d failed %d", sim.srst, sim.hw_resets, f.hw_reset, f.reset_failed);
+    CHECK(idp_sent() == 0 && !ide_recovery_pending(), "0x91 %d, pending %d", idp_sent(), ide_recovery_pending());
+    CHECK(read_right(1234) && idp_sent() == 0, "read after the hardware reset: 0x91 %d", idp_sent());
+    CHECK(sim.cmd_log.front() == 0x10 && std::count(sim.cmd_log.begin(), sim.cmd_log.end(), (uint8_t)0x10) == 2,
+          "RECALIBRATE after the hardware reset missing");
+
+    // The same inside host commands: the recovery outlasts the first
+    // command's 20 s and is carried on by the next ones (recovery_gate).
+    native_drive("native: recovery carried over host commands");
+    ctrl_g_native();
+    sim.srst_wedges = true;
+    sim.bad[4321] = {BAD_HANG, 0};
+    bool right = false;
+    CHECK(host_read(4321, &right) < 0, "hung read succeeded");
+    int tries = 0;
+    do { got = host_read(1234, &right); tries++; } while (got < 0 && tries < 6);
+    CHECK(got >= 0 && right && tries > 1, "read after the carried-over recovery: %d, right %d, %d commands", (int)got, right, tries);
+    CHECK(idp_sent() == 0 && sim.hw_resets == 2 && !ide_recovery_pending(), "0x91 %d, resets %d", idp_sent(), sim.hw_resets);
+
+    // The control for the three above: the old mode, same drive, same faults,
+    // does send 0x91 after each (so the counts above can see one).
+    native_drive("old mode control: soft reset");
+    keys("522\r4\r40\ry"); run_manual_chs();
+    int base = idp_sent();
+    sim.bad[4321] = {BAD_HANG, 0};
+    read_right(4321, &got);
+    CHECK(idp_sent() == base + 1, "old mode: 0x91 not sent after the soft reset (%d)", idp_sent() - base);
+    native_drive("old mode control: recovery over host commands");
+    keys("522\r4\r40\ry"); run_manual_chs();
+    base = idp_sent();
+    sim.srst_wedges = true;
+    sim.bad[4321] = {BAD_HANG, 0};
+    host_read(4321, &right);
+    tries = 0;
+    do { got = host_read(1234, &right); tries++; } while (got < 0 && tries < 6);
+    CHECK(got >= 0 && right && idp_sent() > base, "old mode: read %d, 0x91 %d", (int)got, idp_sent() - base);
+}
+
+// What the mode forgets it on: Auto Detect's probe, and anything that is not
+// the geometry it was set with.
+static void test_native_forgotten() {
+    native_drive("native: forgotten by the probe");
+    ctrl_g_native();
+    ide_probe_devices();                            // Auto Detect's RESET- and RECALIBRATE
+    CHECK(!ide_manual_chs_native_active(), "native kept over a probe");
+    config.cyls = NC; config.heads = NH; config.spt = NS; // the same geometry put back by hand
+    size_t m = sim.cmd_log.size();
+    CHECK(read_right(1234) && cmds_since(m) == (std::vector<uint8_t>{ 0x91, 0x20 }), "0x91 not sent after the probe: %zu",
+          sim.cmd_log.size() - m);
+
+    native_drive("native: another geometry in use");
+    ctrl_g_native();
+    config.heads = 2;                               // not the one declared
+    CHECK(!ide_manual_chs_native_active(), "native with other heads");
+    config.heads = NH; config.use_lba_mode = true;
+    CHECK(!ide_manual_chs_native_active(), "native in LBA mode");
+    config.use_lba_mode = false; ide_select_device(0xB0);
+    CHECK(!ide_manual_chs_native_active(), "native on the other device");
+    ide_select_device(0xA0);
+    CHECK(ide_manual_chs_native_active(), "native not back with the same geometry");
+}
+
+// It can fail, and then nothing is set.
+static void test_native_not_ready() {
+    native_drive("native: DRDY only after 0x91");
+    earlier_setup();
+    sim.drdy_needs_idp = true;
+    keys("\x07" "522\r4\r40\ry");
+    CHECK(run_manual_chs(), "no result box");
+    CHECK(sim.cmd_log == std::vector<uint8_t>{ 0x10 } && idp_sent() == 0, "commands %zu", sim.cmd_log.size());
+    CHECK(strstr(hdd_status_text, "Manual CHS: drive not ready, no 91h (ST:10)") != nullptr, "\"%s\"", hdd_status_text);
+    CHECK(cur_cyls == 0 && config.cyls == 0 && hdd_model_raw[0] == 0 && !ide_manual_chs_native_active() &&
+          !ide_manual_chs_active(), "geometry set");
+    CHECK(chs_geometry_lost, "geometry not lost");
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(f.kind == IDE_FAIL_MANUAL_CHS && f.command == 0x10 && f.status == 0x10, "record kind %u cmd %02X st %02X",
+          f.kind, f.command, f.status);
+    tty.clear(); run_debug_errors();
+    CHECK(has("[Last Failed I/O] cmd 10, manual CHS: not ready after 10h (no 91h)"), "Debug E");
+
+    native_drive("native: RECALIBRATE aborted");
+    sim.abort_recal = true;
+    keys("\x07" "522\r4\r40\ry");
+    CHECK(run_manual_chs(), "no result box");
+    CHECK(sim.cmd_log == std::vector<uint8_t>{ 0x10 } && idp_sent() == 0, "commands %zu", sim.cmd_log.size());
+    CHECK(strstr(hdd_status_text, "Manual CHS: drive not ready, no 91h (ST:51)") != nullptr, "\"%s\"", hdd_status_text);
+
+    native_drive("native: RECALIBRATE never ends");
+    sim.hang_cmd = 0x10;
+    keys("\x07" "522\r4\r40\ry");
+    CHECK(run_manual_chs(), "no result box");
+    CHECK(strstr(hdd_status_text, "Manual CHS: RECALIBRATE did not end (ST:80)") != nullptr, "\"%s\"", hdd_status_text);
+    tty.clear(); run_debug_errors();
+    CHECK(has("[Last Failed I/O] cmd 10, manual CHS: RECALIBRATE did not end"), "Debug E");
+}
+
+// The trade-off, as a fact about the firmware: nothing checks the operator's
+// declaration. Declared 1045/2/40 on a drive whose power-up default is 4/40,
+// a read comes back GOOD from another sector. (The old mode sends 2/40 as
+// 0x91; what a CP3044 does with that is not known either: FORK-README 27.)
+static void test_native_trusts_the_declaration() {
+    native_drive("native: a wrong declaration is not caught");
+    sim.nsect = 1045 * 2 * 40;
+    ctrl_g_native("1045\r2\r40\r");
+    CHECK(ide_manual_chs_native_active() && idp_sent() == 0, "native not set");
+    int32_t got = 0;
+    bool right = read_right(1234, &got);
+    CHECK(got >= 0 && !right, "read %d right %d: the simulated drive should have answered from another sector",
+          (int)got, right);
+}
+
 // ---- 7. through the main loop: Ctrl+G reaches the entry ---------------------
 // Last, since core1_entry never returns (on_idle ends the program).
 static void core1_done() {
@@ -795,6 +1042,12 @@ int main() {
     test_mchs_flag();
     test_save_setup();
     test_iordy_note();
+    test_native_accepted();
+    test_native_selection();
+    test_native_resets();
+    test_native_forgotten();
+    test_native_not_ready();
+    test_native_trusts_the_declaration();
     test_core1();                                   // does not return
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;

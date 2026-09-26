@@ -259,9 +259,9 @@ static void print_help(const char *text) {
 // the unit for the shipping build (review L-2). That line is 11 characters
 // longer, so it starts further left to stay inside 80 columns.
 #if ATABOY_SAT && ATABOY_SAT_SMART_SAVES
-#define BANNER "\033[1;4H" FG_WHITE "ATAboy Setup Utility v0.6f3p9 (fork+smartsaves) - (C) 2026 obsoletetech.us"
+#define BANNER "\033[1;4H" FG_WHITE "ATAboy Setup Utility v0.6f3p10 (fork+smartsaves) - (C) 2026 obsoletetech.us"
 #else
-#define BANNER "\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p9 (fork) - (C) 2026 obsoletetech.us"
+#define BANNER "\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p10 (fork) - (C) 2026 obsoletetech.us"
 #endif
 
 static void draw_bios_frame(void) {
@@ -783,7 +783,9 @@ static void run_debug_errors(void) {
                                       "no time", "bad end"};
         if (f.kind == IDE_FAIL_MANUAL_CHS)      // Ctrl+G: no sector was asked for
             debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X, manual CHS: %s", f.command,
-                        f.command == 0x91 ? "drive refused geometry" : "RECALIBRATE did not end");
+                        f.command == 0x91 ? "drive refused geometry" :
+                        (f.status & 0x88) ? "RECALIBRATE did not end" :
+                        "not ready after 10h (no 91h)");      // 0.6f3p10, power-up default mode
         else
             debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
                         f.command, kinds[f.kind < 8 ? f.kind : 0], (unsigned long)f.lba,
@@ -1150,12 +1152,26 @@ static bool run_auto_detect(void) {
 // otherwise the error box says why, the geometry is 0 (nothing to mount),
 // and Debug E has the registers. Nothing here saves to EEPROM (F10 still can,
 // on purpose, later, but not with Auto Mount on: save_setup).
+//
+// 0.6f3p10: the power-up default mode, opt-in. Ctrl+G pressed again while a
+// field is being typed switches the box to it (and back): the title, help
+// line, question and working line all say "no 91h", and Y then calls
+// ide_manual_chs_native(), which sends RESET- and RECALIBRATE and no 0x91 at
+// all, before or after any reset (ide.h). Every Ctrl+G from the main menu
+// starts in the old mode, and the old mode's box is drawn byte for byte as
+// in 0.6f3p9, so tools that read it are unaffected. Success shows
+// MCHS_MODEL_NATIVE on Current HDD, which starts with MCHS_MODEL.
 #define MCHS_COL   9                    // the box: 64 wide, as the picker
 #define MCHS_ROW   5
 #define MCHS_W     64
 #define MCHS_H     11
 #define MCHS_TITLE "Manual CHS (no IDENTIFY)"
 #define MCHS_MODEL "Manual CHS (no IDENTIFY)"   // Current HDD once the drive took it
+#define MCHS_TITLE_NATIVE "Manual CHS (no IDENTIFY) - power-up default, no 91h"
+#define MCHS_MODEL_NATIVE "Manual CHS (no IDENTIFY) no 91h"
+#define MCHS_HELP        "0-9: Digits   Enter/Tab: Next field   Esc: Cancel"
+#define MCHS_HELP_NATIVE "0-9: Digits  Enter/Tab: Next  Ctrl+G: 91h mode  Esc: Cancel"
+#define MCHS_NOTE_NATIVE "Only if C/H/S IS the drive's power-up default."
 static const int mchs_field_col[3] = {18, 34, 50};
 
 // One line of the box's interior (62 columns), text centred, in `color`.
@@ -1169,13 +1185,13 @@ static void mchs_line(int row, const char *color, const char *text) {
 // fields: what was typed (digits, "" when empty). active: the field being
 // typed into, or -1 (nothing is being typed). msg: the message row, "" for
 // none; ask draws it as the Y/N question.
-static void draw_manual_chs(char fields[3][6], int active, const char *msg, bool ask) {
+static void draw_manual_chs_mode(char fields[3][6], int active, const char *msg, bool ask, bool native) {
     int c = MCHS_COL, r = MCHS_ROW;
     for (int i = 0; i < MCHS_H; i++) cdc_printf("\033[%d;%dH\033[40m%*s", r+1+i, c+2, MCHS_W, "");
     cdc_puts(SEL_RED);
     cdc_printf("\033[%d;%dH", r, c);
     cdc_puts(BOX_TL); emit_n(BOX_HH, MCHS_W - 2); cdc_puts(BOX_TR);
-    mchs_line(r+1, SEL_RED, MCHS_TITLE);
+    mchs_line(r+1, SEL_RED, native ? MCHS_TITLE_NATIVE : MCHS_TITLE);
     char who[64];
     snprintf(who, sizeof(who), "%s drive. Nothing is sent to it until you press Y.",
              config.dev_base == 0xB0 ? "Slave" : "Master");
@@ -1194,12 +1210,17 @@ static void draw_manual_chs(char fields[3][6], int active, const char *msg, bool
     mchs_line(r+7, ask ? "\033[103;30m" : FG_YELLOW, msg);
     cdc_printf("\033[%d;%dH", r+8, c);
     cdc_puts(BOX_MLD); emit_n(BOX_HH, MCHS_W - 2); cdc_puts(BOX_MRD);
-    mchs_line(r+9, SEL_RED, "0-9: Digits   Enter/Tab: Next field   Esc: Cancel");
+    mchs_line(r+9, SEL_RED, native ? MCHS_HELP_NATIVE : MCHS_HELP);
     cdc_printf("\033[%d;%dH", r+10, c);
     cdc_puts(BOX_BL); emit_n(BOX_HH, MCHS_W - 2); cdc_puts(BOX_BR);
     cdc_puts(RESET);
     if (active >= 0) cdc_printf("\033[%d;%dH", r+5, mchs_field_col[active] + (int)strlen(fields[active]));
     cdc_flush();
+}
+
+// The box as 0.6f3p8 and 0.6f3p9 draw it (the old mode).
+static void draw_manual_chs(char fields[3][6], int active, const char *msg, bool ask) {
+    draw_manual_chs_mode(fields, active, msg, ask, false);
 }
 
 // Ctrl+G on the main menu with nothing mounted opens the entry. True if it did.
@@ -1227,12 +1248,16 @@ static bool run_manual_chs(void) {
     int active = 0;
     const char *msg = "";
     uint32_t v[3] = {0, 0, 0};
+    bool native = false;            // 0.6f3p10: every Ctrl+G starts in the old mode (91h)
     for (;;) {
-        draw_manual_chs(fields, active, msg, false);
+        draw_manual_chs_mode(fields, active, (native && !*msg) ? MCHS_NOTE_NATIVE : msg, false, native);
         int ch;
         while ((ch = get_input()) == -1) tight_loop_contents();
         int p = (int)strlen(fields[active]);
         if (ch == KEY_ESC) return false;                      // nothing sent, nothing changed
+        // Ctrl+G again, while typing: the power-up default mode, or back.
+        // Only here; at the question below it does nothing, as before.
+        if (ch == MANUAL_CHS_KEY) { native = !native; msg = ""; continue; }
         if (ch >= '0' && ch <= '9') { if (p < 5) { fields[active][p] = (char)ch; fields[active][p+1] = '\0'; } continue; }
         if ((ch == 8 || ch == 127) && p > 0) { fields[active][p-1] = '\0'; continue; }
         if (ch != KEY_ENTER && ch != '\t') continue;
@@ -1242,10 +1267,15 @@ static bool run_manual_chs(void) {
         int bad = manual_chs_bad_field(v[0], v[1], v[2]);
         if (bad >= 0) { msg = manual_chs_refusal(bad); active = bad; continue; }
         char q[64];
-        snprintf(q, sizeof(q), "Y: reset %s, send %lu/%lu/%lu (91h)   N: edit",
-                 config.dev_base == 0xB0 ? "Slave" : "Master",
-                 (unsigned long)v[0], (unsigned long)v[1], (unsigned long)v[2]);
-        draw_manual_chs(fields, -1, q, true);
+        if (native)
+            snprintf(q, sizeof(q), "Y: reset %s, keep %lu/%lu/%lu, no 91h   N: edit",
+                     config.dev_base == 0xB0 ? "Slave" : "Master",
+                     (unsigned long)v[0], (unsigned long)v[1], (unsigned long)v[2]);
+        else
+            snprintf(q, sizeof(q), "Y: reset %s, send %lu/%lu/%lu (91h)   N: edit",
+                     config.dev_base == 0xB0 ? "Slave" : "Master",
+                     (unsigned long)v[0], (unsigned long)v[1], (unsigned long)v[2]);
+        draw_manual_chs_mode(fields, -1, q, true, native);
         int k;
         do { while ((k = get_input()) == -1) tight_loop_contents(); }
         while (k != 'y' && k != 'Y' && k != 'n' && k != 'N' && k != KEY_ESC);
@@ -1256,14 +1286,16 @@ static bool run_manual_chs(void) {
     // Y. Nothing has been sent yet. A USB command still running, or a reset
     // it has left pending, stops it here too.
     if (!bus_free_wait(false) || mchs_pending_refused()) return false;
-    draw_manual_chs(fields, -1, "Resetting the drive, then 10h and 91h. Up to a minute.", false);
+    draw_manual_chs_mode(fields, -1, native ? "Resetting the drive, then 10h only (no 91h). Up to a minute."
+                                            : "Resetting the drive, then 10h and 91h. Up to a minute.", false, native);
     id_w49_known = false;           // no IDENTIFY: nothing to say about IORDY
     uint8_t st = 0;
-    int r = ide_manual_chs((uint8_t)v[1], (uint8_t)v[2], &st);
+    int r = native ? ide_manual_chs_native((uint8_t)v[1], (uint8_t)v[2], &st)
+                   : ide_manual_chs((uint8_t)v[1], (uint8_t)v[2], &st);
     if (r == IDE_MCHS_OK) {
         use_lba_mode = false; total_lba_sectors = 0;
         cur_cyls = (uint16_t)v[0]; cur_heads = (uint8_t)v[1]; cur_spt = (uint8_t)v[2];
-        strcpy(hdd_model_raw, MCHS_MODEL);
+        strcpy(hdd_model_raw, native ? MCHS_MODEL_NATIVE : MCHS_MODEL);
         sync_to_config();
         return false;
     }
@@ -1272,7 +1304,8 @@ static bool run_manual_chs(void) {
     const char *why = r == IDE_MCHS_REFUSED  ? "drive refused geometry" :
                       r == IDE_MCHS_RECAL    ? "RECALIBRATE did not end" :
                       r == IDE_MCHS_NO_DEVICE ? "no drive answered" :
-                      r == IDE_MCHS_BUSY     ? "drive still busy" : "nothing sent";
+                      r == IDE_MCHS_BUSY     ? "drive still busy" :
+                      r == IDE_MCHS_NOT_READY ? "drive not ready, no 91h" : "nothing sent";
     snprintf(hdd_status_text, sizeof(hdd_status_text), "\033[91;1mManual CHS: %s (ST:%02X)", why, st);
     hdd_model_raw[0] = '\0';
     cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;

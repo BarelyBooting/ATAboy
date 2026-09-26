@@ -72,6 +72,7 @@ void ide_last_failure(ide_fail_t *out) { *out = stub_fail; }
 // Manual CHS (Ctrl+G) runs against ide.c itself in test_manual_chs.cpp.
 bool ide_recovery_pending(void) { return false; }
 int ide_manual_chs(uint8_t, uint8_t, uint8_t *st) { bus_use(); *st = 0x50; return IDE_MCHS_OK; }
+int ide_manual_chs_native(uint8_t, uint8_t, uint8_t *st) { bus_use(); *st = 0x50; return IDE_MCHS_OK; }
 bool ide_manual_chs_active(void) { return false; }
 // 0.6f3p9: the salvage capture (Debug E).
 static ide_salvage_t stub_salvage;
@@ -407,11 +408,11 @@ static void test_banner() {
     tty.clear();
     draw_bios_frame();
 #if ATABOY_SAT && ATABOY_SAT_SMART_SAVES
-    CHECK(tty.find("\033[1;4H\033[37;1mATAboy Setup Utility v0.6f3p9 (fork+smartsaves) - (C) 2026 obsoletetech.us") != std::string::npos,
+    CHECK(tty.find("\033[1;4H\033[37;1mATAboy Setup Utility v0.6f3p10 (fork+smartsaves) - (C) 2026 obsoletetech.us") != std::string::npos,
           "SMART opt-in build: banner does not say so");
 #else
-    CHECK(tty.find("\033[1;10H\033[37;1mATAboy Setup Utility v0.6f3p9 (fork) - (C) 2026 obsoletetech.us") != std::string::npos,
-          "banner is not v0.6f3p9 (fork)");
+    CHECK(tty.find("\033[1;10H\033[37;1mATAboy Setup Utility v0.6f3p10 (fork) - (C) 2026 obsoletetech.us") != std::string::npos,
+          "banner is not v0.6f3p10 (fork)");
     CHECK(tty.find("smartsaves") == std::string::npos, "shipping build banner claims SMART saves");
 #endif
 }

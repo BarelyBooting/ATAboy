@@ -208,11 +208,28 @@ bool    ide_recovery_pending(void);
 #define IDE_MCHS_RECAL      3   // RECALIBRATE still busy after 10 s; 0x91 not sent (recorded)
 #define IDE_MCHS_REFUSED    4   // 0x91 ended with ERR, or not ready 1 s after it (recorded)
 #define IDE_MCHS_BAD_ARGS   5   // heads not 1..16 or sectors 0; nothing done at all
+#define IDE_MCHS_NOT_READY  6   // native only: RECALIBRATE ended but the drive is not
+                                // ready (DRDY clear within 1 s) or shows ERR (recorded)
 // A 1990 Conner can take up to 40 s to spin up when its spin recovery
 // starts (CP3044 manual, section 3.3), longer than ATA's 31 s or the
 // probe's 10 s.
 #define IDE_MCHS_READY_MS   45000
 int     ide_manual_chs(uint8_t heads, uint8_t spt, uint8_t *status);
+
+// 0.6f3p10, opt-in: the same, but with NO INITIALIZE DEVICE PARAMETERS at
+// all, for a drive whose own power-up default translation is the geometry
+// typed in (the operator declares it; nothing can check it). RESET-, the
+// wait, RECALIBRATE, then the drive must show ready with no ERR
+// (IDE_MCHS_NOT_READY otherwise). Accepted, that geometry stays in use with
+// 0x91 never sent, not even after a reset of any kind, since a reset puts the
+// drive back in its power-up default (ide.c, native_geo), until Auto Detect
+// or the next Ctrl+G. Everything else is as ide_manual_chs: no IDENTIFY,
+// ide_manual_chs_active() is set, the IDENTIFY words are forgotten.
+int     ide_manual_chs_native(uint8_t heads, uint8_t spt, uint8_t *status);
+
+// True while the geometry in use came from ide_manual_chs_native and is
+// still that geometry, on that device, in CHS mode: no 0x91 is sent.
+bool    ide_manual_chs_native_active(void);
 
 // True from a Ctrl+G whose 0x91 the drive accepted until an IDENTIFY answers
 // (ide_identify). RAM only. While true, sat.c refuses every pass-through

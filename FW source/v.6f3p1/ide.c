@@ -33,7 +33,33 @@ static uint8_t dev_base = 0xA0;   // 0xA0 = master, 0xB0 = slave
 //   hw_reset_start (recovery,     RESET-, set there as well, though the SRST
 //     after an SRST that failed)  before it has always set it already
 // Only a 0x91 the drive accepts clears it (ide_set_geometry, ide_manual_chs).
+// 0.6f3p10: or, in Ctrl+G's power-up default mode (native_geo below), the
+// drive coming back from the reset with the translation it powers up in,
+// which is the geometry in use there, so nothing needs sending.
 static bool chs_geometry_lost = true;
+
+// 0.6f3p10: Ctrl+G's power-up default mode (ide_manual_chs_native). The
+// operator has declared that the geometry typed in IS the drive's own
+// power-up default translation, so INITIALIZE DEVICE PARAMETERS (0x91) is
+// never sent to set it: not by Ctrl+G, and not after any reset, since a
+// reset puts the drive back in that same default. That holds while the
+// geometry in use is still the one it was set with, on the same device, in
+// CHS mode (native_geometry_in_use); Auto Detect's probe and the next Ctrl+G
+// forget it. RAM only, like manual_chs_active: a power cycle forgets it too.
+// Nothing here checks the declaration: a drive whose power-up default is
+// not the geometry typed in reads other sectors than the ones asked for,
+// with good status. See FORK-README item 27.
+static struct {
+    bool    on;
+    uint8_t dev_base, heads, spt;
+} native_geo;
+
+static bool native_geometry_in_use(void) {
+    return native_geo.on && !config.use_lba_mode && dev_base == native_geo.dev_base &&
+           config.heads == native_geo.heads && config.spt == native_geo.spt;
+}
+
+bool ide_manual_chs_native_active(void) { return native_geometry_in_use(); }
 
 // The geometry in use was set by Ctrl+G (ide_manual_chs), which never sends
 // IDENTIFY: set when its 0x91 is accepted, cleared by the next IDENTIFY that
@@ -497,6 +523,7 @@ uint8_t ide_probe_devices(void) {
     sleep_ms(50);
     gpio_put(IDE_RESET, 1);
     chs_geometry_lost = true; // RESET- drops 0x91 (review of 0.6f3p8, M-1)
+    native_geo.on = false;    // a new detection: the Ctrl+G power-up default no longer applies
     sleep_ms(2000);           // generous POST delay (not status-based)
     ide_write_control(0x00);  // nIEN=0
 
@@ -560,6 +587,11 @@ bool ide_wait_until_ready(uint32_t timeout_ms) {
 #define IDE_GEOMETRY_TIMEOUT_MS 1000
 
 bool ide_set_geometry(uint8_t heads, uint8_t spt) {
+    // 0.6f3p10: in Ctrl+G's power-up default mode the drive is never sent
+    // 0x91 (native_geo). This is the only place 0x91 goes out apart from
+    // Ctrl+G itself, so every path after a reset (recovery_run,
+    // chs_geometry_ok, the menus) comes through here.
+    if (native_geometry_in_use()) { chs_geometry_lost = false; return true; }
     ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
     ide_write_reg(2, spt);
     ide_write_reg(7, 0x91);
@@ -1002,6 +1034,10 @@ static int recovery_run(void) {
     // Back from the reset. CHS mode: the translation the host's sector
     // numbers assume, or CHS reads and writes refuse (chs_geometry_ok).
     if (config.use_lba_mode) return recovery_end(true);
+    // 0.6f3p10: Ctrl+G's power-up default mode. The reset put the drive back
+    // in the translation in use; there is no 0x91 to send, so no time to wait
+    // for either (ide_set_geometry would send nothing).
+    if (native_geometry_in_use()) return recovery_end(ide_set_geometry(config.heads, config.spt));
     // Review of 0.6f3p7 (LOW): 0x91 used to go out with whatever was left,
     // none at all if the drive came back as the host command's time ran out;
     // it then "failed" and the record said the reset had failed, when nothing
@@ -1096,10 +1132,13 @@ static bool mchs_wait_end(sat_watch_t *w, uint32_t limit_ms, uint8_t *st) {
     }
 }
 
-int ide_manual_chs(uint8_t heads, uint8_t spt, uint8_t *status) {
+// 0.6f3p10: native (ide_manual_chs_native) leaves out 0x91 and only that.
+// Everything before it is the same bytes in the same order.
+static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *status) {
     uint8_t st = 0;
     *status = 0;
     if (heads < 1 || heads > 16 || spt < 1) return IDE_MCHS_BAD_ARGS;
+    native_geo.on = false;          // set again below only by a native mount that ends well
 #if ATABOY_SAT
     id_words.valid = false;         // this drive is never asked who it is
 #endif
@@ -1142,6 +1181,36 @@ int ide_manual_chs(uint8_t heads, uint8_t spt, uint8_t *status) {
         return IDE_MCHS_RECAL;
     }
 
+    if (native) {
+        // No 0x91: the drive keeps the translation it came out of RESET-
+        // with, which the operator has declared is the geometry typed in.
+        // Nothing here can check that (no IDENTIFY, no 0x91 answer). What is
+        // checked is that the drive is ready for a read: DRDY, given up to
+        // the second 0x91 would have had, with no ERR left by RECALIBRATE.
+        // A drive older than ATA that sets DRDY only after 0x91 fails here,
+        // and so would every read (ide_wait_until_ready wants DRDY).
+        uint32_t t1 = ms_now();
+        while (!(st & 0x40) && !(st & 0x01) && !ms_passed(t1, IDE_MCHS_IDP_MS)) {
+            busy_wait_us_32(10);
+            st = ide_read_reg(7);
+        }
+        *status = st;
+        if (!(st & 0x40) || (st & 0x89)) {
+            // Recorded as RECALIBRATE's, since it was the last command sent;
+            // BSY and DRQ clear tell Debug E it ended but left the drive not
+            // ready (a RECALIBRATE that never ended has one of them set).
+            record_failure(IDE_FAIL_MANUAL_CHS, 0x10, st, 0, 0, 0);
+            return IDE_MCHS_NOT_READY;
+        }
+        chs_geometry_lost = false;  // the power-up default is the geometry in use
+        native_geo.on = true;
+        native_geo.dev_base = dev_base;
+        native_geo.heads = heads;
+        native_geo.spt = spt;
+        manual_chs_active = true;   // no pass-through to this drive, as below
+        return IDE_MCHS_OK;
+    }
+
     ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
     ide_write_reg(2, spt);
     sat_watch_arm(&w);
@@ -1157,6 +1226,14 @@ int ide_manual_chs(uint8_t heads, uint8_t spt, uint8_t *status) {
     }
     manual_chs_active = true;       // no pass-through to this drive (sat_policy.h)
     return IDE_MCHS_OK;
+}
+
+int ide_manual_chs(uint8_t heads, uint8_t spt, uint8_t *status) {
+    return manual_chs_run(heads, spt, false, status);
+}
+
+int ide_manual_chs_native(uint8_t heads, uint8_t spt, uint8_t *status) {
+    return manual_chs_run(heads, spt, true, status);
 }
 
 // ---------------------------------------------------------------------------
