@@ -942,6 +942,27 @@ MUTANTS = [
      '    ide_write_reg(2, spt);\n    ide_write_reg(7, 0x91);\n    wait_after_command();\n    // Only'),
     ('p10 H-1: 91h from the old-mode Ctrl+G not counted', 'ide.c',
      '    sat_watch_arm(&w);\n    idp_written = true;\n', '    sat_watch_arm(&w);\n'),
+    # --- re-review of 0.6f3p10: N-1 and N-2, each fix reverted ---
+    ('p10 N-1: unmount does not wait for a running read', 'menus.c',
+     '        if (!usb_msc_ide_busy()) {\n            ide_manual_chs_native_forget();',
+     '        if (1) {\n            ide_manual_chs_native_forget();'),
+    ('p10 N-1: ide.c sends 0x91 to a drive mounted native', 'ide.c',
+     'if (native_declared || heads == 0 || spt == 0) return false;', 'if (heads == 0 || spt == 0) return false;'),
+    ('p10 N-1: 0x91 with 0 heads or 0 sectors', 'ide.c',
+     'if (native_declared || heads == 0 || spt == 0) return false;', 'if (native_declared) return false;'),
+    ('p10 N-1: a native mount does not mark the drive', 'ide.c',
+     '        native_declared = true;\n', ''),
+    ('p10 N-1: the next Ctrl+G keeps the mark', 'ide.c',
+     '    native_geo.on = false;          // set again below only by a native mount that ends well\n    native_declared = false;\n',
+     '    native_geo.on = false;          // set again below only by a native mount that ends well\n'),
+    ('p10 N-1: Auto Detect keeps the mark', 'ide.c',
+     '    native_geo.on = false;    // a new detection: the Ctrl+G power-up default no longer applies\n    native_declared = false;\n',
+     '    native_geo.on = false;    // a new detection: the Ctrl+G power-up default no longer applies\n'),
+    ('p10 N-2: Mount after a Ctrl+G drops the marker', 'menus.c',
+     '    if (ide_mchs_no_identify()) {\n        snprintf(hdd_status_text, sizeof(hdd_status_text), "\\033[91;1m" MCHS_NEEDED);',
+     '    if (0) {\n        snprintf(hdd_status_text, sizeof(hdd_status_text), "\\033[91;1m" MCHS_NEEDED);'),
+    ('p10 N-2: dismissing the error box drops the marker', 'menus.c',
+     '    if (ide_mchs_no_identify()) strcpy(hdd_model_raw, MCHS_MODEL_CLEARED);\n', ''),
 ]
 
 

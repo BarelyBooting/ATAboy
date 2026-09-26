@@ -695,7 +695,12 @@ void ide_pio_init(void) {}
 inline void iordy_check() {
     if (mock_iordy_inover == GPIO_OVERRIDE_NORMAL && sim.hw_post && sim.phase == SimDrive::IN_RESET) sim.iordy_stalls++;
 }
+// Re-review of 0.6f3p10 (N-1): something core 1 does while core 0 is in the
+// middle of a command (an unmount, say), run from the next register read.
+// The callback clears it first if it should run once.
+inline void (*sim_on_read)() = nullptr;
 void ide_pio_read(uint32_t count, uint16_t *buf) {
+    if (sim_on_read) sim_on_read();
     iordy_check();
     bool cs1; int r = bus_reg(cs1);
     for (uint32_t i = 0; i < count; i++) {

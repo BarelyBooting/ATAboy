@@ -54,6 +54,14 @@ static struct {
     uint8_t dev_base, heads, spt;
 } native_geo;
 
+// Re-review of 0.6f3p10, N-1: set with native_geo.on by a native mount, but
+// NOT cleared when native_geo.on is (unmount): only the next Ctrl+G that
+// sends anything, or Auto Detect's probe, clears it. While it is set
+// ide_set_geometry never sends 0x91, whatever the geometry, so a read that
+// was still recovering when the operator unmounted (core 1 clearing the
+// mode and the geometry under core 0) cannot send one either.
+static bool native_declared = false;
+
 static bool native_geometry_in_use(void) {
     return native_geo.on && !config.use_lba_mode && dev_base == native_geo.dev_base &&
            config.heads == native_geo.heads && config.spt == native_geo.spt;
@@ -63,6 +71,7 @@ bool ide_manual_chs_native_active(void) { return native_geometry_in_use(); }
 // The geometry is also marked lost, as after a reset: nothing mountable is
 // left, and a CHS read would otherwise go out with no geometry checked.
 void ide_manual_chs_native_forget(void) { native_geo.on = false; chs_geometry_lost = true; }
+bool ide_native_drive(void) { return native_declared; }
 
 // Review of 0.6f3p10, H-1: any 0x91 this firmware has written since boot
 // (ide_set_geometry, the old-mode Ctrl+G). A native Ctrl+G is refused
@@ -539,6 +548,7 @@ uint8_t ide_probe_devices(void) {
     gpio_put(IDE_RESET, 1);
     chs_geometry_lost = true; // RESET- drops 0x91 (review of 0.6f3p8, M-1)
     native_geo.on = false;    // a new detection: the Ctrl+G power-up default no longer applies
+    native_declared = false;
     mchs_no_identify = false; // a deliberate Auto Detect: IDENTIFY follows (review of 0.6f3p10, M-1)
     sleep_ms(2000);           // generous POST delay (not status-based)
     ide_write_control(0x00);  // nIEN=0
@@ -608,6 +618,11 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     // Ctrl+G itself, so every path after a reset (recovery_run,
     // chs_geometry_ok, the menus) comes through here.
     if (native_geometry_in_use()) { chs_geometry_lost = false; return true; }
+    // Re-review of 0.6f3p10, N-1: the drive was mounted in the power-up
+    // default mode and no Ctrl+G or Auto Detect has come since: no 0x91 at
+    // all, even with the mode ended. And never a geometry of 0 heads or 0
+    // sectors, which would go out as 16 heads and 0 sectors.
+    if (native_declared || heads == 0 || spt == 0) return false;
     ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
     ide_write_reg(2, spt);
     idp_written = true;
@@ -629,6 +644,7 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
 // or ended the command with ERR. -1: IDENTIFY was sent and gave no data in
 // time; the drive may still be working on it.
 static int identify_run(uint16_t *buf) {
+    if (mchs_no_identify) return 0;     // re-review of 0.6f3p10, N-3: every IDENTIFY comes through here
     if (!ide_wait_until_ready(work_ms(1000))) return 0;
     if (ide_read_reg(7) & 0x08) ide_drain_sector();   // drain stranded DRQ before command
     ide_write_reg(6, dev_base);
@@ -1165,6 +1181,7 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
     // is not known). Nothing is sent and nothing changes.
     if (native && idp_written) return IDE_MCHS_IDP_SENT;
     native_geo.on = false;          // set again below only by a native mount that ends well
+    native_declared = false;
     mchs_no_identify = true;        // from here on this drive gets no IDENTIFY (M-1)
 #if ATABOY_SAT
     id_words.valid = false;         // this drive is never asked who it is
@@ -1231,6 +1248,7 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
         }
         chs_geometry_lost = false;  // the power-up default is the geometry in use
         native_geo.on = true;
+        native_declared = true;
         native_geo.dev_base = dev_base;
         native_geo.heads = heads;
         native_geo.spt = spt;

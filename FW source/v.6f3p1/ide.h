@@ -240,6 +240,11 @@ bool    ide_manual_chs_native_active(void);
 // and the no-IDENTIFY rule below stay as they are.
 void    ide_manual_chs_native_forget(void);
 
+// True from a native mount until the next Ctrl+G that sends anything or
+// Auto Detect's probe, even after ide_manual_chs_native_forget(): no 0x91
+// goes to the drive meanwhile (re-review of 0.6f3p10, N-1).
+bool    ide_native_drive(void);
+
 // True once this firmware has written INITIALIZE DEVICE PARAMETERS (0x91)
 // to the bus since it booted, by any path. A native Ctrl+G is refused
 // while it is true (IDE_MCHS_IDP_SENT): the drive may still hold that 91h's

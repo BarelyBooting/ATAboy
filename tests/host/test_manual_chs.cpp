@@ -112,6 +112,10 @@ static void fresh(const char *name) {
     chs_geometry_lost = false;
     manual_chs_active = false; iordy_held = false;
     native_geo.on = false; idp_written = false; mchs_no_identify = false;
+#ifdef MCHS_MODEL_CLEARED
+    native_declared = false;
+#endif
+    sim_on_read = nullptr;
     saves = 0; busy_until_ns = 0; pend_at_ns = 0;
     tty.clear(); rx.clear(); rxi = 0;
     hang_limit_ns = mock_now_ns + 300000000000ull;  // 300 s of mock time
@@ -862,12 +866,16 @@ static void test_native_forgotten() {
     CHECK(!ide_manual_chs_native_active(), "native with other heads");
     config.heads = NH; config.spt = 17;             // review of p10, I-1
     CHECK(!ide_manual_chs_native_active(), "native with other sectors per track");
-    debug_reset();                                  // a reset: the old rule then sends 0x91
+    debug_reset();
     size_t m2 = sim.cmd_log.size();
-    read_right(0);
-    CHECK(cmds_since(m2).size() >= 1 && cmds_since(m2)[0] == 0x91 && sim.spt == 17,
-          "other sectors per track: 0x91 not sent for them (%zu commands)", sim.cmd_log.size() - m2);
-    config.spt = NS; native_geo.on = true;          // put back as it was (the read above sent 0x91)
+    int32_t got2 = 0;
+    read_right(0, &got2);
+#ifdef MCHS_MODEL_CLEARED
+    // Re-review (N-1): still the drive declared native: refused, no 0x91.
+    CHECK(got2 < 0 && idp_sent() == 0 && sim.cmd_log.size() == m2,
+          "other sectors per track: %d, 0x91 %d", (int)got2, idp_sent());
+#endif
+    config.spt = NS;
     config.use_lba_mode = true;
     CHECK(!ide_manual_chs_native_active(), "native in LBA mode");
     config.use_lba_mode = false; ide_select_device(0xB0);
@@ -1041,8 +1049,9 @@ static void test_p10_h1_idp_since_boot() {
     native_drive("H-1: a 91h after a reset counts too");
     ctrl_g_native();
     CHECK(!ide_idp_sent_since_boot(), "native mount set it");
-    config.heads = 2; config.spt = 17;              // not the native geometry: the old rule applies
-    debug_reset();
+    native_drive("H-1: a 91h after a reset counts too (saved geometry, no Ctrl+G)");
+    config.cyls = NC; config.heads = 2; config.spt = 17;
+    chs_geometry_lost = true;                       // as at power-up
     read_right(0);
     CHECK(ide_idp_sent_since_boot() && idp_sent() == 1, "0x91 from ide_set_geometry not counted");
 
@@ -1053,6 +1062,112 @@ static void test_p10_h1_idp_since_boot() {
     keys("522\r4\r40\ry"); run_manual_chs();
     CHECK(idp_sent() == 1 && !ide_manual_chs_native_active(), "old mode refused");
 }
+
+// ---- 12. re-review of 0.6f3p10 -------------------------------------------------
+// N-1: an unmount while a USB read is still in its reset recovery. The read
+// (core 0) is the one below; the unmount (core 1) is run from a register
+// read once the soft reset has gone out, with usb.c's busy flag up.
+static int n1_fired;
+static void n1_unmount() {
+    if (sim.srst < 1) return;
+    sim_on_read = nullptr;
+    n1_fired++;
+    busy_until_ns = ~0ull;                          // the read is still running
+    is_mounted = false;
+    menu_unmount();
+}
+static void test_p10_n1_unmount_during_recovery() {
+    native_drive("N-1: unmount during a read's recovery");
+    ctrl_g_native();
+    is_mounted = true;
+    sim.srst_wedges = true;                         // SRST does not bring it back: RESET-, RECALIBRATE
+    sim.bad[4321] = {BAD_HANG, 0};
+    n1_fired = 0;
+    sim_on_read = n1_unmount;
+    int32_t got = 0;
+    read_right(4321, &got);
+    busy_until_ns = 0;
+    CHECK(n1_fired == 1 && got < 0 && sim.srst == 1 && sim.hw_resets == 2, "fired %d, srst %d, resets %d",
+          n1_fired, sim.srst, sim.hw_resets);
+    CHECK(idp_sent() == 0 && !ide_idp_sent_since_boot(), "0x91 sent during the recovery: %d", idp_sent());
+    // The unmount waited for the read: it could not end the mode or clear
+    // config under it, and the recovery finished with the geometry intact.
+    ide_fail_t f1; ide_last_failure(&f1);
+    CHECK(ide_manual_chs_native_active() && config.heads == NH && config.spt == NS && !f1.reset_failed,
+          "mode %d, config %u/%u, reset failed %d", ide_manual_chs_native_active(), config.heads, config.spt, f1.reset_failed);
+    bool gv = (use_lba_mode && total_lba_sectors > 0) || (!use_lba_mode && cur_cyls > 0 && cur_heads > 0 && cur_spt > 0);
+    CHECK(!gv, "something left to mount after the unmount");
+    // Nothing more reaches the drive as 0x91 afterwards either.
+    debug_reset();
+    read_right(1234, &got);
+    CHECK(idp_sent() == 0, "0x91 after the unmount: %d", idp_sent());
+
+    // The same race, with the mode and geometry already cleared under the
+    // recovery (as c17fc81's unmount did): ide.c alone must not send 0x91.
+    native_drive("N-1: ide.c alone, mode and geometry cleared under a recovery");
+    ctrl_g_native();
+    sim.srst_wedges = true;
+    sim.bad[4321] = {BAD_HANG, 0};
+    bool right = false;
+    host_read(4321, &right);                        // the recovery outlasts this command
+    CHECK(ide_recovery_pending(), "no recovery pending to race");
+    ide_manual_chs_native_forget();
+    config.cyls = 0; config.heads = 0; config.spt = 0;
+    for (int i = 0; i < 6 && ide_recovery_pending(); i++) host_read(1234, &right);
+    CHECK(idp_sent() == 0, "0x91 sent with the geometry cleared: %d", idp_sent());
+    native_drive("N-1: ide.c alone, mode cleared, geometry kept");
+    ctrl_g_native();
+    sim.srst_wedges = true;
+    sim.bad[4321] = {BAD_HANG, 0};
+    host_read(4321, &right);
+    ide_manual_chs_native_forget();
+    for (int i = 0; i < 6 && ide_recovery_pending(); i++) host_read(1234, &right);
+    CHECK(idp_sent() == 0, "0x91 sent after the mode was cleared: %d", idp_sent());
+#ifdef MCHS_MODEL_CLEARED
+    // ...until a new Ctrl+G (old mode) or Auto Detect: then 91h as before.
+    keys("522\r4\r40\ry"); run_manual_chs();
+    CHECK(idp_sent() == 1 && !ide_native_drive(), "old-mode Ctrl+G after: 0x91 %d", idp_sent());
+    // Never 0 heads or 0 sectors, in any mode.
+    native_drive("N-1: no 0x91 with 0 heads or 0 sectors");
+    CHECK(!ide_set_geometry(0, 40) && !ide_set_geometry(4, 0) && sim.cmd_log.empty(), "sent %zu", sim.cmd_log.size());
+#endif
+}
+
+#ifdef MCHS_MODEL_CLEARED
+// N-2: after a native unmount, Mount and the error box keep the Ctrl+G text
+// on Current HDD until Auto Detect; ataboy_autodetect.ctrlg_refusal looks
+// for text starting "Manual CHS (no IDENTIFY)", or "Manual CHS: ".
+static void test_p10_n2_marker_kept() {
+    native_drive("N-2: Mount after a native unmount");
+    ctrl_g_native();
+    is_mounted = true;
+    menu_unmount();
+    mount_nothing_to_mount();
+    CHECK(strcmp(hdd_model_raw, MCHS_MODEL_CLEARED) == 0 && strstr(hdd_status_text, "Manual CHS: geometry cleared, Ctrl+G again"),
+          "\"%s\" / \"%s\"", hdd_model_raw, hdd_status_text);
+    tty.clear(); update_main_menu();
+    CHECK(has("Manual CHS: geometry cleared"), "row 22 lost the Ctrl+G text");
+    detect_result_dismiss();
+    tty.clear(); update_main_menu();
+    CHECK(has("Current HDD: ") && has(MCHS_MODEL_CLEARED) && has("0 Cyl / 0 Hd / 0 SPT"), "after dismissing");
+    // A failed Ctrl+G (either mode) is marked the same once dismissed.
+    native_drive("N-2: a failed Ctrl+G, dismissed");
+    sim.reject_idp = true;
+    keys("522\r4\r40\ry"); run_manual_chs();
+    detect_result_dismiss();
+    CHECK(strcmp(hdd_model_raw, MCHS_MODEL_CLEARED) == 0, "\"%s\"", hdd_model_raw);
+    // Auto Detect ends it: as before.
+    native_drive("N-2: not after Auto Detect");
+    sim.identify_ok = false;
+    ctrl_g_native();
+    keys("\r");
+    run_auto_detect();
+    detect_result_dismiss();
+    CHECK(hdd_model_raw[0] == 0, "\"%s\" after Auto Detect", hdd_model_raw);
+    mount_nothing_to_mount();
+    CHECK(strstr(hdd_status_text, "Detect drive and set geometry first!") && hdd_model_raw[0] == 0, "\"%s\"", hdd_status_text);
+}
+#endif
 
 // ---- 7. through the main loop: Ctrl+G reaches the entry ---------------------
 // Last, since core1_entry never returns (on_idle ends the program).
@@ -1192,6 +1307,10 @@ int main() {
     test_p10_m2_consistent();
     test_p10_l1_unmount();
     test_p10_h1_idp_since_boot();
+    test_p10_n1_unmount_during_recovery();
+#ifdef MCHS_MODEL_CLEARED
+    test_p10_n2_marker_kept();
+#endif
     test_core1();                                   // does not return
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;

@@ -1019,10 +1019,23 @@ static void menu_unmount(void) {
     // geometry with it: Mount then refuses until a new Ctrl+G. Current HDD
     // keeps saying it was a Ctrl+G drive, so the host tools still refuse
     // Auto Detect on it.
+    //
+    // Re-review of 0.6f3p10, N-1: a USB read that started before the unmount
+    // can still be running, even recovering from a reset, and it works from
+    // config and the mode. So only the menu's own copy is cleared at once
+    // (Mount then has nothing), and the mode and config only once that read
+    // has ended. If it is still running after IDE_BUS_WAIT_MS, both are left
+    // as they are: the next Ctrl+G or Auto Detect replaces them. ide.c sends
+    // no 0x91 to this drive either way (ide_native_drive).
     if (ide_manual_chs_native_active()) {
-        ide_manual_chs_native_forget();
         cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;
-        sync_to_config();
+        uint32_t t0 = to_ms_since_boot(get_absolute_time());
+        while (usb_msc_ide_busy() && to_ms_since_boot(get_absolute_time()) - t0 < IDE_BUS_WAIT_MS)
+            sleep_ms(10);
+        if (!usb_msc_ide_busy()) {
+            ide_manual_chs_native_forget();
+            sync_to_config();
+        }
     }
 }
 
@@ -1198,6 +1211,11 @@ static bool run_auto_detect(void) {
 // Review of 0.6f3p10, H-1: the power-up default mode is not offered after
 // this firmware has sent 91h since it booted.
 #define MCHS_NATIVE_REFUSED "Refused: 91h already sent. Power-cycle drive and ATAboy."
+// Re-review of 0.6f3p10, N-2: Current HDD and the Mount refusal after a
+// Ctrl+G geometry was cleared (unmount in the power-up default mode, the
+// error box), until Auto Detect. Both still start with the Ctrl+G texts.
+#define MCHS_MODEL_CLEARED "Manual CHS (no IDENTIFY) cleared"
+#define MCHS_NEEDED        "Manual CHS: geometry cleared, Ctrl+G again"
 static const int mchs_field_col[3] = {18, 34, 50};
 
 // One line of the box's interior (62 columns), text centred, in `color`.
@@ -1345,6 +1363,35 @@ static bool run_manual_chs(void) {
     return true;
 }
 
+// The error box dismissed (Enter or Esc): nothing is left set up. Re-review
+// of 0.6f3p10, N-2: after a Ctrl+G, until Auto Detect, Current HDD keeps
+// saying so (MCHS_MODEL_CLEARED), for the host tools that refuse Auto
+// Detect on a Ctrl+G drive. Otherwise as before.
+static void detect_result_dismiss(void) {
+    show_detect_result = false; hdd_status_text[0] = '\0'; hdd_model_raw[0] = '\0';
+    if (ide_mchs_no_identify()) strcpy(hdd_model_raw, MCHS_MODEL_CLEARED);
+    cur_cyls = 0; cur_heads = 0; cur_spt = 0;
+    total_lba_sectors = 0; use_lba_mode = false; is_mounted = false;
+    media_changed_waiting = true;   // as every other unmount path does
+    sync_to_config(); needs_full_redraw = true;
+}
+
+// Mount with no drive or no geometry set: the error box (the caller draws
+// it). Re-review of 0.6f3p10, N-2: after a Ctrl+G, until Auto Detect, it
+// says a new Ctrl+G is needed and Current HDD keeps the Ctrl+G text.
+static void mount_nothing_to_mount(void) {
+    if (ide_mchs_no_identify()) {
+        snprintf(hdd_status_text, sizeof(hdd_status_text), "\033[91;1m" MCHS_NEEDED);
+        strcpy(hdd_model_raw, MCHS_MODEL_CLEARED);
+    } else {
+        snprintf(hdd_status_text, sizeof(hdd_status_text), "\033[91;1mDetect drive and set geometry first!");
+        hdd_model_raw[0] = '\0';
+    }
+    cur_cyls = 0; cur_heads = 0; cur_spt = 0;
+    total_lba_sectors = 0; use_lba_mode = false; is_mounted = false;
+    show_detect_result = true; needs_full_redraw = true;
+}
+
 // Y at "Save Current Setup to EEPROM" (F10, or the main menu item). Review of
 // 0.6f3p8 (L-1): with Auto Mount on, every power-up resets the drive and
 // sends it IDENTIFY before anything else (try_auto_mount), whenever a
@@ -1438,11 +1485,7 @@ void core1_entry(void) {
 
         if (show_detect_result) {
             if (k == KEY_ENTER || k == KEY_ESC) {
-                show_detect_result = false; hdd_status_text[0] = '\0'; hdd_model_raw[0] = '\0';
-                cur_cyls = 0; cur_heads = 0; cur_spt = 0;
-                total_lba_sectors = 0; use_lba_mode = false; is_mounted = false;
-                media_changed_waiting = true;   // as every other unmount path does
-                sync_to_config(); needs_full_redraw = true;
+                detect_result_dismiss();
             } else if (force_detect && (k == 'f' || k == 'F')) {
                 show_detect_result = false; hdd_status_text[0] = '\0';
                 force_detect = false;
@@ -1555,10 +1598,8 @@ void core1_entry(void) {
                     bool dv = (hdd_model_raw[0] != '\0');
                     bool gv = (use_lba_mode && total_lba_sectors > 0) || (!use_lba_mode && cur_cyls > 0 && cur_heads > 0 && cur_spt > 0);
                     if (!dv || !gv) {
-                        snprintf(hdd_status_text, sizeof(hdd_status_text), "\033[91;1mDetect drive and set geometry first!");
-                        hdd_model_raw[0] = '\0'; cur_cyls = 0; cur_heads = 0; cur_spt = 0;
-                        total_lba_sectors = 0; use_lba_mode = false; is_mounted = false;
-                        show_detect_result = true; trigger_overlay = true; needs_full_redraw = true;
+                        mount_nothing_to_mount();
+                        trigger_overlay = true;
                     } else { current_screen = SCREEN_CONFIRM; confirm_type = 3; trigger_overlay = true; needs_full_redraw = true; }
                 } else if (config.main_selected == 2) {
                     current_screen = SCREEN_FEATURES; config.feat_selected = 0; needs_full_redraw = true;
