@@ -104,7 +104,23 @@ Added in 0.6f3p10 (built and host-tested, not yet run on hardware):
 
     **After the Ctrl+G reset, a floating bus (FFh) is waited for** up to the same 45 seconds as a busy one, since a drive older than ATA may not drive the bus at once; only FFh all that time is "no drive answered".
 
-The fork's build calls itself `0.6f3p10-palimpsest` and shows `v0.6f3p10 (fork)` in the setup screen (0.6f3p1 before items 6 to 15, 0.6f3p6 before 16 to 21, 0.6f3p7 before 22, 0.6f3p8 before 23 to 26, 0.6f3p9 before 27 and 28), so it can't be mistaken for a stock v0.6f3.
+29. **Holistic review of the whole firmware, before it goes on hardware (2026-09-26).** Built and host-tested, not yet run on hardware.
+
+    **Reads: DRQ must fall between blocks.** After each block of a multi-sector READ SECTORS the firmware went straight back to polling status, and took the first status with DRQ set as the next block. A drive whose DRQ stayed up a moment after a block (a 1990 drive isn't bound by ATA-4's 400 ns) had that same status read as the next block's DRQ: 256 words read while nothing drove the bus (FFFFh on this board), every later block one out, and all of it handed to the host with good status. The same-mount verify pass can't catch that, since the drive does it the same way every time. Now, after each block but the last, Alternate Status is read and polled closely for up to 1 ms until DRQ is low or BSY high. If DRQ is still up after that, the whole command fails and none of its sectors is handed over, as also happens now when a drive still offers data after the last block (it used to hand over all but the last). A drive that goes straight from one block's DRQ to the next with no visible gap can't be told from one whose DRQ is stuck, so it fails every multi-sector read, reported as "bad end" in Debug E, never silently; for such a drive, read one sector per command (imagelba `-Chunk 1`). Writes (donor drives only; a Ctrl+G drive is write protected) get the same check after each block, and a write that ends with DF or with DRQ still up is no longer taken as done. A device fault (DF) during a read now ends it like ERR, and the drive is reset.
+
+    **No more than 16 heads, anywhere.** 17 heads went to the drive as 1 in 91h (`(17 - 1) & 0Fh`) while the firmware addressed head 16 as head 0: other sectors, good status. The Auto Detect picker's manual row and F: Force now refuse what Ctrl+G refuses (heads 1 to 16, cylinders 1 to 65535, sectors 1 to 255), a picker row whose heads exceed 16 (IDENTIFY word 3 above 16, or the LARGE translation's 32 and more, which could never have worked) isn't applied, 91h and every CHS address refuse more than 16 heads whatever set them, and saved settings with more are not loaded. Nothing is cut to four bits any more.
+
+    **Bus timing.** Every task file access is an 8-bit transfer, whose ATA mode 0 minimum strobe is 290 ns, not the 165 ns of 16-bit data. The write strobe was 300 ns. Now DIOW- is 400 ns with 200 ns data setup, DIOR- 500 ns with the data sampled at 400 ns, every figure at least 100 ns over its minimum; `ataboy.pio`'s header has the table, and a host test works the figures out from the file and fails below that. The state machines' clock divider is worked out from the system clock that is actually running, rounded up so a cycle is never shorter than 100 ns (it was a fixed 15, right only at 150 MHz). Each word costs 100 to 200 ns more; that doesn't show behind USB.
+
+    **The settings sector** has a CRC-32 and every field is range-checked when it's loaded; anything wrong (a torn write, a flipped bit, an older layout) loads the defaults: write protect on, Auto Mount off. Settings saved by any earlier build load as defaults once. **F10 and Load Setup Defaults** now wait for a USB command still running, as the other bus users do, or say so and save nothing.
+
+    **IDENTIFY** is only taken once the command has ended cleanly (BSY and DRQ clear, no ERR or DF), and its 48-bit capacity words are only used when word 83 says the drive has the 48-bit feature set.
+
+    **Faults.** A HardFault on either core used to lock the core up with the bus as it was, possibly with CS0- asserted and DIOR- held low. Now it runs on a stack of its own, records the core, PC, LR and CFSR where a warm reset keeps them (Debug E: "Fault before this boot: ..."), releases the bus (data lines as inputs behind both transceivers disabled, DIOR-, DIOW-, CS0- and CS1- negated, RESET- not asserted, the state machines stopped), holds the other core in reset and stops. It doesn't reboot: a reboot would re-enumerate USB mid-session, clear the no-IDENTIFY rule and could run Auto Mount. Unplug to recover. **Stacks:** core 0 has all 4 KB of its scratch bank and core 1 its own 8 KB (it measured 2 KB deep against a 2 KB stack), both with the RP2350's stack limit set at the bottom, and core 1 checks a canary above its limit on every pass of its loop.
+
+    **Pins.** The firmware was built as a Raspberry Pi Pico 2, whose board file names GPIO 25 (CS1- here) as its LED and GPIO 23 and 24 (RESET- and CS0-) as power pins. It is now built for its own board file, `boards/ataboy_rev6.h`, which names none of those, and the build refuses a board file that does. After a warm reset (Ctrl+F flashing), RESET-, CS0-, CS1- and the transceiver enables used to fall to their pad pull-downs for a moment while the firmware took them over; they are now driven high before they are switched. The main screen shows the chip's stepping (right panel, "Chip: RP2350 A4").
+
+The fork's build calls itself `0.6f3p10-palimpsest` and shows `v0.6f3p10 (fork)` in the setup screen (0.6f3p1 before items 6 to 15, 0.6f3p6 before 16 to 21, 0.6f3p7 before 22, 0.6f3p8 before 23 to 26, 0.6f3p9 before 27 to 29), so it can't be mistaken for a stock v0.6f3.
 
 ## Builds
 
@@ -118,10 +134,12 @@ To build locally with the same toolchain:
 
 ```
 cmake -S "FW source/v.6f3p1" -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DPICO_BOARD=pico2 -DPICO_SDK_PATH=<sdk> -DPICO_TOOLCHAIN_PATH=<toolchain> \
+  -DPICO_SDK_PATH=<sdk> -DPICO_TOOLCHAIN_PATH=<toolchain> \
   -Dpicotool_DIR=<picotool>
 ninja -C build
 ```
+
+The board is set in `CMakeLists.txt` (`ataboy_rev6`, item 29); a `-DPICO_BOARD` on the command line is overridden.
 
 ## Not official
 
