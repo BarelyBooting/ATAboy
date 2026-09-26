@@ -1277,7 +1277,8 @@ static void test_c3_c5_c8() {
           srs.native_failed == 1 && srs.idp_resent == 0, "read %d, 0x91 %d, kind %u, counts %u %u", (int)g, idp_sent(), fr.kind,
           srs.detected, srs.native_failed);
     tty.clear(); run_debug_errors();
-    CHECK(has("drive reset itself at LBA 1234") && has("Self-resets 1, last LBA 1234; 91h again 0, failed 1"), "Debug E");
+    CHECK(has("[Last Failed I/O] drive reset itself before LBA 1234") && has("Self-resets 1, last LBA 1234") &&
+          has("Self-resets: 91h again 0, failed 1"), "Debug E");
     CHECK(read_right(1234) && idp_sent() == 0, "the next read");
 
     // Round 3, C3-1: in the power-up default mode, a drive that does not keep
@@ -1303,7 +1304,15 @@ static void test_c3_c5_c8() {
     self_resets.detected = 4294967295u; self_resets.last_lba = 4294967295u;
     self_resets.idp_resent = 4294967295u; self_resets.native_failed = 4294967295u;
     self_resets.unavailable = true; self_resets.unheld = 4294967295u;
+    last_fail.kind = IDE_FAIL_SELF_RESET; last_fail.lba = 4294967295u;
     tty.clear(); run_debug_errors();
+    // Every number whole at its largest (the host reads them), and each row
+    // whole: its text, padded to the box, then the reset (nothing was cut).
+    auto whole = [](const std::string &row) { return has((row + std::string(68 - row.size(), ' ') + "\033[0m").c_str()); };
+    CHECK(whole("[Last Failed I/O] drive reset itself before LBA 4294967295") &&
+          whole("Self-resets 4294967295, last LBA 4294967295") &&
+          whole("Self-resets: 91h again 4294967295, failed 4294967295") &&
+          whole("Self-reset check OFF: drive does not keep SC/SN (x4294967295)"), "a Debug E self-reset row cut at the largest values");
     bool inbox = true;
     for (int row = 4; row <= 20; row++) {
         std::string at = "\033[" + std::to_string(row) + ";7H\033[40m";
@@ -1318,12 +1327,52 @@ static void test_c3_c5_c8() {
         }
     }
     CHECK(inbox, "a Debug E row is wider than the box");
+    // A generic record can still run past 68 columns at its largest (a
+    // 10-digit LBA and 3-digit counts): it is cut at the box, not spilled.
+    native_drive("C3: a long generic Debug E record is cut at the box");
+    last_fail.kind = IDE_FAIL_STALE_DRQ; last_fail.command = 0x20; last_fail.lba = 4294967295u;
+    last_fail.done = 255; last_fail.count = 256;
+    tty.clear(); run_debug_errors();
+    std::string cut = "[Last Failed I/O] cmd 20 stale data at LBA 4294967295, 255 of 256 do";
+    CHECK(cut.size() == 68 && has((cut + "\033[0m").c_str()), "the long record is not cut at 68 columns");
 #endif
     // C-8: a drive that floats the bus (FFh) for 5 s after RESET- is waited for.
     native_drive("C-8: FFh for 5 s after RESET-");
     sim.t_float = 5000000000ull;
     keys("\x07" "522\r4\r40\ry");
     CHECK(!run_manual_chs() && cur_cyls == NC, "\"%s\"", hdd_status_text);
+}
+#endif
+
+#ifdef IDE_SENTINEL_SC
+// ---- 15. mutation run of fa3190a: coverage the review C changes removed ------------
+static void test_fa3190a_gaps() {
+    // Auto Detect starts by clearing whatever geometry was set, on screen
+    // and in config (review P2 of 0.6f3p8), so leaving its picker with Esc
+    // leaves nothing to mount. Since review C (C-3) Auto Detect is refused
+    // after a Ctrl+G, so the geometry here is an earlier one (EEPROM).
+    fresh("fa3190a: Auto Detect clears an earlier geometry");
+    sim.identify_ok = true;
+    earlier_setup();
+    keys("\x1b");
+    run_auto_detect();
+    CHECK(sim.id_commands() == 1, "Auto Detect did not run");
+    CHECK(cur_cyls == 0 && cur_heads == 0 && cur_spt == 0 && !use_lba_mode && total_lba_sectors == 0,
+          "screen kept %u/%u/%u", cur_cyls, cur_heads, cur_spt);
+    CHECK(config.cyls == 0 && config.heads == 0 && config.spt == 0 && !config.use_lba_mode && config.lba_sectors == 0,
+          "config kept %u/%u/%u", config.cyls, config.heads, config.spt);
+    // ide.c on its own: only an IDENTIFY that answers ends the Ctrl+G flag;
+    // one that fails leaves it (the probe is how the no-IDENTIFY rule ends,
+    // and it is only reached through Auto Detect, which the menu refuses
+    // after a Ctrl+G: this is the rule underneath).
+    fresh("fa3190a: an IDENTIFY that fails keeps the Ctrl+G flag (ide.c)");
+    ctrl_g();
+    ide_probe_devices();
+    sim.identify_ok = false;
+    uint16_t id[256];
+    CHECK(!ide_identify(id) && ide_manual_chs_active(), "flag cleared by an IDENTIFY that failed");
+    sim.identify_ok = true;
+    CHECK(ide_identify(id) && !ide_manual_chs_active(), "flag kept after an IDENTIFY that answered");
 }
 #endif
 
@@ -1472,6 +1521,9 @@ int main() {
 #endif
 #ifdef AUTODETECT_CONFIRM
     test_c3_c5_c8();
+#endif
+#ifdef IDE_SENTINEL_SC
+    test_fa3190a_gaps();
 #endif
     test_core1();                                   // does not return
     printf("%d checks, %d failed\n", checks, failures);

@@ -800,6 +800,8 @@ static void run_debug_errors(void) {
         else if (f.kind == IDE_FAIL_MCHS_NOT_READY)     // 0.6f3p10, power-up default mode
             debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X, manual CHS: not ready after 10h (no 91h)",
                         f.command);
+        else if (f.kind == IDE_FAIL_SELF_RESET)         // review C round 2; 59 columns at most
+            debug_print(2, FG_YELLOW, "[Last Failed I/O] drive reset itself before LBA %lu", (unsigned long)f.lba);
         else
             debug_print(2, FG_YELLOW, "[Last Failed I/O] cmd %02X %s at LBA %lu, %lu of %lu done",
                         f.command, kinds[f.kind < 12 ? f.kind : 0], (unsigned long)f.lba,
@@ -829,13 +831,17 @@ static void run_debug_errors(void) {
     // Review C round 2, C2-1: every drive self-reset seen, and what was done.
     ide_self_resets_t sr;
     ide_self_resets(&sr);
-    if (sr.detected)
-        debug_print(6, FG_YELLOW, "Self-resets %lu, last LBA %lu; 91h again %lu, failed %lu",
-                    (unsigned long)sr.detected, (unsigned long)sr.last_lba,
+    // Two rows so that every number fits at its largest (4294967295): 45 and
+    // 51 columns (the host reads the counts; a cut row would lose them).
+    if (sr.detected) {
+        debug_print(6, FG_YELLOW, "Self-resets %lu, last LBA %lu",
+                    (unsigned long)sr.detected, (unsigned long)sr.last_lba);
+        debug_print(7, FG_YELLOW, "Self-resets: 91h again %lu, failed %lu",
                     (unsigned long)sr.idp_resent, (unsigned long)sr.native_failed);
-    // Review C round 3, C3-1: the check is off for this mount.
+    }
+    // Review C round 3, C3-1: the check is off for this mount (58 at most).
     if (sr.unavailable)
-        debug_print(7, FG_YELLOW, "Self-reset check OFF: drive does not keep SC/SN (x%lu)",
+        debug_print(8, FG_YELLOW, "Self-reset check OFF: drive does not keep SC/SN (x%lu)",
                     (unsigned long)sr.unheld);
 }
 

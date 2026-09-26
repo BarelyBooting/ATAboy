@@ -71,6 +71,9 @@ struct HostRead {
     uint8_t key = 0, asc = 0;    // sense the firmware set (TinyUSB overwrites it today)
 };
 
+// Called between two chunks of one READ(10), when set (mutation run of
+// fa3190a): what the drive does on its own while the host sends nothing.
+static void (*between_chunks)() = nullptr;
 static void host_read10_body(HostRead &h, uint32_t lba, uint32_t nblocks) {
     uint32_t total = nblocks * 512, xferred = 0;
     static uint8_t epbuf[CFG_TUD_MSC_EP_BUFSIZE];
@@ -90,6 +93,7 @@ static void host_read10_body(HostRead &h, uint32_t lba, uint32_t nblocks) {
         if ((uint32_t)r > n) { std::printf("callback returned more than asked\n"); return; }
         h.data.insert(h.data.end(), epbuf, epbuf + r);
         xferred += r;
+        if (between_chunks && xferred < total) between_chunks();
     }
     h.ok = true;
 }
@@ -2454,6 +2458,19 @@ static void test_min_window_after_ready_wait() {
     CHECK(!h.ok && h.data.size() == 8 * 512 && sim.cmd_count[0x20] == 1 && no_reset(),
           "ok %d got %zu, %d READs", h.ok, h.data.size(), sim.cmd_count[0x20]);
     CHECK(f.kind == IDE_FAIL_NO_TIME && f.lba == MW + 8, "record kind %u lba %u", f.kind, f.lba);
+
+    // Since review C (C-2) a read waits for the end of its own command, so
+    // busy_after above is absorbed by the first chunk. The same check, with
+    // the drive going busy on its own between the two chunks instead.
+    setup("min window: checked again after the ready wait (busy between chunks)", LBA);
+    sim.pause[MW + 2] = 2000000000ull;
+    between_chunks = [] { sim.status = 0x80; sim.ready_at = mock_now_ns + 4000000000ull; };
+    h = host_read10(MW, 16);
+    between_chunks = nullptr;
+    ide_last_failure(&f);
+    CHECK(!h.ok && h.data.size() == 8 * 512 && sim.cmd_count[0x20] == 1 && no_reset(),
+          "between chunks: ok %d got %zu, %d READs", h.ok, h.data.size(), sim.cmd_count[0x20]);
+    CHECK(f.kind == IDE_FAIL_NO_TIME && f.lba == MW + 8, "between chunks: record kind %u lba %u", f.kind, f.lba);
 }
 
 // ...and after INITIALIZE DEVICE PARAMETERS, for a write. CHS mode with the
@@ -3492,6 +3509,21 @@ static void test_c2r_once_per_mount() {
     CHECK(zero, "READ BUFFER is not the unchanged no-capture layout after a self-reset (r %d)", b.r);
     h = host_read10(5008, 8);
     CHECK(h.ok && sim.init_params == 1, "and not again: 0x91 %d", sim.init_params);
+
+    // Any command disarms the sentinel: after a read that failed with ERR
+    // (no reset, the drive idle), the registers are the drive's, and the next
+    // command must not take them for a self-reset (mutation run of fa3190a).
+    setup("C2-1: a failed read is not a self-reset, 91h mode", CHS);
+    chs_user_geometry();
+    h = host_read10(4000, 8);
+    sim.bad[5003] = {BAD_ERR, 0};
+    uint8_t eb[8 * 512]; uint32_t ed = 0;
+    CHECK(ide_read_sectors_partial(5000, 8, eb, &ed) < 0 && sim.srst == 0, "the bad read: srst %d", sim.srst);
+    sim.bad.clear();
+    h = host_read10(6000, 8);
+    ide_self_resets(&sr);
+    CHECK(h.ok && sr.detected == 0 && sim.init_params == 0, "after a failed read: ok %d, detected %u, 0x91 %d", h.ok, sr.detected,
+          sim.init_params);
 
     // ide_set_geometry no longer takes the status 1 us after 91h as its
     // answer: a drive slow to raise BSY, with an ERR left by a failed read.
