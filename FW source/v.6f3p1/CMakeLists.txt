@@ -23,7 +23,13 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
-set(PICO_BOARD pico2 CACHE STRING "Board type")
+# Holistic review 2026-09-26 (the owner's RP2354B guide, L1): the board is
+# the ATAboy Rev .6, not a pico2, whose header names GPIO 23, 24, 25 and 29
+# (RESET-, CS0-, CS1-, IORDY here) as power pins and an LED. FORCE: a
+# -DPICO_BOARD=pico2 on the command line (the CI workflow's, the README's)
+# must not bring the pico2 header back.
+set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards)
+set(PICO_BOARD ataboy_rev6 CACHE STRING "Board type" FORCE)
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -42,7 +48,8 @@ add_executable(ATAboy
         menus.c
         usb.c
         usb_descriptors.c
-        config.c)
+        config.c
+        fault.c)
 
 pico_set_program_name(ATAboy "ATAboy")
 
@@ -72,6 +79,11 @@ target_link_libraries(ATAboy
 target_include_directories(ATAboy PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
+
+# palimpsest fork, holistic review 2026-09-26 (L-4): stacks. Core 0 gets all of
+# SCRATCH_Y (4 KB; it peaked near 1.7 KB of the SDK's 2 KB), core 1 its own 8 KB
+# (ATAboy.c), and both a stack limit (MSPLIM) at the bottom.
+target_compile_definitions(ATAboy PRIVATE PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0 PICO_USE_STACK_GUARDS=1)
 
 # palimpsest fork: never zero-fill reads beyond the configured medium (see usb.c)
 target_compile_definitions(ATAboy PRIVATE ATABOY_STRICT_MEDIA_BOUNDS=1)

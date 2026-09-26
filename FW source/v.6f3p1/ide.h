@@ -129,6 +129,35 @@ typedef struct {
     uint32_t count;         // sectors requested
 } ide_fail_t;
 
+// Holistic review (2026-09-26), fault handling: what a fault left behind
+// for Debug E, in RAM the runtime does not clear, so it survives a warm
+// reset (not a power cycle). valid only while magic matches.
+#define IDE_FAULT_MAGIC 0xFA017ED5u
+#define IDE_FAULT_CANARY 0xCA4A2Du  // cfsr value used for a core 1 stack canary hit
+typedef struct {
+    uint32_t magic;
+    uint32_t core, pc, lr, cfsr;
+} ide_fault_t;
+// The fault handler (fault.c) and the core 1 stack check call these: the
+// record first, then the bus released: DD0-15 inputs behind both
+// transceivers disabled (OE- high, DIR B to A), DIOR-, DIOW-, CS0-, CS1-
+// negated (high) as plain outputs, RESET- high (not asserted), the PIO
+// state machines stopped.
+void    ide_fault_record(uint32_t core, uint32_t pc, uint32_t lr, uint32_t cfsr);
+void    ide_fault_release_bus(void);
+// The record from before this boot, if any (Debug E).
+bool    ide_fault_last(ide_fault_t *out);
+
+// Holistic review L-3: the 48-bit capacity from IDENTIFY words 100 to 103,
+// or 0 unless word 83 says the drive has the 48-bit feature set (bit 10)
+// with a valid word (bits 15:14 = 01b). A drive older than ATA-6 may have
+// anything in those words.
+static inline uint64_t ide_identify_lba48(const uint16_t *id) {
+    if ((id[83] & 0xC400u) != 0x4400u) return 0;
+    return ((uint64_t)id[103] << 48) | ((uint64_t)id[102] << 32) |
+           ((uint64_t)id[101] << 16) | (uint64_t)id[100];
+}
+
 // Copy of the last failure record (kind == IDE_FAIL_NONE if none yet).
 void    ide_last_failure(ide_fail_t *out);
 

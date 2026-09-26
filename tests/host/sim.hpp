@@ -184,6 +184,15 @@ struct SimDrive {
     // Review C round 2: DRQ lingers after the last word of a READ SECTORS
     // too (drq_linger, as for READ LONG), and a busy drive shows FFh.
     bool     linger_reads = false;
+    // Holistic review H-1: DRQ stays up (58h) drq_linger ns after the last
+    // word of every block that is not the last, before the drive goes busy
+    // for the next one. Data read meanwhile is FFFFh, as on this board.
+    bool     mid_linger = false;
+    uint32_t mid_linger_from = 0;  // only after the blocks from this LBA on
+    uint64_t write_linger = 0;     // L-7: DRQ stays up this long after each written block
+    uint32_t df_mid_at = 0xFFFFFFFFu;   // L-8: this block is offered with DF set (status 78h)
+    uint8_t  identify_end_status = 0;   // L-3: IDENTIFY ends with this status instead of 50h
+    uint8_t  write_end_status = 0;      // L-7: a write ends with this status instead of 50h
     bool     ff_while_busy = false;
     uint64_t float_until = 0;
     bool     dead = false;
@@ -303,7 +312,11 @@ struct SimDrive {
 
     // advance the state machine to 'now'
     void tick(uint64_t now) {
-        if (lingering && now >= linger_until) { lingering = false; if (phase == IDLE && status == 0x58) status = 0x50; }
+        if (lingering && now >= linger_until) {
+            lingering = false;
+            if (phase == IDLE && status == 0x58) status = 0x50;
+            else if ((phase == BUSY_IN || phase == BUSY_COMMIT) && status == 0x58) status = 0x80;   // H-1, L-7: then busy
+        }
         if (phase == IN_RESET) {
             if (!(devctl & 0x04) && !reset_low && !wedged && now >= ready_at) {
                 geo_valid = false;              // SRST drops INITIALIZE DEVICE PARAMETERS
@@ -323,7 +336,7 @@ struct SimDrive {
         }
         if (phase == BUSY_OUT && now >= ready_at) { phase = DRQ_OUT; widx = 0; status = 0x58; }   // no INTRQ for the first block out
         if (phase == BUSY_COMMIT && now >= ready_at) {
-            if (left == 0) { phase = IDLE; status = 0x50; }
+            if (left == 0) { phase = IDLE; status = write_end_status ? write_end_status : 0x50; }
             else { phase = DRQ_OUT; widx = 0; status = 0x58; }
             intrq = true;
         }
@@ -411,6 +424,7 @@ struct SimDrive {
         }
         for (int i = 0; i < 256; i++) xfer[i] = byte_at(cur, 2 * i) | (byte_at(cur, 2 * i + 1) << 8);
         widx = 0; phase = DRQ_IN; status = 0x58;
+        if (cur == df_mid_at) status = 0x78;          // L-8: a device fault, with the block on offer
     }
 
     uint64_t sector_delay(uint32_t lba) const {
@@ -683,10 +697,17 @@ struct SimDrive {
                         phase = IDLE; status = (df_cmd && cmd == df_cmd) ? 0x70 : 0x50;
                         if (err_end_cmd && cmd == err_end_cmd) { status = 0x51; error = 0x04; }
                         if (end_status && cmd == 0x20) status = end_status;
+                        if (identify_end_status && cmd == 0xEC) status = identify_end_status;
                         if (busy_after.count(cur - 1)) { status = 0x80; ready_at = now + busy_after[cur - 1]; }
                         if ((is_long() || linger_reads) && drq_linger) { status = 0x58; lingering = true; linger_until = now + drq_linger; }
                     }
-                    else { phase = BUSY_IN; status = 0x80; ready_at = now + sector_delay(cur); }
+                    else {
+                        phase = BUSY_IN; status = 0x80; ready_at = now + sector_delay(cur);
+                        if (mid_linger && drq_linger && cur - 1 >= mid_linger_from) {
+                            status = 0x58; lingering = true; linger_until = now + drq_linger;
+                            if (ready_at < linger_until) ready_at = linger_until;
+                        }
+                    }
                 }
             }
             return w;
@@ -707,6 +728,10 @@ struct SimDrive {
             uint64_t extra = p != pause.end() ? p->second : 0;
             cur++; left--;
             phase = BUSY_COMMIT; status = 0x80; ready_at = now + 1000 + extra;
+            if (write_linger) {
+                status = 0x58; lingering = true; linger_until = now + write_linger;
+                if (ready_at < linger_until) ready_at = linger_until;
+            }
         }
     }
 };
@@ -734,6 +759,9 @@ inline void iordy_check() {
 inline void (*sim_on_read)() = nullptr;
 // ide_pio.c's count of IORDY stalls it had to release (review C, C-7).
 uint32_t ide_pio_stalls(void) { return sim.pio_stalls; }
+// Holistic review: the fault handler stops the state machines.
+inline bool mock_pio_stopped = false;
+void ide_pio_stop(void) { mock_pio_stopped = true; }
 void ide_pio_read(uint32_t count, uint16_t *buf) {
     if (sim_on_read) sim_on_read();
     iordy_check();

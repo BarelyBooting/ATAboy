@@ -141,6 +141,43 @@ bool ide_manual_chs_active(void) { return manual_chs_active; }
 
 void ide_select_device(uint8_t base) { dev_base = base; }
 
+// ---------------------------------------------------------------------------
+//  Faults (holistic review; the guide's MEDIUM F1)
+// ---------------------------------------------------------------------------
+// Kept in RAM the runtime does not clear, so a warm reset (BOOTSEL from the
+// firmware, a flash) keeps it for Debug E; a power cycle loses it.
+static ide_fault_t __uninitialized_ram(fault_rec);
+
+void ide_fault_record(uint32_t core, uint32_t pc, uint32_t lr, uint32_t cfsr) {
+    fault_rec.core = core;
+    fault_rec.pc = pc;
+    fault_rec.lr = lr;
+    fault_rec.cfsr = cfsr;
+    fault_rec.magic = IDE_FAULT_MAGIC;
+}
+
+bool ide_fault_last(ide_fault_t *out) {
+    if (fault_rec.magic != IDE_FAULT_MAGIC) return false;
+    *out = fault_rec;
+    return true;
+}
+
+// Leave the bus as nothing drives it: no strobe, no chip select, no reset,
+// the data lines inputs behind both transceivers disabled. Plain register
+// writes and SDK pin calls only; nothing waits.
+void ide_fault_release_bus(void) {
+    ide_pio_stop();
+    uint32_t high = (1u << IDE_OE) | (1u << IDE_OE1) | (1u << IDE_CS0) | (1u << IDE_CS1) |
+                    (1u << IDE_RESET) | (1u << IDE_DIOR) | (1u << IDE_DIOW);
+    sio_hw->gpio_set = high;
+    sio_hw->gpio_oe_set = high;
+    gpio_set_function(IDE_DIOR, GPIO_FUNC_SIO);        // from the PIO: now a plain high output
+    gpio_set_function(IDE_DIOW, GPIO_FUNC_SIO);
+    sio_hw->gpio_clr = (1u << IDE_DIR) | (1u << IDE_DIR1);   // B to A (disabled anyway)
+    sio_hw->gpio_oe_clr = 0xFFFFu;                      // DD0-15: inputs
+    for (unsigned pin = 0; pin < 16; pin++) gpio_set_function(pin, GPIO_FUNC_SIO);
+}
+
 // IDENTIFY word 22 for READ LONG (0.6f3p9, ide.h), in every build. Set only
 // by the firmware's own IDENTIFY (ide_identify: detection, auto-mount, the
 // debug screen), on core 1 while nothing is mounted; cleared by a probe, a
@@ -529,13 +566,25 @@ void ide_hw_init(void) {
                        (1 << IDE_RESET) |
                        (1 << IDE_CS0) | (1 << IDE_CS1);
 
-    gpio_init_mask(sio_out);
-    // Review C, C-5: gpio_init_mask leaves every output latch at 0, so making
-    // them outputs drove RESET-, CS0-, CS1- and both transceiver enables low
-    // until the lines below: a reset of the drive at every boot, of
-    // unmeasured length. The active-low ones are set high first.
-    sio_hw->gpio_set = (1 << IDE_RESET) | (1 << IDE_CS0) | (1 << IDE_CS1) |
-                       (1 << IDE_OE) | (1 << IDE_OE1);
+    // Holistic review, B1 (the warm-boot RESET- dip): after a warm reset the
+    // pads still hold the old image's levels (isolation latches), and
+    // gpio_init would put 0 in the latch, make the pin an input and clear
+    // the latch, so RESET-, CS0-, CS1- and the transceiver enables fell to
+    // their pull-downs for a moment. The active-low lines are now pulled up,
+    // given a high output with the output enabled, and only then switched to
+    // SIO (which clears the isolation onto a pin already driven high).
+    uint32_t active_low = (1 << IDE_RESET) | (1 << IDE_CS0) | (1 << IDE_CS1) |
+                          (1 << IDE_OE) | (1 << IDE_OE1);
+    for (unsigned pin = 0; pin < 32; pin++)
+        if (active_low & (1u << pin)) gpio_pull_up(pin);
+    sio_hw->gpio_set = active_low;
+    sio_hw->gpio_oe_set = active_low;
+    for (unsigned pin = 0; pin < 32; pin++)
+        if (active_low & (1u << pin)) gpio_set_function(pin, GPIO_FUNC_SIO);
+    gpio_init_mask(sio_out & ~active_low);
+    // Review C, C-5: the other outputs' latches are 0 after gpio_init_mask;
+    // the active-low ones are high already (B1, above).
+    sio_hw->gpio_set = active_low;
     gpio_set_dir_out_masked(sio_out);
 
     // INTRQ — active-high from drive, idle low
@@ -682,8 +731,11 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     // all, even with the mode ended. And never a geometry of 0 heads or 0
     // sectors, which would go out as 16 heads and 0 sectors.
     if (native_declared) { refused.idp_native++; return false; }
-    if (heads == 0 || spt == 0) { refused.idp_zero++; return false; }
-    ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
+    // Holistic review M-1: 1 to 16 heads only. 17 used to go out as 1
+    // ((17 - 1) & 0Fh) while the firmware addressed 17: other sectors, good
+    // status. Counted with the zero refusals.
+    if (heads == 0 || heads > 16 || spt == 0) { refused.idp_zero++; return false; }
+    ide_write_reg(6, dev_base | (uint8_t)(heads - 1));
     ide_write_reg(2, spt);
     idp_written = true;
     // Review C round 2, C2-1: the answer is only read once the drive has
@@ -758,7 +810,20 @@ ready:
 
     sio_hw->gpio_set = (1 << IDE_CS0);
     bus_idle();
-    return 1;
+    // Holistic review L-3: the end of the command, as for a read (review C,
+    // C-2): BSY and DRQ clear, no ERR or DF, a status that is not floating,
+    // within a second; otherwise these words are not taken.
+    (void)ide_read_alt_status();
+    {
+        uint32_t t1 = ms_now();
+        uint32_t lim = work_ms(1000);
+        for (;;) {
+            uint8_t e = ide_read_reg(7);
+            if (e != 0xFF && e != 0x7F && !(e & 0x88)) return (e & 0x21) ? 0 : 1;
+            if (ms_passed(t1, lim)) return 0;
+            busy_wait_us_32(10);
+        }
+    }
 }
 
 static bool identify_once(uint16_t *buf) { return identify_run(buf) > 0; }
@@ -1235,6 +1300,9 @@ static bool geometry_refusal_recorded = false;
 static bool chs_geometry_ok(uint32_t lba) {
     geometry_refusal_recorded = false;
     if (config.use_lba_mode) return true;
+    // Holistic review M-1: no CHS address is worked out for a geometry the
+    // device register cannot carry (1 to 16 heads), whatever set it.
+    if (config.heads == 0 || config.heads > 16 || config.spt == 0) return false;
     bool native = native_geometry_in_use();
     bool resend = false;
     // Review C round 2, C2-1: did the drive reset itself since the last
@@ -1410,7 +1478,7 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
         return IDE_MCHS_OK;
     }
 
-    ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
+    ide_write_reg(6, dev_base | (uint8_t)(heads - 1));   // 1 to 16, checked above
     ide_write_reg(2, spt);
     sat_watch_arm(&w);
     idp_written = true;
@@ -1648,7 +1716,7 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
         ide_write_reg(3, sec);
         ide_write_reg(4, cyl & 0xFF);
         ide_write_reg(5, (cyl >> 8) & 0xFF);
-        ide_write_reg(6, dev_base | (head & 0x0F));
+        ide_write_reg(6, dev_base | head);                 // head < heads <= 16 (chs_geometry_ok)
     }
 
     cmd = use_lba48 ? 0x24 : 0x20;
@@ -1682,7 +1750,9 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
             // While BSY is set the other status bits are not valid (ATA), so a
             // leftover ERR must not end a command the drive is still working on.
             if (st & 0x80) { busy_wait_us_32(10); continue; }
-            if (st & 0x01) goto read_err;
+            // Holistic review L-8: DF (device fault) with DRQ is not a block
+            // to take; it ends the read like ERR.
+            if (st & 0x21) goto read_err;
             if (st & 0x08) goto drq_read;
             busy_wait_us_32(10);
         }
@@ -1699,6 +1769,25 @@ int32_t ide_read_sectors_partial(uint32_t lba, uint32_t count, uint8_t *buf,
         if (ide_pio_stalls() != stalls) goto read_stall;
         sector_start = ms_now();
         vouched = false;
+        // Holistic review H-1: DRQ must fall after each block before the next
+        // one is taken. A drive whose DRQ lingers a moment after a block
+        // used to have that same status read as the next block's DRQ: 256
+        // words read with nothing driving the bus (FFFFh here), every later
+        // block one out, and all of it handed over as good. Now Alternate
+        // Status once, then up to IDE_READ_SETTLE_US for DRQ low or BSY high.
+        // DRQ still up with BSY clear after that fails the whole command: no
+        // sector of it is handed over, since the drive and the firmware no
+        // longer agree which block is which.
+        if (s + 1 < count) {
+            (void)ide_read_alt_status();
+            uint64_t t0 = us_now();
+            for (;;) {
+                uint8_t a = ide_read_alt_status();
+                if ((a & 0x80) || !(a & 0x08)) break;
+                if (us_now() - t0 >= IDE_READ_SETTLE_US) { st = a; s++; goto mid_drq; }
+                busy_wait_us_32(1);                        // polled closely: a short BSY is seen
+            }
+        }
     }
 
     // Review C, C-2: the end of the command. Its final status was never
@@ -1751,11 +1840,21 @@ end_err:
 
 end_drq:
     // More data on offer than was asked for: the drive and the firmware
-    // disagree about the command. Reset it; the last sector is not trusted.
-    note_failed_sector(lba + count - 1, ms_now() - sector_start);
-    record_failure(IDE_FAIL_BAD_END, cmd, st, lba + count - 1, count - 1, count);
+    // disagree about the command, somewhere in it (holistic review H-1),
+    // so none of it is trusted. Reset it.
+    note_failed_sector(lba, ms_now() - sector_start);
+    record_failure(IDE_FAIL_BAD_END, cmd, st, lba + count - 1, 0, count);
     soft_reset_restore();
-    if (done) *done = count - 1;
+    if (done) *done = 0;
+    return -1;
+
+mid_drq:
+    // Holistic review H-1: DRQ did not fall after block s-1. Nothing of
+    // this command is handed over.
+    note_failed_sector(lba, ms_now() - sector_start);
+    record_failure(IDE_FAIL_BAD_END, cmd, st, lba + s, 0, count);
+    soft_reset_restore();
+    if (done) *done = 0;
     return -1;
 
 end_busy:
@@ -1803,7 +1902,7 @@ read_err:
         last_fail.drained = true;
         last_fail.salvaged = true;
     }
-    if (!idle_after_error(2000)) soft_reset_restore();
+    if ((st & 0x20) || !idle_after_error(2000)) soft_reset_restore();   // DF: always reset (L-8)
     if (done) *done = s;
     return -1;
 
@@ -1867,7 +1966,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
         ide_write_reg(3, sec);
         ide_write_reg(4, cyl & 0xFF);
         ide_write_reg(5, (cyl >> 8) & 0xFF);
-        ide_write_reg(6, dev_base | (head & 0x0F));
+        ide_write_reg(6, dev_base | head);                 // head < heads <= 16 (chs_geometry_ok)
     }
 
     uint8_t cmd = use_lba48 ? 0x34 : 0x30;
@@ -1903,6 +2002,20 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
 
         sio_hw->gpio_set = (1 << IDE_CS0);
         bus_idle();
+        // Holistic review L-7, as H-1 for reads: DRQ must fall (or BSY rise)
+        // after each block before the next DRQ is believed.
+        {
+            (void)ide_read_alt_status();
+            uint64_t t0 = us_now();
+            bool fell = false;
+            for (;;) {
+                uint8_t a = ide_read_alt_status();
+                if ((a & 0x80) || !(a & 0x08)) { fell = true; break; }
+                if (us_now() - t0 >= IDE_READ_SETTLE_US) { st = a; break; }
+                busy_wait_us_32(1);
+            }
+            if (!fell) { write_ok = false; fail_kind = IDE_FAIL_BAD_END; s++; break; }
+        }
     }
 
     // Wait for drive to commit the last sector to media (BSY=0). This is the
@@ -1913,7 +2026,8 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
             if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);
             st = ide_read_reg(7);
             if (st & 0x80) { busy_wait_us_32(10); continue; }   // BSY: other bits not valid
-            if (st & 0x01) { write_ok = false; fail_kind = IDE_FAIL_ERR; break; }
+            if (st & 0x21) { write_ok = false; fail_kind = IDE_FAIL_ERR; break; }     // ERR or DF (L-7)
+            if (st & 0x08) { write_ok = false; fail_kind = IDE_FAIL_BAD_END; break; } // wants more data (L-7)
             sentinel_arm();                         // review C round 2, C2-1
             return (int32_t)(count * 512);
         }
@@ -1947,7 +2061,7 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
 // one read per vendor specific byte keeping bits 7:0; how many is 4, the
 // default of section 2.1.7, since no SET FEATURES is ever sent (ide.h,
 // IDE_LONG_ECC_BYTES). Section 7.16 also asks for PIO mode 0, which is the
-// only timing this bus runs (ataboy.pio: 400 ns DIOR-, 700 ns cycle).
+// only timing this bus runs (ataboy.pio: 500 ns DIOR-, 800 ns cycle).
 //
 // Before each vendor specific byte, Alternate Status (no side effects) must
 // show DRQ with BSY clear, so a drive that has fewer than 4 is never read
@@ -2026,7 +2140,7 @@ int ide_read_long(uint32_t lba, uint8_t *buf) {
         ide_write_reg(3, sec);
         ide_write_reg(4, cyl & 0xFF);
         ide_write_reg(5, (cyl >> 8) & 0xFF);
-        ide_write_reg(6, dev_base | (head & 0x0F));
+        ide_write_reg(6, dev_base | head);                 // head < heads <= 16 (chs_geometry_ok)
     }
     ide_write_reg(7, cmd);
     wait_after_command();

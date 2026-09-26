@@ -27,7 +27,17 @@ struct MockSioReg {
         return *this;
     }
 };
-struct MockSio { MockSioReg gpio_set{true}; MockSioReg gpio_clr{false}; };
+// Output enables, as the firmware sets them (holistic review, B1 and the
+// fault handler's bus release).
+inline uint32_t mock_gpio_oe = 0;
+struct MockSioOe {
+    bool is_set;
+    MockSioOe &operator=(uint32_t v) {
+        if (is_set) mock_gpio_oe |= v; else mock_gpio_oe &= ~v;
+        return *this;
+    }
+};
+struct MockSio { MockSioReg gpio_set{true}; MockSioReg gpio_clr{false}; MockSioOe gpio_oe_set{true}; MockSioOe gpio_oe_clr{false}; };
 extern MockSio mock_sio;
 #define sio_hw (&mock_sio)
 
@@ -41,9 +51,31 @@ void mock_reset_line(bool high);
 // Review C, C-5: gpio_init_mask leaves the output latches at 0, as the SDK
 // does, and the latch as it was when the pins became outputs is kept.
 inline uint32_t mock_gpio_out_at_dir = 0;
-static inline void gpio_init_mask(uint32_t m) { mock_gpio_out &= ~m; }
-static inline void gpio_set_dir_out_masked(uint32_t) { mock_gpio_out_at_dir = mock_gpio_out; }
-static inline void gpio_init(unsigned) {}
+// Holistic review, B1: a pin of RESET- (23), CS0- (24), CS1- (25) or the
+// transceiver enables (18, 19) that is let go to its pad pull-down: made an
+// input by gpio_init or gpio_init_mask, or switched to SIO while not an
+// output driven high. On the board that is a dip on the line (warm boot).
+#define MOCK_ACTIVE_LOW ((1u << 18) | (1u << 19) | (1u << 23) | (1u << 24) | (1u << 25))
+inline int mock_active_low_dips = 0;
+inline uint32_t mock_sio_pins = 0;          // pins switched to SIO (gpio_set_function)
+enum { GPIO_FUNC_SIO = 5, GPIO_FUNC_PIO0 = 6 };
+static inline void gpio_init_mask(uint32_t m) {
+    if (m & MOCK_ACTIVE_LOW) mock_active_low_dips++;
+    mock_gpio_out &= ~m; mock_gpio_oe &= ~m;
+}
+static inline void gpio_set_dir_out_masked(uint32_t m) { mock_gpio_out_at_dir = mock_gpio_out; mock_gpio_oe |= m; }
+static inline void gpio_init(unsigned pin) {
+    if (MOCK_ACTIVE_LOW & (1u << pin)) mock_active_low_dips++;
+    mock_gpio_out &= ~(1u << pin); mock_gpio_oe &= ~(1u << pin);
+}
+static inline void gpio_set_function(unsigned pin, unsigned fn) {
+    if (fn == GPIO_FUNC_SIO) {
+        if ((MOCK_ACTIVE_LOW & (1u << pin)) && !(mock_gpio_out & mock_gpio_oe & (1u << pin))) mock_active_low_dips++;
+        mock_sio_pins |= 1u << pin;
+    }
+}
+#define __uninitialized_ram(name) name
+static inline uint8_t rp2350_chip_version(void) { return 4; }
 static inline void gpio_set_dir(unsigned, bool) {}
 static inline void gpio_pull_down(unsigned) {}
 static inline void gpio_pull_up(unsigned) {}

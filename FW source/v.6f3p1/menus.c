@@ -14,6 +14,7 @@
 #include "config.h"
 #include "fwupdate.h"
 #include "manualchs.h"
+#include "fault.h"
 #include "pico/util/queue.h"
 
 // ---------------------------------------------------------------------------
@@ -396,6 +397,8 @@ static void update_main_menu(void) {
                         : "\033[20;3H F10: Save Current Setup to EEPROM  Ctrl+F: Firmware Update  Enter: Select");
 
     draw_iordy_note(2, IORDY_NOTE_ROW);
+    // Holistic review (the guide's L2): the chip's stepping, from the chip.
+    cdc_printf("\033[14;45H" FG_WHITE "Chip: RP2350 A%u", (unsigned)rp2350_chip_version());
     draw_hdd_status();
 }
 
@@ -552,8 +555,10 @@ static void draw_selection_menu_ex(uint16_t *id, int selected_idx, bool force_mo
 
     bool lba_supp = (id[49] & 0x0200);
     uint32_t lba28 = id[60] | ((uint32_t)id[61] << 16);
-    uint64_t lba48 = ((uint64_t)id[103] << 48) | ((uint64_t)id[102] << 32) |
-                     ((uint64_t)id[101] << 16) | ((uint64_t)id[100]);
+    // Holistic review L-3: words 100 to 103 only when word 83 says the drive
+    // has the 48-bit feature set (bit 10, with its 01b signature); a drive
+    // older than ATA-6 may have anything there.
+    uint64_t lba48 = ide_identify_lba48(id);
     uint64_t lba_total = lba48 ? lba48 : (uint64_t)lba28;
 
     uint16_t l_cyl; uint8_t l_hd;
@@ -828,6 +833,11 @@ static void run_debug_errors(void) {
     if (sv.valid)
         debug_print(5, FG_WHITE, "Salvaged #%lu: LBA %lu ST:%02X ERR:%02X, READ BUFFER 5Ah",
                     (unsigned long)sv.seq, (unsigned long)sv.lba, sv.status, sv.error);
+    // Holistic review: a fault from before this (warm) boot.
+    ide_fault_t fr;
+    if (ide_fault_last(&fr))
+        debug_print(9, "\033[91;1m", "Fault before this boot: core %lu PC %08lX CFSR %08lX",
+                    (unsigned long)fr.core, (unsigned long)fr.pc, (unsigned long)fr.cfsr);
     // Review C round 2, C2-1: every drive self-reset seen, and what was done.
     ide_self_resets_t sr;
     ide_self_resets(&sr);
@@ -1181,6 +1191,10 @@ static bool run_auto_detect(void) {
                     // Esc used to fall through to here and APPLY geometry (0x91)
                     // from whatever mf[] held. An abort must apply nothing.
                     if (manual_aborted) { sd = true; }
+                    // Holistic review M-1: the ranges Ctrl+G has (manualchs.h),
+                    // checked before anything is cut to 8 or 16 bits. 17 heads
+                    // used to be sent as 1 and read other sectors.
+                    else if (manual_chs_bad_field((uint32_t)mf[0], (uint32_t)mf[1], (uint32_t)mf[2]) >= 0) { sd = true; }
                     else {
                     detect_cyls = (uint16_t)mf[0]; detect_heads = (uint8_t)mf[1]; detect_spt = (uint8_t)mf[2];
                     if (detect_cyls > 0 && detect_heads > 0 && detect_spt > 0) {
@@ -1196,11 +1210,15 @@ static bool run_auto_detect(void) {
                     else if (geo_idx == 1) { use_lba_mode = false; get_large_geometry(id_buf[1],(uint8_t)id_buf[3],(uint8_t)id_buf[6],&cur_cyls,&cur_heads); cur_spt = (uint8_t)id_buf[6]; valid = true; }
                     else if (geo_idx == 2 && ls) {
                         use_lba_mode = true; cur_cyls = id_buf[1]; cur_heads = (uint8_t)id_buf[3]; cur_spt = (uint8_t)id_buf[6];
-                        uint64_t l48 = ((uint64_t)id_buf[103]<<48)|((uint64_t)id_buf[102]<<32)|((uint64_t)id_buf[101]<<16)|((uint64_t)id_buf[100]);
+                        uint64_t l48 = ide_identify_lba48(id_buf);         // L-3: only with word 83 bit 10
                         total_lba_sectors = l48; if (!total_lba_sectors) total_lba_sectors = id_buf[60]|((uint32_t)id_buf[61]<<16);
                         valid = true;
                     }
 
+                    // Holistic review M-1: a CHS row whose heads the device
+                    // register cannot carry (IDENTIFY word 3 above 16, or the
+                    // LARGE translation's 32 and more) is not applied.
+                    if (valid && !use_lba_mode && (cur_heads == 0 || cur_heads > 16 || cur_spt == 0)) { valid = false; sd = true; }
                     if (valid) { if (!use_lba_mode) ide_set_geometry(cur_heads, cur_spt); sync_to_config(); waiting = false; }
                 }
             }
@@ -1458,6 +1476,9 @@ static bool auto_detect_enter(void) {
 // True if saved.
 #define SAVE_REFUSED_MCHS "Not saved: Auto Mount would IDENTIFY. Press a key"
 static bool save_setup(void) {
+    // Holistic review L-1: a USB command still running (after an unmount)
+    // would be stopped for the flash erase; wait for it, or save nothing.
+    if (!bus_free_wait(false)) return false;
     if (config.auto_mount && ide_manual_chs_active()) {
         draw_confirm_box(SAVE_REFUSED_MCHS);
         while (get_input() == -1) tight_loop_contents();
@@ -1486,6 +1507,9 @@ void core1_entry(void) {
     }
 
     while (true) {
+        // Holistic review L-4: core 1's stack canary (ATAboy.c). A stack
+        // that ran into it has overwritten something: stop, bus released.
+        if (!core1_stack_intact()) fault_stop(IDE_FAULT_CANARY);
         bool connected = cdc_connected;
         if (connected && !last_cdc_connected) { sleep_ms(200); needs_full_redraw = true; }
         last_cdc_connected = connected;
@@ -1577,6 +1601,7 @@ void core1_entry(void) {
                         }
                         // Same defect as the picker copy: Esc must apply nothing.
                         if (f_aborted) { sd = true; }
+                        else if (manual_chs_bad_field((uint32_t)mf[0], (uint32_t)mf[1], (uint32_t)mf[2]) >= 0) { sd = true; }   // M-1
                         else {
                         detect_cyls = (uint16_t)mf[0]; detect_heads = (uint8_t)mf[1]; detect_spt = (uint8_t)mf[2];
                         if (detect_cyls > 0 && detect_heads > 0 && detect_spt > 0) {
@@ -1606,7 +1631,11 @@ void core1_entry(void) {
 
         if (current_screen == SCREEN_CONFIRM) {
             if (k == 'y' || k == 'Y') {
-                if (confirm_type == 0) { config_defaults(); sync_from_config(); config_save(); current_screen = SCREEN_MAIN; }
+                if (confirm_type == 0) {
+                    // Holistic review L-1: as F10, never under a USB command.
+                    if (bus_free_wait(false)) { config_defaults(); sync_from_config(); config_save(); }
+                    current_screen = SCREEN_MAIN;
+                }
                 else if (confirm_type == 1) { (void)save_setup(); current_screen = confirm_return_screen; }
                 else if (confirm_type == 3) { is_mounted = true; media_changed_waiting = true; current_screen = SCREEN_MOUNTED; }
                 else if (confirm_type == 4) { menu_unmount(); current_screen = SCREEN_MAIN; }

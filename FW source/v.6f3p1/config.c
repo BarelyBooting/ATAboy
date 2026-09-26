@@ -27,7 +27,7 @@ void config_defaults(void) {
 void config_load(void) {
     config_t tmp;
     memcpy(&tmp, flash_target, sizeof(config_t));
-    if (tmp.magic == CONFIG_MAGIC) {
+    if (config_valid(&tmp)) {           // holistic review L-2: CRC and ranges, not the magic alone
         config = tmp;
     } else {
         config_defaults();
@@ -36,6 +36,7 @@ void config_load(void) {
 
 void config_save(void) {
     config.magic = CONFIG_MAGIC;
+    config.crc = config_crc(&config);
     static uint8_t buf[FLASH_PAGE_SIZE];
     memset(buf, 0, sizeof(buf));
     memcpy(buf, &config, sizeof(config_t));

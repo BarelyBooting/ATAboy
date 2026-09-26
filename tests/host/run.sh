@@ -59,3 +59,7 @@ ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function $defs \
     -I "$here/mock" -I "$here" -I "$src" \
     -o "$out/test_usb_desc" "$here/test_usb_desc.cpp"
 "$out/test_usb_desc"
+# PIO bus timing against ATA mode 0, read from ataboy.pio, and the clock
+# divider (holistic review 2026-09-26, M-2 and L-6; see test_pio_timing.cpp).
+${CXX:-g++} -std=c++17 -O1 -g -Wall -I "$src" -o "$out/test_pio_timing" "$here/test_pio_timing.cpp"
+"$out/test_pio_timing" "$src/ataboy.pio"

@@ -5,20 +5,35 @@
 ; deterministic timing.  C code manages address, chip-select, and bus
 ; transceiver direction/enable before triggering these programs.
 ;
-; PIO clock target: 10 MHz (100 ns/cycle) for ATA PIO Mode 0.
+; PIO clock: at least 100 ns a cycle (ide_pio_timing.h: the divider is worked
+; out from clk_sys, rounded up; 150 MHz / 15 exactly).
 ;
-; Timing analysis (Mode 0 minimums in parentheses):
+; Timing against ATA PIO mode 0 (holistic review 2026-09-26, M-2). Mode 0's
+; strobe minimum t2 is 165 ns for 16-bit data but 290 ns for 8-bit register
+; transfers, and every task file write is an 8-bit transfer. Until then the
+; strobes were 300 ns (write) and 400 ns (read, sampled at 300 ns): 10 ns over
+; the 8-bit minimum on writes. Now every figure has at least 100 ns over its
+; minimum. Numbers at exactly 100 ns a cycle, WAIT on IORDY taking one cycle
+; (IORDY high); tests/host/test_pio_timing.cpp works them out from this file
+; and fails below these margins.
 ;
-;   READ:
-;     DIOR pulse width  : 400 ns  (165 ns min)
-;     Recovery          : 300 ns  (215 ns min)
-;     Cycle time        : 700 ns  (600 ns min)
+;   READ (DIOR-):
+;     pulse width t2    : 500 ns  (290 ns min, 8-bit)      +210
+;     data sampled at   : 400 ns after DIOR- falls          (a mode 0 device
+;                         has 8-bit data valid by t2 - t5 = 290 - 50 = 240 ns:
+;                         +160, less about 13 ns of input synchroniser)
+;     high between      : 300 ns
+;     cycle t0          : 800 ns  (600 ns min)              +200
 ;
-;   WRITE:
-;     Data setup        : 100 ns  ( 60 ns min)
-;     DIOW pulse width  : 300 ns  (165 ns min)
-;     Recovery          : 300 ns  (215 ns min)
-;     Cycle time        : 800 ns  (600 ns min)
+;   WRITE (DIOW-):
+;     data setup t3     : 200 ns  ( 60 ns min)              +140
+;     pulse width t2    : 400 ns  (290 ns min, 8-bit)      +110
+;     data hold t4      : 400 ns  ( 30 ns min)              +370
+;     cycle t0          : 1000 ns (600 ns min)              +400
+;
+; Address and chip select (t1, 70 ns min; t9, 20 ns min) are set by the C code
+; around the whole burst, microseconds away. Mode 0 gives no minimum for the
+; time a strobe is high between cycles; t0 covers it.
 ;
 
 ; ============================================================
@@ -38,10 +53,10 @@
     mov y, osr          side 1
 
 read_loop:
-    nop                 side 0 [1]  ; assert DIOR  (200 ns setup)
-    wait 1 gpio 29      side 0      ; IORDY hold   (extends pulse if needed)
-    in pins, 16         side 0      ; sample data   (DIOR still LOW)
-    nop                 side 1 [1]  ; deassert DIOR (200 ns recovery)
+    nop                 side 0 [2]  ; assert DIOR   (300 ns)
+    wait 1 gpio 29      side 0      ; IORDY hold    (extends pulse if needed)
+    in pins, 16         side 0      ; sample data at 400 ns (DIOR still LOW)
+    nop                 side 1 [1]  ; deassert DIOR (200 ns, then jmp)
     jmp y-- read_loop   side 1      ; loop or fall through
     irq wait 0 rel      side 1      ; signal done, wait for C to ack
 .wrap
@@ -63,10 +78,10 @@ read_loop:
 
 write_loop:
     pull block          side 1      ; get data word
-    out pins, 16        side 1      ; data on bus   (100 ns setup)
-    nop                 side 0 [1]  ; assert DIOW   (200 ns pulse)
-    wait 1 gpio 29      side 0      ; IORDY hold
-    nop                 side 1 [1]  ; deassert DIOW (200 ns recovery)
+    out pins, 16        side 1 [1]  ; data on bus   (200 ns setup)
+    nop                 side 0 [2]  ; assert DIOW   (300 ns)
+    wait 1 gpio 29      side 0      ; IORDY hold    (pulse 400 ns)
+    nop                 side 1 [1]  ; deassert DIOW (200 ns, then jmp)
     jmp y-- write_loop  side 1      ; loop or fall through
     irq wait 0 rel      side 1      ; signal done, wait for C to ack
 .wrap

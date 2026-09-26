@@ -55,6 +55,11 @@ static inline bool time_reached(absolute_time_t t) { return get_absolute_time() 
 
 #include "menus.c"
 
+// Holistic review: core 1's stack canary lives in ATAboy.c and the fault
+// stop in fault.c, neither built here (fault.c is Arm assembly).
+bool core1_stack_intact(void) { return true; }
+void fault_stop(uint32_t code) { printf("FAIL: fault_stop(%08X) reached\n", (unsigned)code); exit(250); }
+
 uint64_t mock_now_ns = 0;
 uint32_t mock_gpio_out = 0;
 MockSio mock_sio;
@@ -1376,6 +1381,80 @@ static void test_fa3190a_gaps() {
 }
 #endif
 
+#ifdef IDE_FAULT_MAGIC
+// ---- holistic review (2026-09-26): menus, settings, boot, faults -----------------
+static bool busy_now() { return true; }
+static void test_holistic_menus() {
+    // M-1: the picker's MANUAL row refuses 17 heads (it used to send 91h with 1).
+    fresh("M-1: picker MANUAL, 17 heads");
+    sim.identify_ok = true;
+    keys("\t" "1045\r17\r40\r" "\x1b");
+    run_auto_detect();
+    CHECK(sim.cmd_count.count(0x91) == 0 && config.heads != 17, "0x91 %d, config heads %u",
+          (int)(sim.cmd_count.count(0x91) ? sim.cmd_count[0x91] : 0), config.heads);
+    fresh("M-1: picker MANUAL, 16 heads still taken");
+    sim.identify_ok = true;
+    keys("\t" "1045\r16\r40\r");
+    run_auto_detect();
+    CHECK(sim.cmd_count.count(0x91) == 1 && config.heads == 16, "16 heads not applied: %u", config.heads);
+
+    // L-1: F10 and Load Defaults wait for a USB command, or do nothing.
+    fresh("L-1: F10 with a USB command running");
+    busy_until_ns = mock_now_ns + 60000000000ull;   // longer than the wait
+    keys("x");
+    tty.clear();
+    CHECK(!save_setup() && saves == 0 && has("nothing sent"), "saved %d", saves);
+    busy_until_ns = 0;
+
+    // Stepping on the main screen.
+    fresh("chip stepping shown");
+    tty.clear(); update_main_menu();
+    CHECK(has("Chip: RP2350 A4"), "no stepping on the main screen");
+
+    // L-2: the settings sector.
+    // (config.c is not built here: these are its defaults, written out.)
+    fresh("L-2: the settings sector's checks");
+    config_t c; memset(&c, 0, sizeof c);
+    c.drive_write_protected = true; c.auto_mount = false; c.dev_base = 0xA0;
+    c.magic = CONFIG_MAGIC; c.crc = config_crc(&c);
+    CHECK(config_valid(&c) && c.drive_write_protected && !c.auto_mount, "defaults not valid, or not safe");
+    config_t d = c; d.crc ^= 1;                      CHECK(!config_valid(&d), "a bad CRC taken");
+    d = c; d.magic = 0x1DE45707; d.crc = config_crc(&d); CHECK(!config_valid(&d), "an old layout taken");
+    d = c; d.heads = 17; d.cyls = 10; d.spt = 40; d.crc = config_crc(&d); CHECK(!config_valid(&d), "17 heads taken");
+    d = c; d.dev_base = 0xE0; d.crc = config_crc(&d); CHECK(!config_valid(&d), "dev_base E0h taken");
+    d = c; { uint8_t two = 2; memcpy(&d.auto_mount, &two, 1); } d.crc = config_crc(&d); CHECK(!config_valid(&d), "a bool of 2 taken");
+    d = c; d.cyls = 522; d.heads = 4; d.spt = 0; d.crc = config_crc(&d); CHECK(!config_valid(&d), "0 sectors taken");
+    d = c; d.cyls = 522; d.heads = 4; d.spt = 40; d.crc = config_crc(&d); CHECK(config_valid(&d), "522/4/40 refused");
+    d = c; d.auto_mount = true; d.crc = config_crc(&d); d.lba_sectors = 1; CHECK(!config_valid(&d), "a changed field under an old CRC taken");
+
+    // B1: no active-low line dips at boot (warm or cold).
+    fresh("B1: ide_hw_init lets no active-low line fall");
+    mock_active_low_dips = 0;
+    mock_gpio_out = 0; mock_gpio_oe = 0;            // SIO after a warm reset: latches and enables 0
+    ide_hw_init();
+    CHECK(mock_active_low_dips == 0, "%d dips", mock_active_low_dips);
+
+    // The fault path: record, and the bus released.
+    fresh("fault: record and bus release");
+    mock_pio_stopped = false;
+    mock_gpio_out = 0; mock_gpio_oe = 0xFFFFFFFFu;
+    ide_fault_record(1, 0x10001234u, 0x10005678u, 0x00020000u);
+    ide_fault_release_bus();
+    uint32_t high = (1u << IDE_OE) | (1u << IDE_OE1) | (1u << IDE_CS0) | (1u << IDE_CS1) | (1u << IDE_RESET) |
+                    (1u << IDE_DIOR) | (1u << IDE_DIOW);
+    CHECK(mock_pio_stopped && (mock_gpio_out & high) == high && (mock_gpio_oe & high) == high &&
+          !(mock_gpio_out & ((1u << IDE_DIR) | (1u << IDE_DIR1))) && !(mock_gpio_oe & 0xFFFFu) &&
+          (mock_sio_pins & ((1u << IDE_DIOR) | (1u << IDE_DIOW) | 0xFFFFu)) == ((1u << IDE_DIOR) | (1u << IDE_DIOW) | 0xFFFFu),
+          "out %08X oe %08X pio stopped %d", (unsigned)mock_gpio_out, (unsigned)mock_gpio_oe, mock_pio_stopped);
+    ide_fault_t fr;
+    CHECK(ide_fault_last(&fr) && fr.core == 1 && fr.pc == 0x10001234u && fr.cfsr == 0x00020000u, "record");
+    tty.clear(); run_debug_errors();
+    CHECK(has("Fault before this boot: core 1 PC 10001234 CFSR 00020000"), "Debug E does not show the fault");
+    fault_rec.magic = 0;
+    (void)busy_now;
+}
+#endif
+
 // ---- 7. through the main loop: Ctrl+G reaches the entry ---------------------
 // Last, since core1_entry never returns (on_idle ends the program).
 static void core1_done() {
@@ -1524,6 +1603,9 @@ int main() {
 #endif
 #ifdef IDE_SENTINEL_SC
     test_fa3190a_gaps();
+#endif
+#ifdef IDE_FAULT_MAGIC
+    test_holistic_menus();
 #endif
     test_core1();                                   // does not return
     printf("%d checks, %d failed\n", checks, failures);

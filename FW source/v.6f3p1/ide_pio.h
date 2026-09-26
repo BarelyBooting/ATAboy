@@ -25,4 +25,8 @@ void ide_pio_write(uint32_t count, const uint16_t *buf);
 #define IDE_PIO_STALL_US 1000
 uint32_t ide_pio_stalls(void);
 
+// Holistic review: stop both state machines (fault handler). Pins are then
+// taken over by ide_fault_release_bus.
+void ide_pio_stop(void);
+
 #endif

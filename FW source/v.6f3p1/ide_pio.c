@@ -1,4 +1,5 @@
 #include "ide_pio.h"
+#include "ide_pio_timing.h"
 #include "ide.h"
 #include "ataboy.pio.h"
 #include "hardware/pio.h"
@@ -32,7 +33,11 @@ void ide_pio_init(void) {
     sm_config_set_in_pins(&c_rd, 0);                       // in base = GPIO 0
     sm_config_set_sideset_pins(&c_rd, 26);                  // side-set = DIOR
     sm_config_set_in_shift(&c_rd, false, true, 16);         // shift left, autopush @ 16
-    sm_config_set_clkdiv(&c_rd, 15.0f);                    // 150 MHz / 15 = 10 MHz
+    // Holistic review L-6: from the clock actually running, not an assumed
+    // 150 MHz (a faster clk_sys would have made every cycle shorter than
+    // ataboy.pio's timing assumes). At least 100 ns a cycle.
+    uint32_t div = ide_pio_clkdiv_for(clock_get_hz(clk_sys));
+    sm_config_set_clkdiv_int_frac(&c_rd, (uint16_t)div, 0);
 
     pio_sm_init(pio, sm_read, offset_read, &c_rd);
 
@@ -45,7 +50,7 @@ void ide_pio_init(void) {
     sm_config_set_out_pins(&c_wr, 0, 16);                  // out base = GPIO 0, 16 pins
     sm_config_set_sideset_pins(&c_wr, 27);                  // side-set = DIOW
     sm_config_set_out_shift(&c_wr, true, false, 32);        // shift right, manual pull
-    sm_config_set_clkdiv(&c_wr, 15.0f);
+    sm_config_set_clkdiv_int_frac(&c_wr, (uint16_t)div, 0);
 
     pio_sm_init(pio, sm_write, offset_write, &c_wr);
 
@@ -66,6 +71,11 @@ void ide_pio_init(void) {
 // and the next stall, if any, ends the same way).
 static volatile uint32_t stalls = 0;
 uint32_t ide_pio_stalls(void) { return stalls; }
+
+void ide_pio_stop(void) {
+    pio_sm_set_enabled(pio, sm_read, false);
+    pio_sm_set_enabled(pio, sm_write, false);
+}
 
 static void iordy_unstick(void) {
     gpio_set_inover(IDE_IORDY, GPIO_OVERRIDE_HIGH);

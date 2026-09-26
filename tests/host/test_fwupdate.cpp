@@ -77,6 +77,12 @@ int ide_manual_chs_native(uint8_t, uint8_t, uint8_t *st) { bus_use(); *st = 0x50
 bool ide_mchs_no_identify(void) { return false; }
 bool ide_manual_chs_native_active(void) { return false; }
 void ide_manual_chs_native_forget(void) {}
+#ifdef IDE_FAULT_MAGIC
+// Holistic review (fault handling, core 1 stack, chip stepping)
+bool ide_fault_last(ide_fault_t *) { return false; }
+bool core1_stack_intact(void) { return true; }
+void fault_stop(uint32_t) { abort(); }
+#endif
 #ifdef IDE_FAIL_SELF_RESET
 void ide_self_resets(ide_self_resets_t *o) { memset(o, 0, sizeof *o); }
 #endif

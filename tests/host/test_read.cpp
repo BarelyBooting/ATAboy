@@ -2528,13 +2528,25 @@ static void test_sat_min_window() {
     // NATIVE MAX would go out with 9 s. It is not sent.
     setup("min window: SAT checked again after the ready wait", LBA);
     sim.t_identify_extra = 2000000000ull;
-    sim.busy_after[0] = 4000000000ull;
+    // Since the holistic review (L-3) IDENTIFY waits for its own end, so a
+    // busy time right after its data would be IDENTIFY's. The drive goes
+    // busy instead at the SAT path's ready wait: the third status read
+    // with the drive idle after IDENTIFY (the end check reads Alternate
+    // Status and Status, then the ready wait reads Status).
+    static int idle_reads, ids0;
+    idle_reads = 0; ids0 = sim.cmd_count[0xEC];     // IDENTIFYs before this command (detection)
+    sim_on_read = [] {
+        if (sim.cmd_count[0xEC] > ids0 && sim.phase == SimDrive::IDLE && !(sim.status & 0x80) && ++idle_reads == 3) {
+            sim.status = 0x80; sim.ready_at = mock_now_ns + 4000000000ull; sim_on_read = nullptr;
+        }
+    };
     int nm = sim.cmd_count[0xF8];
     SatResult s = sat_cmd(native_max12(), 0, false);
     ide_fail_t f; ide_last_failure(&f);
     CHECK(!s.ok() && sense_is(s.sense, 0x02, 0x04, 0x00) && sim.cmd_count[0xF8] == nm && no_reset(),
           "r %d, READ NATIVE MAX sent %d times", s.r, sim.cmd_count[0xF8] - nm);
     CHECK(f.kind == IDE_FAIL_NO_TIME && f.command == 0xF8, "record kind %u cmd %02X", f.kind, f.command);
+    sim_on_read = nullptr;
 }
 #endif
 
@@ -3573,7 +3585,9 @@ static void test_c2r_drq_settle(Mode m) {
     sim.linger_reads = true; sim.drq_linger = 5000000;
     r = ide_read_sectors_partial(5000, 8, buf, &done);
     ide_last_failure(&f);
-    CHECK(r < 0 && done == 7 && f.kind == IDE_FAIL_BAD_END, "r %d done %u kind %u", r, done, f.kind);
+    // Holistic review H-1: DRQ still up after the last block means the drive
+    // and the firmware disagree somewhere in the command: none of it is kept.
+    CHECK(r < 0 && done == 0 && f.kind == IDE_FAIL_BAD_END, "r %d done %u kind %u", r, done, f.kind);
 }
 
 // C2-3: a working drive that shows FFh while busy on a slow sector.
@@ -3588,6 +3602,145 @@ static void test_c2r_ff_while_busy(Mode m) {
     bool right = r == 8 * 512;
     for (int i = 0; right && i < 8 * 512; i++) right = buf[i] == sim.byte_at(5000 + i / 512, i % 512);
     CHECK(right && sim.srst == 0, "r %d right %d srst %d", r, right, sim.srst);
+}
+
+// ---- holistic review (2026-09-26) ------------------------------------------------
+// H-1: DRQ that lingers after a block that is not the last. It used to be
+// read as the next block's DRQ: 256 words of FFFFh taken as a sector, every
+// later block one out, all handed over as good.
+static void test_h1_mid_linger(Mode m) {
+    const char *mn = m == CHS ? "CHS" : "LBA";
+    for (uint64_t ns : { 200ull, 2000ull, 200000ull }) {
+        std::string n = std::string("H-1: DRQ lingers ") + std::to_string(ns) + " ns between blocks, " + mn;
+        setup(n.c_str(), m);
+        if (m == CHS) chs_user_geometry();
+        sim.mid_linger = true; sim.drq_linger = ns;
+        // The drive is then busy for the next block for a while after DRQ
+        // falls: a gap the firmware can see. (A drive that goes from one
+        // block's DRQ to the next with no visible gap looks exactly like one
+        // whose DRQ is stuck, and fails below.)
+        sim.t_sector = ns + 200000;
+        sim.violations = 0;
+        HostRead h = host_read10(5000, 8);
+        ide_fail_t hf; ide_last_failure(&hf);
+        CHECK(h.ok && h.data.size() == 8 * 512 && matches_medium(h, 5000) && sim.violations == 0 && sim.srst == 0,
+              "ok %d, %zu bytes, right %d, violations %d, srst %d, record %u lba %u st %02X", h.ok, h.data.size(),
+              matches_medium(h, 5000), sim.violations, sim.srst, hf.kind, hf.lba, hf.status);
+    }
+    // DRQ still up after the settle: the whole command fails, nothing handed
+    // over, not even the blocks before, and no data is read without DRQ. The
+    // stuck DRQ comes after block 5003, so four good blocks come first.
+    std::string n = std::string("H-1: DRQ stuck 5 ms between blocks, ") + mn;
+    setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.mid_linger = true; sim.drq_linger = 5000000; sim.mid_linger_from = 5003;
+    sim.violations = 0;
+    uint8_t buf[8 * 512]; uint32_t done = 99;
+    int32_t r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(r < 0 && done == 0 && f.kind == IDE_FAIL_BAD_END && f.done == 0 && f.lba == 5004 && sim.srst >= 1 && sim.violations == 0,
+          "r %d done %u kind %u lba %u srst %d violations %d", r, done, f.kind, f.lba, sim.srst, sim.violations);
+    n = std::string("H-1: DRQ stuck 5 ms between blocks, READ(10), ") + mn;
+    setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.mid_linger = true; sim.drq_linger = 5000000;
+    HostRead h = host_read10(5000, 8);
+    CHECK(!h.ok && h.data.empty(), "READ(10) handed over %zu bytes", h.data.size());
+}
+
+// L-7: the same for a write (donors only).
+static void test_l7_write_linger() {
+    for (uint64_t ns : { 2000ull, 200000ull }) {
+        std::string n = std::string("L-7: write, DRQ lingers ") + std::to_string(ns) + " ns after each block";
+        setup(n.c_str(), LBA);
+        config.drive_write_protected = false;
+        sim.write_linger = ns; sim.violations = 0;
+        for (uint32_t l = 3000; l < 3004; l++) sim.pause[l] = ns + 50000;   // then busy writing it, visibly
+        std::vector<uint8_t> w = fill512(4, 9);
+        int32_t r = ide_write_sectors(3000, 4, w.data());
+        bool all = true;
+        for (int i = 0; i < 4; i++) all = all && written_is(3000 + i, w.data() + i * 512);
+        CHECK(r == 4 * 512 && all && sim.violations == 0, "r %d written %d violations %d", r, all, sim.violations);
+    }
+    // The end of a write: DF, or DRQ (the drive wants more), is not done.
+    for (uint8_t es : { (uint8_t)0x70, (uint8_t)0x58 }) {
+        std::string n = std::string("L-7: write ends with status ") + (es == 0x70 ? "70h (DF)" : "58h (DRQ)");
+        setup(n.c_str(), LBA);
+        config.drive_write_protected = false;
+        sim.write_end_status = es;
+        std::vector<uint8_t> w = fill512(2, 3);
+        int32_t r = ide_write_sectors(3000, 2, w.data());
+        CHECK(r < 0, "a write ending with %02X taken as done", es);
+    }
+    setup("L-7: write, DRQ stuck 5 ms after a block", LBA);
+    config.drive_write_protected = false;
+    sim.write_linger = 5000000; sim.violations = 0;
+    std::vector<uint8_t> w = fill512(4, 9);
+    int32_t r = ide_write_sectors(3000, 4, w.data());
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(r < 0 && f.kind == IDE_FAIL_BAD_END && sim.violations == 0 && sim.srst >= 1, "r %d kind %u violations %d",
+          r, f.kind, sim.violations);
+}
+
+// L-8: DF with a block on offer ends the read like ERR.
+static void test_l8_df_mid_read(Mode m) {
+    std::string n = std::string("L-8: DF with the block for 5003, ") + (m == CHS ? "CHS" : "LBA");
+    setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.df_mid_at = 5003;
+    uint8_t buf[8 * 512]; uint32_t done = 99;
+    int32_t r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_fail_t f; ide_last_failure(&f);
+    CHECK(r < 0 && done == 3 && f.kind == IDE_FAIL_ERR && (f.status & 0x20) && sim.srst >= 1,
+          "r %d done %u kind %u st %02X srst %d", r, done, f.kind, f.status, sim.srst);
+    // On the last block, where the drive is idle after it: DF still resets.
+    n = std::string("L-8: DF with the last block, ") + (m == CHS ? "CHS" : "LBA");
+    setup(n.c_str(), m);
+    if (m == CHS) chs_user_geometry();
+    sim.df_mid_at = 5007;
+    r = ide_read_sectors_partial(5000, 8, buf, &done);
+    ide_last_failure(&f);
+    CHECK(r < 0 && done == 7 && (f.status & 0x20) && sim.srst >= 1, "last block: r %d done %u st %02X srst %d",
+          r, done, f.status, sim.srst);
+}
+
+// M-1: no 91h and no CHS address for more than 16 heads, whatever set them.
+static void test_m1_heads() {
+    setup("M-1: 17 heads in config", CHS);
+    config.cyls = 100; config.heads = 17; config.spt = 40;
+    chs_geometry_lost = true;
+    int ip = sim.init_params, c = sim.commands;
+    uint8_t buf[512]; uint32_t done = 0;
+    CHECK(ide_read_sectors_partial(272, 1, buf, &done) < 0 && sim.init_params == ip && sim.commands == c,
+          "read with 17 heads: %d commands", sim.commands - c);
+    int w = sim.reg_writes;
+    CHECK(!ide_set_geometry(17, 40) && !ide_set_geometry(0, 40) && sim.init_params == ip && sim.reg_writes == w,
+          "91h for 17 heads: %d register writes", sim.reg_writes - w);
+    // The address check on its own: a geometry believed (not lost) with 17
+    // heads works out no address and writes nothing.
+    chs_geometry_lost = false; config.heads = 17;
+    w = sim.reg_writes; c = sim.commands;
+    CHECK(ide_read_sectors_partial(272, 1, buf, &done) < 0 && sim.reg_writes == w && sim.commands == c,
+          "a CHS address for 17 heads: %d register writes", sim.reg_writes - w);
+    config.heads = 17; chs_geometry_lost = true;
+    CHECK(ide_set_geometry(16, 40) && sim.init_params == ip + 1 && sim.heads == 16, "16 heads refused");
+}
+
+// L-3: IDENTIFY's own end, and the 48-bit words.
+static void test_l3_identify_end() {
+    setup("L-3: IDENTIFY ends with ERR after its data", LBA);
+    sim.identify_end_status = 0x51;
+    uint16_t id[256];
+    CHECK(!ide_identify(id), "IDENTIFY with ERR at its end taken");
+    setup("L-3: IDENTIFY ends clean", LBA);
+    CHECK(ide_identify(id), "a clean IDENTIFY refused");
+    uint16_t w[256] = {0};
+    w[100] = 0x1234; w[101] = 1;
+    CHECK(ide_identify_lba48(w) == 0, "words 100-103 used without word 83 bit 10");
+    w[83] = 0x4400;
+    CHECK(ide_identify_lba48(w) == 0x11234ull, "words 100-103 not used with word 83 bit 10");
+    w[83] = 0xC400;
+    CHECK(ide_identify_lba48(w) == 0, "word 83 with a bad signature believed");
 }
 
 int main() {
@@ -3696,6 +3849,13 @@ int main() {
     test_c1_outside_reset();
     test_c4_ctrlg_write_protect();
     test_c2r_once_per_mount();
+    test_h1_mid_linger(LBA);
+    test_h1_mid_linger(CHS);
+    test_l7_write_linger();
+    test_l8_df_mid_read(LBA);
+    test_l8_df_mid_read(CHS);
+    test_m1_heads();
+    test_l3_identify_end();
     test_c3_sentinel_unheld();
     test_c2r_drq_settle(LBA);
     test_c2r_drq_settle(CHS);
