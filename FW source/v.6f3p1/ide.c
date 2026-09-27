@@ -9,6 +9,9 @@
 #endif
 #include "pico/stdlib.h"
 #include "pico/time.h"
+#if ATABOY_CTL
+#include "ctl_state.h"
+#endif
 
 static uint8_t dev_base = 0xA0;   // 0xA0 = master, 0xB0 = slave
 
@@ -102,6 +105,28 @@ static struct {
 bool ide_mchs_no_identify(void) { return mchs_no_identify; }
 bool ide_write_protected(void) { return config.drive_write_protected || mchs_no_identify; }
 
+#if ATABOY_CTL
+// identify.forbid (palimpsest api/SPEC-v1.md 4.12): a second no-IDENTIFY
+// rule, set only by the Control API, on core 0, and never cleared until
+// power-up. Auto Detect's probe clears Ctrl+G's rule (mchs_no_identify) and
+// not this one. Every IDENTIFY refusal tests both: identify_send() and
+// ide_identify() below, the tripwire, the SAT gate (sat.c) and the TUI's own
+// pre-checks (menus.c). Each place keeps its test of mchs_no_identify as it
+// was and tests this flag on a line of its own, so each guard can be taken
+// out on its own (tests/host/mutate.py). It does not set mchs_no_identify,
+// whose texts on the screen are about a Ctrl+G.
+static volatile bool identify_forbidden = false;
+bool ide_identify_forbid(void) {
+    bool was = identify_forbidden;
+    identify_forbidden = true;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);        // before the answer says so
+    if (!was) CTL_EPOCH_BUMP();
+    return !was;
+}
+bool ide_identify_forbidden(void) { return identify_forbidden; }
+bool ide_identify_barred(void) { return mchs_no_identify || identify_forbidden; }
+#endif
+
 // Review C round 2, C2-1: a drive that resets on its own. 91h goes out once
 // per mount again (0.6f3p10's first design sent it before every CHS command,
 // up to 30,000 times a pass, and some Conners save every 91h to EEPROM).
@@ -144,7 +169,29 @@ static bool manual_chs_active = false;
 
 bool ide_manual_chs_active(void) { return manual_chs_active; }
 
+#if ATABOY_CTL
+// status.epoch (ctl_state.h): the rules above are stored in several places
+// here; after each store this bumps the epoch if any of them changed, so a
+// place that only sometimes changes one (a 91h after the first, an IDENTIFY
+// with no Ctrl+G rule to end) does not move it. Called on core 1 (the menus'
+// bus actions) and on core 0 (recovery's 91h, the SAT identity check, the
+// tripwire), never both at once: the bus is core 0's only while mounted and
+// core 1's only while not.
+static struct { bool noid, mchs, native_on, declared, idp; } rules_seen;
+static void rules_note(void) {
+    bool changed = rules_seen.noid != mchs_no_identify || rules_seen.mchs != manual_chs_active ||
+                   rules_seen.native_on != native_geo.on || rules_seen.declared != native_declared ||
+                   rules_seen.idp != idp_written;
+    rules_seen.noid = mchs_no_identify; rules_seen.mchs = manual_chs_active;
+    rules_seen.native_on = native_geo.on; rules_seen.declared = native_declared; rules_seen.idp = idp_written;
+    if (changed) CTL_EPOCH_BUMP();
+}
+// dev_base decides whether the power-up default mode is the one in use
+// (native_geometry_in_use), which status reports.
+void ide_select_device(uint8_t base) { bool moved = dev_base != base; dev_base = base; if (moved) CTL_EPOCH_BUMP(); }
+#else
 void ide_select_device(uint8_t base) { dev_base = base; }
+#endif
 
 // ---------------------------------------------------------------------------
 //  Faults (holistic review; the guide's MEDIUM F1)
@@ -212,9 +259,16 @@ void ide_trip_record(ide_trip_t *out) { *out = trip; }
 static void __attribute__((noinline)) __not_in_flash_func(cmd_tripwire)(uint8_t op) {
     uint8_t rule = (op == 0xEC) ? (mchs_no_identify ? IDE_TRIP_NO_IDENTIFY : 0)
                                 : (native_declared ? IDE_TRIP_NO_91H : 0);
+#if ATABOY_CTL
+    // identify.forbid (SPEC-v1 I-22): ECh is refused here too, the last layer.
+    if (!rule && op == 0xEC && identify_forbidden) rule = IDE_TRIP_FORBIDDEN;
+#endif
     if (!rule) return;                                  // allowed: it goes out as before
     ide_fault_release_bus();                            // first: nothing more reaches the drive
     is_mounted = false;                                 // USB refuses every drive command from here on
+#if ATABOY_CTL
+    CTL_EPOCH_BUMP();                                   // core 0 goes on answering status (ATAboy.c)
+#endif
     trip.opcode = op;
     trip.rule = rule;
     trip.core = (uint8_t)get_core_num();
@@ -722,6 +776,9 @@ uint8_t ide_probe_devices(void) {
     native_declared = false;
     sentinel_new_mount();     // review C round 3, C3-1
     mchs_no_identify = false; // a deliberate Auto Detect: IDENTIFY follows (review of 0.6f3p10, M-1)
+#if ATABOY_CTL
+    rules_note();             // identify.forbid stays: only power-up ends it
+#endif
     sleep_ms(2000);           // generous POST delay (not status-based)
     ide_write_control(0x00);  // nIEN=0
 
@@ -812,6 +869,9 @@ bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     // after the command was taken as the answer, so a drive slow to raise
     // BSY had its next command written while it was still busy, and an ERR
     // left by a failed read was taken as 91h refused.
+#if ATABOY_CTL
+    rules_note();                           // the first 91h since boot (idp_written)
+#endif
     sat_watch_t w;
     (void)ide_read_reg(7);                  // releases INTRQ before the command
     sat_watch_arm(&w);
@@ -848,6 +908,9 @@ static int identify_run(uint16_t *buf) {
 }
 static int identify_send(uint16_t *buf) {
     if (mchs_no_identify) { refused.identify_run++; return 0; }    // re-review of 0.6f3p10, N-3: every IDENTIFY comes through here
+#if ATABOY_CTL
+    if (identify_forbidden) { refused.identify_run++; return 0; }  // identify.forbid (SPEC-v1 4.12)
+#endif
     if (!ide_wait_until_ready(work_ms(1000))) return 0;
     if (ide_read_reg(7) & 0x08) ide_drain_sector();   // drain stranded DRQ before command
     ide_write_reg(6, dev_base);
@@ -913,11 +976,17 @@ bool ide_identify(uint16_t *buf) {
     // Review of 0.6f3p10, M-1: after a Ctrl+G nothing is sent, and nothing
     // is changed: it fails as a drive that did not answer would.
     if (mchs_no_identify) { refused.identify_call++; return false; }
+#if ATABOY_CTL
+    if (identify_forbidden) { refused.identify_call++; return false; }   // identify.forbid: the same
+#endif
     bool ok = identify_once(buf);
     // A drive that answered IDENTIFY is no longer one set up without it, in
     // either Ctrl+G mode (review of 0.6f3p10, M-2: native mode must not
     // stay on with READ LONG and pass-through unlocked).
     if (ok) { manual_chs_active = false; native_geo.on = false; }
+#if ATABOY_CTL
+    rules_note();
+#endif
     // Word 22 for READ LONG; a failed IDENTIFY forgets it, as below.
     long_words.valid = ok;
     if (ok) { long_words.dev_base = dev_base; long_words.w22 = buf[22]; }
@@ -1494,6 +1563,7 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
     mchs_no_identify = true;        // from here on this drive gets no IDENTIFY (M-1)
 #if ATABOY_CTL
     ide_idcache_clear(IDE_IDC_WHY_CTRLG);   // review C, C-12: cleared, not kept
+    rules_note();
 #endif
 #if ATABOY_SAT
     id_words.valid = false;         // this drive is never asked who it is
@@ -1576,6 +1646,9 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
         native_geo.spt = spt;
         manual_chs_active = true;   // no pass-through to this drive, as below
         sentinel_arm();             // review C round 2, C2-1
+#if ATABOY_CTL
+        rules_note();
+#endif
         return IDE_MCHS_OK;
     }
 
@@ -1584,6 +1657,9 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
     ide_write_reg(2, spt);
     sat_watch_arm(&w);
     idp_written = true;
+#if ATABOY_CTL
+    rules_note();
+#endif
     ide_write_reg(7, 0x91);
     wait_after_command();
     uint32_t idp_seq = obs_current_cmd();
@@ -1597,6 +1673,9 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
         return IDE_MCHS_REFUSED;
     }
     manual_chs_active = true;       // no pass-through to this drive (sat_policy.h)
+#if ATABOY_CTL
+    rules_note();
+#endif
     return IDE_MCHS_OK;
 }
 

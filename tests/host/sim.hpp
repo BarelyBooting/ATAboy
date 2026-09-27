@@ -799,4 +799,7 @@ void ide_pio_write(uint32_t count, const uint16_t *buf) {
     }
 }
 bool mock_intrq(void) { return sim.intrq_line(mock_now_ns); }
-void mock_reset_line(bool high) { sim.hw_reset_line(high, mock_now_ns); }
+// A test may look at the firmware's state at the moment RESET- moves (the
+// Control API's test_ctl: the epoch inside a Ctrl+G). Null elsewhere.
+inline void (*sim_reset_hook)(bool high) = nullptr;
+void mock_reset_line(bool high) { if (sim_reset_hook) sim_reset_hook(high); sim.hw_reset_line(high, mock_now_ns); }

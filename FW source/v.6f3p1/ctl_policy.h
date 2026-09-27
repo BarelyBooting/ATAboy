@@ -14,9 +14,9 @@
 //    boot, keyed by id AND the SHA-256 of the request line.
 //  - The rate window (3.5): 20 requests in any 1 s.
 //
-// Stage 1 of the build (SPEC-v1 12.1) carries Tier R only. The replay table
-// is built and tested now; no op of this stage is mutating, so on the unit
-// nothing reaches it until stage 2.
+// Stage 2 of the build (SPEC-v1 12.1) carries Tier R and Tier S (the
+// ratchet), whose five ops are the first mutating ones: from this stage on
+// the replay table is live on the unit.
 #ifndef CTL_POLICY_H
 #define CTL_POLICY_H
 
@@ -54,7 +54,7 @@ typedef struct {
     uint8_t     tier;       // CTL_TIER_*
     bool        job;        // runs on core 1 at the TUI's idle point (5.3)
     uint32_t    max_ms;     // SPEC-v1 4.0 "max time"
-    bool        built;      // carried by this build (stage 1: Tier R)
+    bool        built;      // carried by this build (stage 2: Tier R and Tier S)
 } ctl_op_t;
 
 extern const ctl_op_t ctl_ops[CTL_OP_COUNT];
@@ -69,8 +69,8 @@ int  ctl_op_find(const ctlj_doc_t *d, int str_node);   // CTL_OP_* or -1 (any op
 bool ctl_op_mutating(int op);                           // Tier S, Tier M and the session ops
 bool ctl_op_needs_token(int op);                        // Tier M and session.close
 
-// Capability states (3.4). Stage 1 has no lease and no jumpers, so a built
-// op is OPERATIONAL and an op not built yet is ABSENT with why NOT_BUILT (a
+// Capability states (3.4). Stage 2 has no lease and no jumpers, so a built
+// op is OPERATIONAL (Tier S needs neither) and an op not built yet is ABSENT with why NOT_BUILT (a
 // token of this stage: v1's list in 3.4 has no state for "in v1, not yet
 // built", and ABSENT is "not in this build").
 enum { CTL_CAP_OPERATIONAL, CTL_CAP_LOCKED, CTL_CAP_ABSENT };

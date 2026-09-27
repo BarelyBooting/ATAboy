@@ -105,8 +105,10 @@ option(ATABOY_SAT_SMART_SAVES "Also allow SMART READ DATA and RETURN STATUS thro
 # palimpsest fork: the ATAboy Control API (palimpsest api/SPEC-v1.md), a
 # second CDC port (interfaces 3 and 4) speaking one JSON object per line.
 # Stage 1: the port, the framing and parser, ids and the replay table, and
-# the read-only ops. OFF by default, and an OFF build is byte for byte the
-# image of the sources without it.
+# the read-only ops. Stage 2: the ratchet (write protect on, Pipelined Reads
+# off, forbid IDENTIFY, unmount and detach naming the mount). OFF by
+# default, and an OFF build is byte for byte the image of the sources
+# without it.
 option(ATABOY_CTL "ATAboy Control API: a second CDC port, JSON lines" OFF)
 if(ATABOY_CTL)
     target_sources(ATAboy PRIVATE ctl.c ctl_job.c ctl_json.c ctl_policy.c ctl_sha256.c)

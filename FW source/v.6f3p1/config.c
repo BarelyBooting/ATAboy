@@ -44,11 +44,31 @@ void config_load(void) {
 }
 
 void config_save(void) {
+#if ATABOY_CTL
+    // palimpsest api/SPEC-v1.md 5.5 (R-API-1 finding 15): with the Control
+    // API, core 0 also stores into config (wp.on, pipelined.off) and keeps
+    // running until the lockout below. The CRC used to be computed over the
+    // live config and the copy made after it, so a store between the two
+    // saved a sector whose CRC fails (defaults at the next boot). Now the
+    // copy is taken first and the CRC computed over the copy: whatever a
+    // store changes, the sector is one consistent snapshot. The RAM magic
+    // and crc are set as before (nothing reads them from RAM).
+    static uint8_t buf[FLASH_PAGE_SIZE];
+    memset(buf, 0, sizeof(buf));
+    config_t snap;
+    memcpy(&snap, &config, sizeof snap);
+    snap.magic = CONFIG_MAGIC;
+    snap.crc = config_crc(&snap);
+    memcpy(buf, &snap, sizeof snap);
+    config.magic = snap.magic;
+    config.crc = snap.crc;
+#else
     config.magic = CONFIG_MAGIC;
     config.crc = config_crc(&config);
     static uint8_t buf[FLASH_PAGE_SIZE];
     memset(buf, 0, sizeof(buf));
     memcpy(buf, &config, sizeof(config_t));
+#endif
     multicore_lockout_start_blocking();
     uint32_t ints = save_and_disable_interrupts();
     flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);

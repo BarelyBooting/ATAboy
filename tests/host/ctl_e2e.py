@@ -11,6 +11,13 @@ results and its hash-chained transcript. So what the client accepts is
 what the firmware sends, field by field, and the lines the firmware reads
 are the ones the client writes.
 
+Stage 2: the ratchet through the client's own request(), each op: wp.on,
+pipelined.off, identify.forbid, and unmount and detach naming the mount
+read from status (serve starts with a drive mounted through the menus'
+own path). The client refuses unmount and detach without expect_mount_seq
+before sending anything; a stale one is sent and refused E_STALE by the
+firmware, which the client reports as could-not-run.
+
 Then every request the client's own encoder makes for each op in its
 tables (Tier S, session and Tier M included, with a stand-in token) goes to
 the firmware as raw lines, and each answer is put through the client's
@@ -128,8 +135,10 @@ def main():
           f"version {r['fw']['version']} banner {r['fw']['banner']}")
     check(r['limits']['max_mutating_id'] == 0 and c.ledger.seed_boot == c.boot, 'ids seeded from max_mutating_id')
     tier_r = [op for op, v in ctl.OP_TABLE.items() if v[0] == 'R']
+    tier_s = [op for op, v in ctl.OP_TABLE.items() if v[0] == 'S']
+    check(sorted(tier_s) == ['detach', 'identify.forbid', 'pipelined.off', 'unmount', 'wp.on'], f'Tier S {tier_s}')
     for op in ctl.OP_TABLE:
-        want = 'OPERATIONAL' if op in tier_r else 'ABSENT'
+        want = 'OPERATIONAL' if op in tier_r or op in tier_s else 'ABSENT'
         check(r['caps'][op]['state'] == want, f"hello caps {op}: {r['caps'][op]}")
     for op in ctl.HUMAN_ONLY_OPS | ctl.NOT_IN_V1_OPS:
         check(r['caps'][op]['state'] == 'ABSENT', f'{op} not ABSENT')
@@ -141,20 +150,49 @@ def main():
         x = c.request(op, args)
         check(x.state == 'Pass', f'{op} {args}: {x!r}')
     st = c.request('status').result
-    check(st['tui']['state'] == 'MAIN' and st['presence']['waiting'] is False and st['ids']['max_mutating'] == 0,
-          'status values')
+    check(st['tui']['state'] == 'MAIN' and st['presence']['waiting'] is False and st['ids']['max_mutating'] == 0 and
+          st['mounted'] is True and st['mount_seq'] == 1 and st['setup']['source'] == 'TUI_DETECT_NORMAL',
+          f"status values: mounted {st['mounted']} mount_seq {st['mount_seq']} source {st['setup']['source']}")
     lr = c.request('log.read', {'cursor': 0, 'max_entries': 128}).result
     page = bytes.fromhex(lr['page_hex'])
     check(page[:8] == b'ATBLOG01' and lr['entries'] >= 5 and len(page) == 32 + 32 * lr['entries'],
           f"log page: {page[:8]!r}, {lr['entries']} entries")
-    # The ratchet and the rest are ABSENT in stage 1: the client refuses them
-    # before sending anything, from what hello said.
-    sent = len(ports[0].lines_out)
+    # Stage 2, the ratchet, through the client's own request(), strict
+    # schemas and semantic checks (a DONE that leaves the wrong state fails).
+    e0 = st['epoch']
+    x = c.request('wp.on', {'expect_epoch': e0})
+    check(x.state == 'Pass' and x.result['wp']['effective'] is True and x.result['wp']['last_change'] == 'API',
+          f'wp.on: {x!r}')
     x = c.request('wp.on', {})
-    check(x.state == 'CouldNotRun' and 'ABSENT' in x.reason and len(ports[0].lines_out) == sent,
-          f'wp.on on a stage 1 build: {x!r}')
-    x = c.request('unmount', {'expect_mount_seq': 0})
-    check(x.state == 'CouldNotRun' and len(ports[0].lines_out) == sent, f'unmount: {x!r}')
+    check(x.state == 'Pass' and x.result['changed'] is False, f'wp.on again: {x!r}')
+    x = c.request('pipelined.off', {})
+    check(x.state == 'Pass' and x.result['pipelined_reads'] is False, f'pipelined.off: {x!r}')
+    x = c.request('identify.forbid', {})
+    check(x.state == 'Pass' and x.result['identify_forbidden'] is True and x.result['changed'] is True,
+          f'identify.forbid: {x!r}')
+    st = c.request('status').result
+    check(st['rules']['identify_forbidden'] is True and st['rules']['identify_barred'] is True and
+          st['wp']['effective'] is True and st['features']['pipelined_reads'] is False, 'status after the ratchet')
+    # unmount and detach: refused by the client itself without expect_mount_seq,
+    # before anything is written (owner decision on R-API-1 finding 11).
+    sent = len(ports[0].lines_out)
+    for op in ('unmount', 'detach'):
+        x = c.request(op, {})
+        check(x.state == 'CouldNotRun' and 'expect_mount_seq' in x.reason and len(ports[0].lines_out) == sent,
+              f'{op} without expect_mount_seq: {x!r}, {len(ports[0].lines_out) - sent} lines sent')
+    # A stale name: sent, refused by the firmware, nothing changed.
+    x = c.request('unmount', {'expect_mount_seq': st['mount_seq'] + 1})
+    check(x.state == 'CouldNotRun' and x.response['err']['code'] == 'E_STALE' and len(ports[0].lines_out) == sent + 1,
+          f'a stale unmount: {x!r}')
+    check(c.request('status').result['mounted'] is True, 'a stale unmount unmounted')
+    x = c.request('unmount', {'expect_mount_seq': st['mount_seq']})
+    check(x.state == 'Pass' and x.result == {'mounted': False, 'changed': True, 'native_mode_ended': False},
+          f'unmount: {x!r}')
+    x = c.request('detach', {'expect_mount_seq': st['mount_seq'], 'expect_epoch': c.request('status').result['epoch']})
+    check(x.state == 'Pass' and x.result == {'detached': True}, f'detach: {x!r}')
+    st2 = c.request('status').result
+    check(st2['mounted'] is False and st2['setup']['source'] == 'NONE' and st2['geometry']['total_sectors'] == 0 and
+          st2['tui']['state'] == 'MAIN', 'status after detach')
     x = c.request('setup.detect', {})
     check(x.state == 'CouldNotRun', 'setup.detect')
     c.close()
@@ -169,8 +207,8 @@ def main():
         'hello': {}, 'status': {}, 'identify.cached': {}, 'config.get': {}, 'taskfile.snapshot': {},
         'log.read': {'cursor': 0, 'max_entries': 1}, 'hashes.read': {'cursor': 0, 'max_entries': 1},
         'debug.e': {}, 'selftest.status': {}, 'chip.info': {}, 'job.last': {},
-        'wp.on': {}, 'pipelined.off': {'expect_epoch': 0}, 'identify.forbid': {},
-        'unmount': {'expect_mount_seq': 0}, 'detach': {'expect_mount_seq': 0},
+        'wp.on': {}, 'pipelined.off': {}, 'identify.forbid': {},
+        'unmount': {'expect_mount_seq': 1}, 'detach': {'expect_mount_seq': 1},
         'session.open': {'client': 'palimpsest', 'tui_lock': False, 'idle_s': 300}, 'session.close': {},
         'setup.ctrlg': {'cyls': 522, 'heads': 4, 'spt': 40, 'mode': 'native', 'device': 'master',
                         'drive_power_cycled': True, 'then_mount': True},
@@ -197,7 +235,12 @@ def main():
         check(resp is not None and e is None and resp['id'] == rid, f'{op}: the client rejects the answer: {e} {raw[:200]!r}')
         if resp is None:
             continue
-        if op in tier_r:
+        if op == 'taskfile.snapshot':
+            # serve starts with a drive mounted (stage 2), and this op is
+            # refused while the bus is the host's (spec 4.6); unmount follows.
+            check(resp['outcome'] == 'NOT_EXECUTED' and resp['err']['code'] == 'E_STATE',
+                  f"{op} while mounted: {resp['outcome']} {resp.get('err')}")
+        elif op in tier_r or op in tier_s:
             check(resp['outcome'] == 'DONE', f"{op}: {resp['outcome']} {resp.get('err')}")
             if op in ctl.RESULT_SCHEMA:
                 check(ctl.check(resp['result'], ctl.RESULT_SCHEMA[op], 'result') is None,

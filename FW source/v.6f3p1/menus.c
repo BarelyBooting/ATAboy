@@ -20,6 +20,7 @@
 #if ATABOY_CTL
 #include "ctl.h"
 #include "ctl_build.h"
+#include "ctl_state.h"
 #endif
 
 // ---------------------------------------------------------------------------
@@ -967,6 +968,14 @@ static void features_toggle_iordy(void) {
 // with IDENTIFY) are refused after a Ctrl+G, either mode, until Auto Detect.
 // ide_identify() refuses as well; this only says so on the screen.
 #define DEBUG_REFUSED_MCHS "Refused: Ctrl+G drive, no IDENTIFY. Nothing sent."
+#if ATABOY_CTL
+// The one new TUI text of identify.forbid (SPEC-v1 4.12). The Auto Detect
+// box holds 50 columns, so there it ends "Press a key" as the Ctrl+G one
+// does, and the power-cycle half is left to the Debug screen.
+#define API_FORBIDDEN_TEXT  "IDENTIFY forbidden by ATAboy Control. Power-cycle to end."
+#define API_FORBIDDEN_BOX   "IDENTIFY forbidden by ATAboy Control. Press a key"
+#define API_FORBIDDEN_FORCE "\033[91;1mForbidden by ATAboy Control: no Force"
+#endif
 static void debug_key(int k) {
     bool known = k == 'i' || k == 'I' || k == 't' || k == 'T' || k == 'e' || k == 'E' ||
                  k == 's' || k == 'S' || k == 'r' || k == 'R';
@@ -977,6 +986,16 @@ static void debug_key(int k) {
         debug_print(1, FG_WHITE, "Power-cycle the ATAboy to end this.");
         return;
     }
+#if ATABOY_CTL
+    // identify.forbid (palimpsest api/SPEC-v1.md 4.12, R-API-1 finding 6):
+    // refused here too, before anything is sent, with its own text.
+    if ((k == 'i' || k == 'I' || k == 's' || k == 'S') && ide_identify_forbidden()) {
+        debug_cls();
+        debug_print(0, "\033[91;1m", API_FORBIDDEN_TEXT);
+        debug_print(1, FG_WHITE, "Nothing sent.");
+        return;
+    }
+#endif
     if (!bus_free_wait(true)) return;
     if (k == 'i' || k == 'I') run_debug_identify();
     else if (k == 't' || k == 'T') run_debug_taskfile();
@@ -1002,8 +1021,15 @@ static void sync_from_config(void) {
 }
 
 static void sync_to_config(void) {
+#if ATABOY_CTL
+    bool same = config.cyls == cur_cyls && config.heads == cur_heads && config.spt == cur_spt &&
+                config.use_lba_mode == use_lba_mode && config.lba_sectors == total_lba_sectors;
+#endif
     config.cyls = cur_cyls; config.heads = cur_heads; config.spt = cur_spt;
     config.use_lba_mode = use_lba_mode; config.lba_sectors = total_lba_sectors;
+#if ATABOY_CTL
+    if (!same) CTL_EPOCH_BUMP();        // the geometry (ctl_state.h)
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,6 +1099,9 @@ static void try_auto_mount(void) {
     log_mount(OBS_EV_MOUNT, OBS_MNT_AUTO);
     is_mounted = true;
     media_changed_waiting = true;
+#if ATABOY_CTL
+    ctl_setup_noted(CTL_SRC_AUTO_MOUNT);    // a set-up and a mount: the epoch moves there
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,9 +1121,15 @@ static bool fwupdate_key(int k) {
 // detection must not let the SAT policy judge the new drive by the old one's
 // IDENTIFY (a donor's SMART support would then admit SMART on a specimen).
 static void menu_unmount(void) {
+#if ATABOY_CTL
+    bool was_mounted = is_mounted;
+#endif
     if (is_mounted) log_mount(OBS_EV_UNMOUNT, OBS_UNM_MENU);
     is_mounted = false;
     media_changed_waiting = true;
+#if ATABOY_CTL
+    if (was_mounted) CTL_EPOCH_BUMP();
+#endif
 #if ATABOY_SAT
     ide_id_words_forget();          // only SAT builds keep the words
 #endif
@@ -1114,12 +1149,15 @@ static void menu_unmount(void) {
     // no 0x91 to this drive either way (ide_native_drive).
     if (ide_manual_chs_native_active()) {
         cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;
+#if ATABOY_CTL
+        ctl_setup_noted(CTL_SRC_NONE);  // Mount has nothing now: the set-up is gone
+#endif
         uint32_t t0 = to_ms_since_boot(get_absolute_time());
         while (usb_msc_ide_busy() && to_ms_since_boot(get_absolute_time()) - t0 < IDE_BUS_WAIT_MS)
             sleep_ms(10);
         if (!usb_msc_ide_busy()) {
             ide_manual_chs_native_forget();
-            sync_to_config();
+            sync_to_config();           // the geometry cleared: the epoch moves there (ctl_state.h)
         }
     }
 }
@@ -1171,6 +1209,17 @@ static bool run_auto_detect(void) {
         needs_full_redraw = true;
         return false;
     }
+#if ATABOY_CTL
+    // identify.forbid (SPEC-v1 4.12, R-API-1 finding 6): refused before the
+    // probe, so no RESET-, no RECALIBRATE, and no "IDENTIFY failed" box with
+    // F: Force after it.
+    if (ide_identify_forbidden()) {
+        draw_confirm_box(API_FORBIDDEN_BOX);
+        while (get_input() == -1) tight_loop_contents();
+        needs_full_redraw = true;
+        return false;
+    }
+#endif
     if (!bus_free_wait(false)) { needs_full_redraw = true; return false; }
     bool overlay = false;
     // Auto Detect: single reset, probe master then slave
@@ -1189,9 +1238,18 @@ static bool run_auto_detect(void) {
     cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;
     sync_to_config();
     id_w49_known = false;           // IORDY advisory: only this detection's IDENTIFY counts
+#if ATABOY_CTL
+    ctl_setup_noted(CTL_SRC_NONE);
+#endif
     if (found) {
         ide_select_device(found);
+#if ATABOY_CTL
+        bool dev_moved = config.dev_base != found;
+#endif
         config.dev_base = found;
+#if ATABOY_CTL
+        if (dev_moved) CTL_EPOCH_BUMP();
+#endif
         if (ide_identify(id_buf)) detected = true;
 #if ATABOY_CTL
         if (detected) ide_idcache_put(id_buf, IDE_IDC_AUTO_DETECT);
@@ -1250,6 +1308,9 @@ static bool run_auto_detect(void) {
                         cur_cyls = detect_cyls; cur_heads = detect_heads; cur_spt = detect_spt;
                         ide_set_geometry(cur_heads, cur_spt);
                         sync_to_config(); waiting = false;
+#if ATABOY_CTL
+                        ctl_setup_noted(CTL_SRC_TUI_MANUAL);
+#endif
                     } else { sd = true; }
                     }   /* !manual_aborted */
                 } else if (ch == KEY_ENTER) {
@@ -1268,6 +1329,10 @@ static bool run_auto_detect(void) {
                     // LARGE translation's 32 and more) is not applied.
                     if (valid && !use_lba_mode && (cur_heads == 0 || cur_heads > 16 || cur_spt == 0)) { valid = false; sd = true; }
                     if (valid) { if (!use_lba_mode) ide_set_geometry(cur_heads, cur_spt); sync_to_config(); waiting = false; }
+#if ATABOY_CTL
+                    if (valid) ctl_setup_noted(geo_idx == 0 ? CTL_SRC_TUI_DETECT_NORMAL : geo_idx == 1 ? CTL_SRC_TUI_DETECT_LARGE
+                                                                  : CTL_SRC_TUI_DETECT_LBA);
+#endif
                 }
             }
     } else {
@@ -1452,6 +1517,9 @@ static bool run_manual_chs(void) {
         cur_cyls = (uint16_t)v[0]; cur_heads = (uint8_t)v[1]; cur_spt = (uint8_t)v[2];
         strcpy(hdd_model_raw, native ? MCHS_MODEL_NATIVE : MCHS_MODEL);
         sync_to_config();
+#if ATABOY_CTL
+        ctl_setup_noted(native ? CTL_SRC_TUI_CTRLG_NATIVE : CTL_SRC_TUI_CTRLG_IDP);
+#endif
         return false;
     }
     // The drive was reset, so whatever geometry it had is gone: nothing is
@@ -1463,6 +1531,9 @@ static bool run_manual_chs(void) {
                       r == IDE_MCHS_NOT_READY ? "drive not ready, no 91h" :
                       r == IDE_MCHS_IDP_SENT ? "91h sent since boot" : "nothing sent";
     snprintf(hdd_status_text, sizeof(hdd_status_text), "\033[91;1mManual CHS: %s (ST:%02X)", why, st);
+#if ATABOY_CTL
+    ctl_setup_noted(CTL_SRC_NONE);  // the drive was reset: no set-up is left (cleared below)
+#endif
     hdd_model_raw[0] = '\0';
     cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;
     sync_to_config();
@@ -1483,6 +1554,10 @@ static void detect_result_dismiss(void) {
     total_lba_sectors = 0; use_lba_mode = false; is_mounted = false;
     media_changed_waiting = true;   // as every other unmount path does
     sync_to_config(); needs_full_redraw = true;
+#if ATABOY_CTL
+    CTL_EPOCH_BUMP();
+    ctl_setup_noted(CTL_SRC_NONE);
+#endif
 }
 
 // Mount with no drive or no geometry set: the error box (the caller draws
@@ -1500,7 +1575,52 @@ static void mount_nothing_to_mount(void) {
     cur_cyls = 0; cur_heads = 0; cur_spt = 0;
     total_lba_sectors = 0; use_lba_mode = false; is_mounted = false;
     show_detect_result = true; needs_full_redraw = true;
+#if ATABOY_CTL
+    CTL_EPOCH_BUMP();
+    ctl_setup_noted(CTL_SRC_NONE);
+#endif
 }
+
+#if ATABOY_CTL
+// ---------------------------------------------------------------------------
+//  The ATAboy Control API's unmount and detach (palimpsest api/SPEC-v1.md
+//  4.12), run by ctl_job.c on this core at the TUI's idle point
+// ---------------------------------------------------------------------------
+// Neither draws, reads a key or waits for one (R-API-1 finding 1): they
+// change the state and leave the screen to follow it, redrawn by the menu
+// loop when a terminal is connected (finding 2).
+
+// The confirm-4 path, exactly (menu_unmount, then the main menu). True when
+// Ctrl+G's power-up default mode was on and has ended.
+bool menus_api_unmount(void) {
+    bool native_before = ide_manual_chs_native_active();
+    menu_unmount();
+    current_screen = SCREEN_MAIN;
+    needs_full_redraw = true;
+    return native_before && !ide_manual_chs_native_active();
+}
+
+// detach, once no USB read is left running (the caller waited): what the
+// error box's dismissal clears (detect_result_dismiss), and the IDENTIFY
+// words, so nothing on the ATAboy can mount this drive again without a new
+// set-up. Ctrl+G's rules and identify.forbid stay: only power-up ends them.
+void menus_api_detach_clear(void) {
+    hdd_model_raw[0] = '\0';
+    if (ide_mchs_no_identify()) { strcpy(hdd_model_raw, MCHS_MODEL_CLEARED); }   // for the host tools, as N-2
+    cur_cyls = 0; cur_heads = 0; cur_spt = 0; total_lba_sectors = 0; use_lba_mode = false;
+    ide_manual_chs_native_forget();
+    sync_to_config();
+#if ATABOY_SAT
+    ide_id_words_forget();
+#endif
+    ide_read_long_forget();
+    ide_idcache_clear(IDE_IDC_WHY_DETACH);
+    CTL_EPOCH_BUMP();
+    ctl_setup_noted(CTL_SRC_NONE);
+    current_screen = SCREEN_MAIN;
+    needs_full_redraw = true;
+}
+#endif
 
 // Enter on "Auto Detect & Set Geometry". Review C, C-3: it asks first
 // (confirm_type 6; Y runs it), and after a Ctrl+G it is refused at once
@@ -1508,6 +1628,9 @@ static void mount_nothing_to_mount(void) {
 // question is to be drawn.
 static bool auto_detect_enter(void) {
     if (ide_mchs_no_identify()) { (void)run_auto_detect(); return false; }
+#if ATABOY_CTL
+    if (ide_identify_forbidden()) { (void)run_auto_detect(); return false; }   // refused at once, no Y/N
+#endif
     current_screen = SCREEN_CONFIRM;
     confirm_type = 6;
     needs_full_redraw = true;
@@ -1668,6 +1791,15 @@ void core1_entry(void) {
         if (show_detect_result) {
             if (k == KEY_ENTER || k == KEY_ESC) {
                 detect_result_dismiss();
+#if ATABOY_CTL
+            } else if (force_detect && (k == 'f' || k == 'F') && ide_identify_barred()) {
+                // An "IDENTIFY failed" box drawn before identify.forbid came
+                // still offers F: Force (typed geometry, 91h). Closed now
+                // (SPEC-v1 4.12, R-API-1 finding 6): the box says so instead.
+                force_detect = false;
+                snprintf(hdd_status_text, sizeof(hdd_status_text), "%s", API_FORBIDDEN_FORCE);
+                trigger_overlay = true;
+#endif
             } else if (force_detect && (k == 'f' || k == 'F')) {
                 show_detect_result = false; hdd_status_text[0] = '\0';
                 force_detect = false;
@@ -1712,6 +1844,9 @@ void core1_entry(void) {
                             cur_cyls = detect_cyls; cur_heads = detect_heads; cur_spt = detect_spt;
                             ide_set_geometry(cur_heads, cur_spt);
                             sync_to_config(); waiting = false;
+#if ATABOY_CTL
+                            ctl_setup_noted(CTL_SRC_TUI_FORCE);
+#endif
                         } else { sd = true; }
                         }   /* !f_aborted */
                     }
@@ -1736,11 +1871,23 @@ void core1_entry(void) {
             if (k == 'y' || k == 'Y') {
                 if (confirm_type == 0) {
                     // Holistic review L-1: as F10, never under a USB command.
+#if ATABOY_CTL
+                    bool wp_before = config.drive_write_protected;
+#endif
                     if (bus_free_wait(false)) { config_defaults(); sync_from_config(); config_save(); }
+#if ATABOY_CTL
+                    if (config.drive_write_protected != wp_before) ctl_wp_last = CTL_WP_TUI;
+                    CTL_EPOCH_BUMP();
+                    ctl_setup_noted(CTL_SRC_NONE);
+#endif
                     current_screen = SCREEN_MAIN;
                 }
                 else if (confirm_type == 1) { (void)save_setup(); current_screen = confirm_return_screen; }
-                else if (confirm_type == 3) { log_mount(OBS_EV_MOUNT, OBS_MNT_MENU); is_mounted = true; media_changed_waiting = true; current_screen = SCREEN_MOUNTED; }
+                else if (confirm_type == 3) { log_mount(OBS_EV_MOUNT, OBS_MNT_MENU); is_mounted = true; media_changed_waiting = true; current_screen = SCREEN_MOUNTED;
+#if ATABOY_CTL
+                    CTL_EPOCH_BUMP();
+#endif
+                }
                 else if (confirm_type == 4) { menu_unmount(); current_screen = SCREEN_MAIN; }
                 else if (confirm_type == 5) {
                     // Reboot into the ROM bootloader, so new firmware can be
@@ -1802,12 +1949,20 @@ void core1_entry(void) {
             else if (k == KEY_DOWN && config.feat_selected < 5) config.feat_selected++;
             else if (k == KEY_ESC) current_screen = SCREEN_MAIN;
             else if (k == KEY_ENTER) {
+#if ATABOY_CTL
+                bool wp_before = config.drive_write_protected, pr_before = config.pipelined_reads;
+#endif
                 if (config.feat_selected == 0) config.drive_write_protected = !config.drive_write_protected;
                 else if (config.feat_selected == 1) config.auto_mount = !config.auto_mount;
                 else if (config.feat_selected == 2) features_toggle_iordy();
                 else if (config.feat_selected == 3) config.intrq_enabled = !config.intrq_enabled;
                 else if (config.feat_selected == 4) current_screen = SCREEN_DEBUG;
                 else if (config.feat_selected == 5) config.pipelined_reads = !config.pipelined_reads;   // F1 stage 2: usb.c takes it at a READ(10)'s start
+#if ATABOY_CTL
+                // The human's toggles, both ways (status.epoch, wp.last_change).
+                if (config.drive_write_protected != wp_before) { ctl_wp_last = CTL_WP_TUI; CTL_EPOCH_BUMP(); }
+                if (config.pipelined_reads != pr_before) CTL_EPOCH_BUMP();
+#endif
             }
             needs_full_redraw = true;
         }

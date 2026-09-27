@@ -164,6 +164,9 @@ bool    ide_fault_last(ide_fault_t *out);
 #define IDE_FAULT_TRIPWIRE 0xEC9100u    // cfsr: this | the refused opcode
 #define IDE_TRIP_NO_IDENTIFY 1          // ECh with the no-IDENTIFY rule set (mchs_no_identify)
 #define IDE_TRIP_NO_91H      2          // 91h in the power-up default mode (native_declared)
+#if ATABOY_CTL
+#define IDE_TRIP_FORBIDDEN   3          // ECh after identify.forbid (the Control API, SPEC-v1 I-22)
+#endif
 typedef struct {
     bool     tripped;
     uint8_t  opcode;        // ECh or 91h
@@ -372,6 +375,12 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba);
 // ---------------------------------------------------------------------------
 //  For the ATAboy Control API (palimpsest api/SPEC-v1.md)
 // ---------------------------------------------------------------------------
+// identify.forbid (SPEC-v1 4.12): a no-IDENTIFY rule set by the API, sticky
+// until power-up. ide_identify_forbid() sets it (true: it was not set yet);
+// ide_identify_barred() is either rule, Ctrl+G's or this one (1.4).
+bool    ide_identify_forbid(void);
+bool    ide_identify_forbidden(void);
+bool    ide_identify_barred(void);
 // identify.cached (SPEC-v1 4.4): the 512 bytes of the firmware's own last
 // IDENTIFY that ended cleanly, with where it came from, when and for which
 // device. No API op sends IDENTIFY in v1 (owner Q2); this only keeps what the

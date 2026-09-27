@@ -21,9 +21,14 @@
 // Oracle, per line (SPEC-v1 11.3): with DTR high, exactly one response for a
 // non-empty line and none for an empty one; every response is one line of
 // the response grammar with the closed envelope; a response other than DONE
-// leaves the state as it was (I-10); replayed:true only for a line
-// byte-identical to an earlier one with its id, and then the stored response
-// itself (I-18); a mutating stand-in never runs twice for one id.
+// leaves the state as it was (I-10, I-27: the epoch included); replayed:true
+// only for a line byte-identical to an earlier one with its id, and then a
+// response that id got before (I-18); a mutating request never runs twice
+// for one id (its API entries in the command log, 5.4, count the runs); and
+// no state change is ever missed by the epoch's hooks (epoch_poll's
+// cross-check). Stage 2: the ratchet's five ops are real, with the human's
+// own changes between lines (a TUI mount, write protect or Pipelined Reads
+// switched back), so wp.on, unmount and the rest have something to change.
 // Exit status: 0, or the number of violations (at most 255).
 #include "ctl_harness.hpp"
 #include <algorithm>
@@ -36,7 +41,7 @@ static uint32_t below(uint32_t n) { return n ? (uint32_t)(next() % n) : 0; }
 
 static int violations = 0;
 static uint64_t lines_sent = 0, responses = 0, done_n = 0, replays = 0;
-static std::map<std::string, int> codes;
+static std::map<std::string, int> codes, done_ops;
 static void violation(const char *what, const std::string &line, const std::string &resp) {
     violations++;
     if (violations <= 20) {
@@ -82,15 +87,26 @@ static const char *vals[] = { "0", "1", "2", "9007199254740991", "90071992547409
                               "2147483648", "16777215", "16777216", "128", "129", "96", "97" };
 static const char *keys[] = { "v", "id", "op", "args", "token", "cursor", "max_entries", "include_data", "expect_epoch",
                               "expect_mount_seq", "x", "", "V", "ID" };
+// A small number, or the current one now and then, so both a match and a
+// mismatch come up (expect_mount_seq, expect_epoch).
+static std::string near(uint32_t cur) { return std::to_string(below(3) ? cur : (uint32_t)below(4)); }
 
 // A valid envelope, then one field changed.
 static std::string grammar_line() {
-    uint32_t id = 1 + below(40);
+    // Half the time an id above every mutating id so far, so mutating
+    // requests run (and can be resent byte for byte); else a small one.
+    uint32_t id = below(2) ? c.replay.max_id + 1 + below(2) : 1 + below(40);
     std::string op = ops[below(sizeof ops / sizeof ops[0])];
     std::string args = "{}";
     if (op == "log.read" || op == "hashes.read") args = "{\"cursor\":" + std::to_string(below(50)) + ",\"max_entries\":" + std::to_string(1 + below(96)) + "}";
     if (op == "debug.e" && below(2)) args = "{\"include_data\":true}";
-    if (op == "wp.on" && below(3) == 0) args = "{\"expect_epoch\":" + std::to_string(below(4)) + "}";
+    if ((op == "wp.on" || op == "pipelined.off" || op == "identify.forbid") && below(3) == 0)
+        args = "{\"expect_epoch\":" + near(ctl_epoch) + "}";
+    if (op == "unmount" || op == "detach") {
+        args = "{\"expect_mount_seq\":" + near(ctl_mount_seq);
+        if (below(3) == 0) args += ",\"expect_epoch\":" + near(ctl_epoch);
+        args += "}";
+    }
     std::vector<std::pair<std::string, std::string>> f = {
         { "v", "1" }, { "id", std::to_string(id) }, { "op", "\"" + op + "\"" }, { "args", args } };
     switch (below(10)) {
@@ -133,21 +149,44 @@ static std::string digest() {
     uint8_t h[OBS_PAGE_HEADER];
     obs_log_page(0, h, sizeof h); s.append((const char *)h + 16, 8);
     obs_hash_page(0, h, sizeof h); s.append((const char *)h + 16, 8);
-    s += std::to_string(is_mounted) + std::to_string(mchs_no_identify) + std::to_string(sim.reg_writes) + "/" +
-         std::to_string(sim.cmd_log.size()) + "/" + std::to_string(c.jl_present) + std::to_string(c.epoch);
+    s += std::to_string(is_mounted) + std::to_string(mchs_no_identify) + std::to_string(identify_forbidden) + "/" +
+         std::to_string(sim.reg_writes) + "/" + std::to_string(sim.cmd_log.size()) + "/" + std::to_string(c.jl_present) +
+         "/" + std::to_string(ctl_epoch) + "/" + std::to_string(ctl_mount_seq) + "/" + std::to_string(current_screen) +
+         "/" + std::to_string(ctl_setup_src) + std::to_string(ctl_wp_last) + hdd_model_raw;
     return s;
 }
 
-static int executed_ids[64];
-static int stand_in(ctlw_t *w, const ctlj_doc_t *d, int) {
-    int id = (int)d->node[ctlj_find(d, 0, "id")].num;
-    if (id >= 0 && id < 64) executed_ids[id]++;
-    ctlw_bool(w, "changed", true);
-    return CTL_E_NONE;
+// Runs per id, from the command log: a core-0 op's one DONE entry, a job's
+// API_BEGIN (SPEC-v1 5.4). Counted from the last entry already looked at.
+static std::map<uint32_t, int> runs;
+static uint32_t runs_scanned = 1;
+static void count_runs() {
+    for (; runs_scanned < log_next; runs_scanned++) {
+        const obs_log_entry_t &e = log_ring[runs_scanned % OBS_LOG_ENTRIES];
+        if (e.seq != runs_scanned || e.kind != OBS_EV_API) continue;
+        bool job = e.value == CTL_OP_UNMOUNT || e.value == CTL_OP_DETACH || e.value == CTL_OP_TASKFILE_SNAPSHOT;
+        if (job ? e.outcome != OBS_API_BEGIN : e.outcome != OBS_API_DONE) continue;
+        if (!ctl_op_mutating(e.value)) continue;
+        runs[e.tf[0] | (e.tf[1] << 8) | (e.tf[2] << 16) | ((uint32_t)e.tf[3] << 24)]++;
+    }
+}
+// The human, between lines: what the ratchet then has to change.
+static void human_event() {
+    switch (below(4)) {
+    case 0:                                         // Auto Detect's set-up, then Mount (confirm-3)
+        if (is_mounted) break;
+        use_lba_mode = false; cur_cyls = 980; cur_heads = 10; cur_spt = 17; total_lba_sectors = 0;
+        strcpy(hdd_model_raw, "FUZZ"); sync_to_config(); ctl_setup_noted(CTL_SRC_TUI_DETECT_NORMAL);
+        log_mount(OBS_EV_MOUNT, OBS_MNT_MENU); is_mounted = true; current_screen = SCREEN_MOUNTED; CTL_EPOCH_BUMP();
+        break;
+    case 1: config.drive_write_protected = false; ctl_wp_last = CTL_WP_TUI; CTL_EPOCH_BUMP(); break;
+    case 2: config.pipelined_reads = true; CTL_EPOCH_BUMP(); break;
+    case 3: if (is_mounted) { menu_unmount(); current_screen = SCREEN_MAIN; } break;
+    }
 }
 
 // One line in, the answers out, the oracle applied.
-static std::map<uint32_t, std::pair<std::string, std::string>> first_mutating;   // id -> (line digest, response)
+static std::map<uint32_t, std::vector<std::pair<std::string, std::string>>> answered;   // id -> (line digest, response)
 static void one_line(std::string body, bool count_oracle) {
     for (char &ch : body) if (ch == '\n') ch = ' ';     // one line exactly
     std::string line = body + "\n";
@@ -175,28 +214,33 @@ static void one_line(std::string body, bool count_oracle) {
         if (!e.empty()) { violation(("envelope: " + e).c_str(), line, r); continue; }
         codes[j["outcome"].is("DONE") ? std::string("DONE") : j["err"]["code"].s]++;
         bool done = j["outcome"].is("DONE");
-        done_n += done;
-        if (!done && digest() != d0) violation("a refused line changed the state (I-10)", line, r);
-        if (j.get("replayed")) {
-            replays++;
-            uint8_t dg[32];
-            ctl_sha256(stripped.data(), stripped.size(), dg);
-            std::string dgs((const char *)dg, 32);
-            auto it = j["id"].t == J::INT ? first_mutating.find((uint32_t)j["id"].n) : first_mutating.end();
-            if (it == first_mutating.end() || it->second.first != dgs)
-                violation("replayed for a line that was not sent before with its id (I-18)", line, r);
-            else if (r != it->second.second.substr(0, it->second.second.size() - 1) + ",\"replayed\":true}")
-                violation("a replay that is not the stored response", line, r);
-        } else if (done && j["id"].t == J::INT) {
+        if (done && !j.get("replayed")) {
             static ctlj_doc_t pd;
-            if (ctlj_parse(stripped.data(), stripped.size(), &pd) == CTLJ_OK && ctlj_str_is(&pd, ctlj_find(&pd, 0, "op"), "wp.on")) {
-                uint8_t dg[32];
-                ctl_sha256(stripped.data(), stripped.size(), dg);
-                first_mutating[(uint32_t)j["id"].n] = { std::string((const char *)dg, 32), r };
+            if (ctlj_parse(stripped.data(), stripped.size(), &pd) == CTLJ_OK) {
+                int o = ctlj_find(&pd, 0, "op");
+                for (int k = CTL_OP_WP_ON; k <= CTL_OP_DETACH; k++) if (ctlj_str_is(&pd, o, ctl_ops[k].name)) done_ops[ctl_ops[k].name]++;
             }
         }
+        done_n += done;
+        if (!done && digest() != d0) violation("a refused line changed the state (I-10)", line, r);
+        uint8_t dg[32];
+        ctl_sha256(stripped.data(), stripped.size(), dg);
+        std::string dgs((const char *)dg, 32);
+        if (j.get("replayed")) {
+            replays++;
+            bool found = false, same = false;
+            if (j["id"].t == J::INT)
+                for (auto &pr : answered[(uint32_t)j["id"].n])
+                    if (pr.first == dgs) { found = true; same |= r == pr.second.substr(0, pr.second.size() - 1) + ",\"replayed\":true}"; }
+            if (!found) violation("replayed for a line that was not sent before with its id (I-18)", line, r);
+            else if (!same) violation("a replay that is not a response the line got before", line, r);
+        } else if (j["id"].t == J::INT) {
+            answered[(uint32_t)j["id"].n].push_back({ dgs, r });
+        }
     }
-    for (int i = 0; i < 64; i++) if (executed_ids[i] > 1) { violation("a mutating id ran twice", line, ""); executed_ids[i] = 1; }
+    count_runs();
+    for (auto &kv : runs) if (kv.second > 1) { violation("a mutating id ran twice", line, ""); kv.second = 1; }
+    if (c.epoch_missed) { violation("a state change no epoch hook counted", line, ""); c.epoch_missed = 0; }
 }
 
 int main(int argc, char **argv) {
@@ -207,7 +251,7 @@ int main(int argc, char **argv) {
     load_corpus(dir);
     if (corpus.empty()) { printf("COULD NOT RUN: no corpus in %s\n", dir); return 98; }
     power_up();
-    ctl_test_op[CTL_OP_WP_ON] = stand_in;           // a mutating op, so replays are exercised (stage 2 is not built)
+    runs_scanned = log_next;
     // 1. The corpus as it is: the count oracle holds for every line.
     for (auto &l : corpus) one_line(l, true);
     // 2. Mutants, with events between them.
@@ -218,6 +262,7 @@ int main(int argc, char **argv) {
                       : kind < 10 ? byte_mutant(grammar_line())
                       : history.empty() ? grammar_line() : history[below((uint32_t)history.size())];
         if (history.size() < 64) history.push_back(l); else history[below(64)] = l;
+        if (below(6) == 0) human_event();
         bool events = below(12) == 0;
         if (events) {
             switch (below(5)) {
@@ -232,13 +277,15 @@ int main(int argc, char **argv) {
         core1_runs = true;
         if (below(50) == 0) pump(1000);             // the rate window empties now and then
         one_line(l, true);
-        if (it % 5000 == 4999) { power_up(); ctl_test_op[CTL_OP_WP_ON] = stand_in; first_mutating.clear(); memset(executed_ids, 0, sizeof executed_ids); }
+        if (it % 5000 == 4999) { power_up(); answered.clear(); runs.clear(); runs_scanned = log_next; }
     }
     printf("fuzz: seed %llu, %zu corpus lines, %llu mutants, %llu lines, %llu responses (%llu DONE, %llu replayed); codes:",
            (unsigned long long)(argc > 3 ? strtoull(argv[3], 0, 10) : 1), corpus.size(), (unsigned long long)iters,
            (unsigned long long)lines_sent, (unsigned long long)responses, (unsigned long long)done_n,
            (unsigned long long)replays);
     for (auto &kv : codes) printf(" %s=%d", kv.first.c_str(), kv.second);
+    printf("; ratchet DONE:");
+    for (auto &kv : done_ops) printf(" %s=%d", kv.first.c_str(), kv.second);
     printf("\n%llu checks, %d failed\n", (unsigned long long)lines_sent, violations);
     return violations > 255 ? 255 : violations;
 }

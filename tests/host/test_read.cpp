@@ -198,6 +198,10 @@ static HostRead host_read10(uint32_t lba, uint32_t nblocks) {
     return h;
 }
 
+// Called between two callbacks of one WRITE(10), when set: the Control
+// API's wp.on landing in the middle of a write (SPEC-v1 4.12).
+static void (*between_writes)() = nullptr;
+
 // WRITE(10), as TinyUSB 0.18 hands it over: one callback per chunk of at
 // most CFG_TUD_MSC_EP_BUFSIZE, the command failed at a negative return, and
 // the complete callback once the CSW is out. Returns the bytes accepted, or
@@ -217,6 +221,7 @@ static int32_t host_write10(uint32_t lba, const uint8_t *data, uint32_t nblocks)
         note_cb(mock_now_ns - t);
         if (r < 0) { result = -1; break; }
         xferred += (uint32_t)r;
+        if (between_writes && xferred < total) between_writes();
     }
     note_cmd("WRITE(10)", mock_now_ns - t0);
     tud_msc_write10_complete_cb(0);
@@ -257,6 +262,9 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     chs_geometry_lost = false;
     manual_chs_active = false;
     native_geo.on = false; idp_written = false; mchs_no_identify = false;   // 0.6f3p10: power-up
+#if ATABOY_CTL
+    identify_forbidden = false;                     // the Control API's identify.forbid: power-up
+#endif
 #ifdef IDE_FAULT_TRIPWIRE
     memset(&trip, 0, sizeof trip);                  // Q7: not tripped
 #endif
@@ -2957,6 +2965,101 @@ static void test_sat_failed_ctrl_g_refused() {
 }
 #endif
 
+#if ATABOY_CTL
+// ---------------------------------------------------------------------------
+//  The ATAboy Control API's ratchet against a running USB command
+//  (palimpsest api/SPEC-v1.md 4.12, 6.2; R-API-1 finding 7)
+// ---------------------------------------------------------------------------
+// test_ctl drives the ops themselves; here each op's one store (ctl.c: wp.on
+// and pipelined.off store a config byte; identify.forbid is ide.c's own
+// ide_identify_forbid) lands between two chunks of a READ(10), which must
+// then end as it began: every sector, and the medium's own bytes. A wp.on
+// in the middle of a WRITE(10) cuts it at the next callback: the part before
+// is written, nothing after, and the host is told the command failed.
+// These runs are left out of the transcript (run.sh compares it with the
+// build before the API).
+static void ratchet_wp_on() { config.drive_write_protected = true; }
+static void ratchet_pipelined_off() { config.pipelined_reads = false; }
+static void ratchet_identify_forbid() { (void)ide_identify_forbid(); }
+static void test_api_ratchet_mid_command() {
+    FILE *keep = transcript;
+    transcript = nullptr;
+    struct { const char *name; void (*store)(); } ops[] = {
+        { "wp.on", ratchet_wp_on }, { "pipelined.off", ratchet_pipelined_off }, { "identify.forbid", ratchet_identify_forbid } };
+    for (Mode m : { LBA, CHS }) {
+        for (auto &op : ops) {
+            setup((std::string("API: ") + op.name + " in the middle of a READ(10), " + (m == LBA ? "LBA" : "CHS")).c_str(), m);
+            config.pipelined_reads = true;              // so pipelined.off has something to end
+            static int fired;
+            static void (*store)();
+            fired = 0; store = op.store;
+            between_chunks = [] { if (!fired++) store(); };
+            HostRead h = host_read10(1000, 128);        // 64 KB: several callbacks
+            between_chunks = nullptr;
+            CHECK(fired >= 1 && h.ok && h.data.size() == 128 * 512 && matches_medium(h, 1000),
+                  "%s: the READ(10) failed or read wrong (ok %d, %zu bytes, fired %d)", op.name, h.ok, h.data.size(), fired);
+            HostRead h2 = host_read10(2000, 16);
+            CHECK(h2.ok && matches_medium(h2, 2000), "%s: the next READ(10)", op.name);
+        }
+    }
+    // wp.on in the middle of a WRITE(10): a torn write, reported as failed.
+    setup("API: wp.on in the middle of a WRITE(10)", LBA);
+    config.drive_write_protected = false;
+    std::vector<uint8_t> data = fill512(32, 0x5C);
+    static int writes_seen;
+    writes_seen = 0;
+    between_writes = [] { if (writes_seen++ == 0) config.drive_write_protected = true; };
+    int32_t r = host_write10(3000, data.data(), 32);
+    between_writes = nullptr;
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < 32; i++) if (written_is(3000 + i, data.data() + i * 512)) written++;
+    CHECK(r < 0 && written > 0 && written < 32 && written_is(3000, data.data()) && !written_is(3031, data.data() + 31 * 512),
+          "WRITE(10) cut by wp.on: result %d, %u of 32 sectors written", r, written);
+    transcript = keep;
+}
+
+#if ATABOY_SAT
+// identify.forbid closes ATA pass-through as Ctrl+G's rule does (SPEC-v1
+// 1.4, I-1): every row refused 5/24/00, nothing reaches the drive; before
+// it, the same IDENTIFY goes through. Auto Detect's probe does not end it.
+static void test_api_forbid_sat() {
+    FILE *keep = transcript;                        // out of the transcript, as above
+    transcript = nullptr;
+    setup("API: SAT after identify.forbid", CHS);
+    int ids = sim.id_commands();
+    std::vector<uint8_t> idcdb = pt12(4, 0x0E, 0, 1, 0, 0xA0, 0xEC);
+    SatResult a = sat_cmd(idcdb, 512, true);
+    CHECK(a.r == 512 && sim.id_commands() == ids + 1, "IDENTIFY through SAT before identify.forbid: r %d", a.r);
+    CHECK(ide_identify_forbid() && ide_identify_forbidden() && ide_identify_barred() && !ide_mchs_no_identify(), "the flag");
+    int cmds = sim.commands;
+    ids = sim.id_commands();
+    struct { const char *name; std::vector<uint8_t> cdb; uint32_t xfer; bool in; } rows[] = {
+        { "IDENTIFY (12)", pt12(4, 0x0E, 0, 1, 0, 0xA0, 0xEC), 512, true },
+        { "IDENTIFY (16)", pt16(4, false, 0x0E, 0, 1, 0, 0x00, 0xEC), 512, true },
+        { "READ VERIFY", verify12(0x00, 4, 100), 0, false },
+    };
+    for (auto &e : rows) {
+        SatResult s = sat_cmd(e.cdb, e.xfer, e.in);
+        CHECK(!s.ok() && sense_is(s.sense, 0x05, 0x24, 0x00), "%s after identify.forbid: r %d", e.name, s.r);
+    }
+    for (auto &g : gated_rows()) {
+        SatResult s = sat_cmd(g.cdb, g.xfer, g.in);
+        CHECK(!s.ok() && sense_is(s.sense, 0x05, 0x24, 0x00), "%s after identify.forbid: r %d", g.name, s.r);
+    }
+    CHECK(sim.commands == cmds && sim.id_commands() == ids, "reached the drive: %d commands", sim.commands - cmds);
+    HostRead h = host_read10(100, 8);
+    CHECK(h.ok && matches_medium(h, 100), "READ(10) after identify.forbid");
+    is_mounted = false;
+    ide_probe_devices();
+    is_mounted = true;
+    SatResult b = sat_cmd(idcdb, 512, true);
+    CHECK(!b.ok() && sense_is(b.sense, 0x05, 0x24, 0x00) && ide_identify_forbidden() && sim.id_commands() == ids,
+          "identify.forbid ended by the probe");
+    transcript = keep;
+}
+#endif
+#endif
+
 // ---------------------------------------------------------------------------
 //  0.6f3p9: salvage capture and READ BUFFER
 // ---------------------------------------------------------------------------
@@ -4935,6 +5038,10 @@ int main() {
     // The ATAboy Control API (palimpsest api/SPEC-v1.md 2.4): SET_CONFIGURATION
     // after a USB reset reaches it through usb.c's tud_mount_cb, since ctl.c
     // cannot define one of its own (R-API-1 finding 16).
+    test_api_ratchet_mid_command();
+#if ATABOY_SAT
+    test_api_forbid_sat();
+#endif
     current = "USB reset reaches the Control API";
     int usb_mounts_before = stub_ctl_usb_mounts;
     tud_mount_cb();

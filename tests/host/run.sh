@@ -93,17 +93,25 @@ for ctl in 0 1; do
         -o "$out/test_usb_layout$ctl" "$here/test_usb_layout.cpp"
     "$out/test_usb_layout$ctl"
 done
-# The ATAboy Control API (palimpsest api/SPEC-v1.md, stage 1): its tests,
-# core 1's real loop taking a job (and not in a confirm box), the parser
-# fuzzer (fixed seed and count; UndefinedBehaviorSanitizer in trap mode and
-# the stack protector, since this g++ has no AddressSanitizer), and the
-# real host client end to end. Only in a build with the API.
+# The ATAboy Control API (palimpsest api/SPEC-v1.md, stages 1 and 2): its
+# tests, core 1's real loop taking a job (and not in a confirm box), the
+# same loop with keys (core1-tui: the Features toggles' epoch, F: Force after
+# identify.forbid, an API unmount at the MOUNTED screen), config_save's
+# race, the parser and policy fuzzer (fixed seed and count;
+# UndefinedBehaviorSanitizer in trap mode and the stack protector, since
+# this g++ has no AddressSanitizer), and the real host client end to end.
+# Only in a build with the API.
 if echo "$defs" | grep -q -- '-DATABOY_CTL=1'; then
     ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation $defs \
         -I "$here/mock" -I "$here" -I "$src" -o "$out/test_ctl" "$here/test_ctl.cpp"
     "$out/test_ctl"
     "$out/test_ctl" core1
     "$out/test_ctl" core1-confirm
+    "$out/test_ctl" core1-tui
+    # config_save() with core 0 storing into config at each point before the
+    # lockout (SPEC-v1 5.5, R-API-1 finding 15): the copy first, the CRC over it.
+    ${CXX:-g++} -std=c++17 -O1 -g -Wall $defs -I "$here/config_mock" -I "$src"         -o "$out/test_config_save" "$here/test_config_save.cpp"
+    "$out/test_config_save"
     ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation $defs \
         -fsanitize=undefined -fsanitize-undefined-trap-on-error -fstack-protector-all -D_GLIBCXX_ASSERTIONS \
         -I "$here/mock" -I "$here" -I "$src" -o "$out/ctl_fuzz" "$here/ctl_fuzz.cpp"

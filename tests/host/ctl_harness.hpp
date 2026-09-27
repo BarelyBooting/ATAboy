@@ -10,9 +10,11 @@
 #include "obs.c"
 #include "ide.c"
 
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -32,7 +34,12 @@ static std::string tty;                     // everything the TUI sent to interf
 static void (*on_idle)() = nullptr;
 static uint64_t idle_after_ns = 0;
 static inline void queue_add_blocking(queue_t *, const void *c) { tty.push_back(*(const char *)c); }
+// test_ctl core1-tui: core 1 is its real loop, and core 0's passes (and the
+// test's timed checks) come from its input polls (core0_tick, below).
+static bool core0_in_loop = false;
+static void core0_tick();
 static inline bool queue_try_remove(queue_t *, void *out) {
+    if (core0_in_loop) core0_tick();
     if (rxi < rx.size() && get_absolute_time() >= rx[rxi].at_us) { *(char *)out = rx[rxi++].c; return true; }
     if (on_idle && rxi == rx.size() && mock_now_ns > idle_after_ns) on_idle();
     return false;
@@ -49,7 +56,14 @@ static inline bool time_reached(absolute_time_t t) { return get_absolute_time() 
 
 bool core1_stack_intact(void) { return true; }
 void fault_stop(uint32_t code) { printf("FAIL: fault_stop(%08X) reached\n", (unsigned)code); exit(250); }
-void ide_trip_stop(void) { printf("FAIL: the tripwire fired\n"); exit(251); }
+// A test that drives the tripwire on purpose (identify.forbid, I-22) sets
+// trip_expected and comes back to its setjmp; anywhere else it is a failure.
+static bool trip_expected = false;
+static jmp_buf trip_jb;
+void ide_trip_stop(void) {
+    if (trip_expected) longjmp(trip_jb, 1);
+    printf("FAIL: the tripwire fired\n"); exit(251);
+}
 
 uint64_t mock_now_ns = 0;
 uint32_t mock_gpio_out = 0;
@@ -62,7 +76,12 @@ volatile bool cdc_connected = false, is_mounted = false, media_changed_waiting =
 bool tud_msc_set_sense(uint8_t, uint8_t, uint8_t, uint8_t) { return true; }
 static int saves = 0;
 void config_save(void) { saves++; }
-void config_defaults(void) {}
+// Load Setup Defaults' effect on what the API reports (config.c's values).
+void config_defaults(void) {
+    config.drive_write_protected = true; config.pipelined_reads = false; config.auto_mount = false;
+    config.use_lba_mode = false; config.cyls = 0; config.heads = 0; config.spt = 0; config.lba_sectors = 0;
+    config.dev_base = 0xA0;
+}
 static uint64_t busy_until_ns = 0;
 bool usb_msc_ide_busy(void) { return mock_now_ns < busy_until_ns; }
 
@@ -142,6 +161,17 @@ static void one_task() {
     if (port.reading) { port.got += port.fifo; port.fifo.clear(); }
 }
 
+// core1-tui: a pass of core 0 every 1 ms of core 1's polling, unless core 0
+// is held (inside a long USB callback, say), and the timed checks.
+static bool core0_hold = false;
+static uint64_t core0_last_ns = 0;
+static std::vector<std::pair<uint64_t, std::function<void()>>> timeline;   // at us, run
+static size_t tli = 0;
+static void core0_tick() {
+    while (tli < timeline.size() && get_absolute_time() >= timeline[tli].first) { auto f = timeline[tli++].second; f(); }
+    if (!core0_hold && mock_now_ns - core0_last_ns >= 1000000) { core0_last_ns = mock_now_ns; one_task(); }
+}
+
 // ms of time: each 1 ms, a pass of core 0's loop and, when it runs, one of
 // core 1's (its idle point).
 static void pump(uint32_t ms = 20) {
@@ -182,6 +212,7 @@ static void power_up() {
     rec.stage = REC_NONE; memset(&last_fail, 0, sizeof last_fail);
     chs_geometry_lost = false; manual_chs_active = false; iordy_held = false;
     native_geo.on = false; idp_written = false; mchs_no_identify = false; native_declared = false;
+    identify_forbidden = false; memset(&rules_seen, 0, sizeof rules_seen);
     memset(&refused, 0, sizeof refused);
     memset(&self_resets, 0, sizeof self_resets);
     memset(&trip, 0, sizeof trip);
@@ -191,9 +222,13 @@ static void power_up() {
     memset(&c, 0, sizeof c);
     memset(&ctl_job, 0, sizeof ctl_job);
     ctl_tui_state = CTL_TUI_BOOT;
+    ctl_epoch = 0; ctl_wp_last = CTL_WP_BOOT; ctl_setup_src = CTL_SRC_NONE; ctl_setup_at_ms = 0;
+    ctl_mount_seq = 0; ctl_mount_log_seq = 0;
+    fail_detach = false;
     dtr_dropped = false; usb_mounted = false;
     memset(ctl_test_op, 0, sizeof ctl_test_op);
     port = CtlPort();
+    sim_reset_hook = nullptr;
     tty.clear(); rx.clear(); rxi = 0;
     core1_screen = CTL_TUI_MAIN; core1_runs = true;
     ctl_init();

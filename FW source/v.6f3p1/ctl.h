@@ -9,10 +9,11 @@
 // a dialog. The TUI on interface 0 is untouched: no byte of one port is ever
 // read as the other's, and the two share no queue.
 //
-// Stage 1 of the build (SPEC-v1 12.1): the descriptor, the transport and
-// framing, the parser, the envelope with ids and the replay table, and the
-// Tier R ops. Tier S (the ratchet), the jumpers, the lease and Tier M are
-// not in this stage; hello lists them ABSENT (ctl_policy.h).
+// Stages 1 and 2 of the build (SPEC-v1 12.1): the descriptor, the transport
+// and framing, the parser, the envelope with ids and the replay table, the
+// Tier R ops, and Tier S, the ratchet (wp.on, pipelined.off and
+// identify.forbid on core 0; unmount and detach as jobs). The jumpers, the
+// lease and Tier M are later stages; hello lists them ABSENT (ctl_policy.h).
 #ifndef CTL_H
 #define CTL_H
 
@@ -40,5 +41,13 @@ void ctl_tui_busy(void);
 // A MOUNT marker was written (menus.c log_mount): status.mount_seq counts
 // mounts since boot (SPEC-v1 4.3, R-API-1 finding 11).
 void ctl_mount_noted(uint32_t marker_log_seq);
+
+// menus.c, for the unmount and detach jobs (ctl_job.c), on core 1 at the
+// idle point. Neither draws or waits for a key. menus_api_unmount() is the
+// confirm-4 path then the main menu, true when Ctrl+G's power-up default
+// mode ended; menus_api_detach_clear() clears the set-up once no USB read
+// is running.
+bool menus_api_unmount(void);
+void menus_api_detach_clear(void);
 
 #endif

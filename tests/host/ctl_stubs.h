@@ -10,9 +10,20 @@ void ctl_core1_idle(uint8_t s) { stub_ctl_idle++; stub_ctl_state = s; }
 void ctl_tui_busy(void) { stub_ctl_busy++; }
 void ctl_mount_noted(uint32_t) { stub_ctl_mounts++; }
 void ctl_on_usb_mount(void) { stub_ctl_usb_mounts++; }
+// Stage 2 (ctl_state.h): the epoch and what the menus report as it changes.
+volatile uint32_t ctl_epoch;
+volatile uint8_t ctl_wp_last;
+inline int stub_ctl_setups = 0;
+inline uint8_t stub_ctl_setup_src = 0;
+void ctl_setup_noted(uint8_t s) { stub_ctl_setups++; stub_ctl_setup_src = s; }
 #ifdef CTL_STUB_IDCACHE             // menus.c built against stand-ins for ide.c
 inline int stub_idc_puts = 0, stub_idc_stale = 0;
 void ide_idcache_put(const uint16_t *, uint8_t) { stub_idc_puts++; }
 void ide_idcache_stale(void) { stub_idc_stale++; }
+inline int stub_idc_clears = 0;
+void ide_idcache_clear(uint8_t) { stub_idc_clears++; }
+// identify.forbid is never set in these tests (test_ctl drives it).
+bool ide_identify_forbidden(void) { return false; }
+bool ide_identify_barred(void) { return ide_mchs_no_identify(); }
 #endif
 #endif

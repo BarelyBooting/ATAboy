@@ -20,12 +20,13 @@ const ctl_op_t ctl_ops[CTL_OP_COUNT] = {
     { "selftest.status",   CTL_TIER_R,       false,     5, true  },
     { "chip.info",         CTL_TIER_R,       false,     5, true  },
     { "job.last",          CTL_TIER_R,       false,     5, true  },
-    // Stage 2 (the ratchet), stage 4 (session, Tier M): in v1, not built yet.
-    { "wp.on",             CTL_TIER_S,       false,     5, false },
-    { "pipelined.off",     CTL_TIER_S,       false,     5, false },
-    { "identify.forbid",   CTL_TIER_S,       false,     5, false },
-    { "unmount",           CTL_TIER_S,       true,  30000, false },
-    { "detach",            CTL_TIER_S,       true,  30000, false },
+    // Stage 2: the ratchet (Tier S).
+    { "wp.on",             CTL_TIER_S,       false,     5, true  },
+    { "pipelined.off",     CTL_TIER_S,       false,     5, true  },
+    { "identify.forbid",   CTL_TIER_S,       false,     5, true  },
+    { "unmount",           CTL_TIER_S,       true,  30000, true  },
+    { "detach",            CTL_TIER_S,       true,  30000, true  },
+    // Stage 4 (session, Tier M): in v1, not built yet.
     { "session.open",      CTL_TIER_SESSION, false,     5, false },
     { "session.close",     CTL_TIER_SESSION, false,     5, false },
     { "setup.ctrlg",       CTL_TIER_M,       true,  75000, false },

@@ -28,6 +28,7 @@
 #include "ctl_policy.h"
 #include "ctl_sha256.h"
 #include "ctl_build.h"
+#include "ctl_state.h"
 #include "tusb.h"
 #include "pico/stdlib.h"
 #include "pico/rand.h"
@@ -49,10 +50,12 @@ extern bool usb_msc_ide_busy(void);         // usb.c
 #define CTL_TUI_WAIT_MS     30000           // a job not picked up by then is withdrawn (5.3)
 #define CTL_JOB_LAST_BYTES  1024
 
-// What status and the epoch are computed from (SPEC-v1 4.3). epoch counts
-// changes of it, seen by comparing this snapshot at every pass of ctl_task().
+// What status and the epoch are computed from (SPEC-v1 4.3). The epoch is
+// counted where each of these changes (ctl_state.h); this snapshot is the
+// cross-check (epoch_poll) and status's consistency test.
 typedef struct {
     uint8_t  mounted, lba, wp, pipelined, dev_base, no_identify, native_active, native_declared;
+    uint8_t  forbidden, manual_chs, idp, setup_src;
     uint16_t cyls;
     uint8_t  heads, spt;
     uint64_t lba_sectors;
@@ -75,16 +78,19 @@ static struct {
     // Identity and bookkeeping
     char     serial[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
     char     boot[17];
-    uint32_t seq, epoch;
+    uint32_t seq;
     ctl_fp_t fp;
-    uint8_t  wp_last;               // 0 BOOT, 1 TUI (stage 1: nothing else can change it)
+    uint32_t fp_epoch;              // ctl_epoch when fp was taken
+    uint32_t epoch_missed;          // changes no hook counted (epoch_poll); 0, or a hook is missing
     uint32_t tx_abandoned, parse_errors;
+    uint32_t cur_id;                // the request a core-0 op is running for (its API entry)
+    const char *err_field;          // err.field of a core-0 op's refusal
     ctl_replay_t replay;
     ctl_rate_t   rate;
     ctlj_doc_t   doc;
     // The job in the mailbox, as core 0 knows it
     uint32_t job_port_gen;
-    int      job_slot;              // its replay slot when it is mutating (stage 2 on)
+    int      job_slot;              // its replay slot when it is mutating (unmount, detach)
     // job.last (SPEC-v1 4.11)
     bool     jl_present;
     uint8_t  jl_op;
@@ -92,8 +98,6 @@ static struct {
     uint8_t  jl_digest[32];
     uint32_t jl_len;
     char     jl_resp[CTL_JOB_LAST_BYTES];
-    // status.mount_seq, from core 1 (ctl_mount_noted)
-    volatile uint32_t mount_seq, mount_log_seq;
 } c;
 
 static volatile bool dtr_dropped, usb_mounted;      // set by the two callbacks
@@ -105,9 +109,9 @@ _Static_assert(OBS_PAGE_HEADER + CTL_LOG_PER_READ * sizeof(obs_log_entry_t) <= s
 static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
 
 #if ATABOY_HOST_TEST
-// Host tests: stand-in handlers that make an op of a later stage count as
-// built, so the replay path (for mutating requests only) can be driven from
-// the envelope before stage 2 exists. Never compiled into the firmware.
+// Host tests: stand-in handlers that make an op of a later stage (the
+// session ops) count as built, so the dispatcher can be driven for them
+// before stage 4 exists. Never compiled into the firmware.
 typedef int (*ctl_test_op_fn)(ctlw_t *w, const ctlj_doc_t *d, int args);
 inline ctl_test_op_fn ctl_test_op[CTL_OP_COUNT];
 #endif
@@ -126,22 +130,40 @@ static void fingerprint(ctl_fp_t *f) {
     f->no_identify = ide_mchs_no_identify();
     f->native_active = ide_manual_chs_native_active();
     f->native_declared = ide_native_drive();
+    f->forbidden = ide_identify_forbidden();
+    f->manual_chs = ide_manual_chs_active();
+    f->idp = ide_idp_sent_since_boot();
+    f->setup_src = ctl_setup_src;
     f->cyls = config.cyls;
     f->heads = config.heads;
     f->spt = config.spt;
     f->lba_sectors = config.lba_sectors;
 }
 
-// Stage 1's epoch: the snapshot above compared at every pass. A change and
-// its reversal inside one pass (one long USB callback) is not counted.
+// The cross-check, once a pass: a snapshot that moved while the epoch did
+// not is a change no hook counted. It is counted (epoch_missed, which the
+// host tests require to stay 0) and the epoch is moved here, late, so a
+// missing hook is never a missed change. This is stage 1's epoch, kept
+// behind the hooks: on its own it missed a change and its reversal inside
+// one pass (one long USB callback). On the unit the other core can be
+// between its store and its bump when this looks, which counts one here
+// that was not missed; only the host tests, where nothing runs between,
+// read the count.
 static void epoch_poll(void) {
     ctl_fp_t f;
     fingerprint(&f);
+    uint32_t e = ctl_epoch;
     if (memcmp(&f, &c.fp, sizeof f) != 0) {
-        if (f.wp != c.fp.wp) c.wp_last = 1;     // only the TUI (or its Load Defaults) writes it now
+        if (e == c.fp_epoch) {
+            c.epoch_missed++;
+            // Not CTL_EPOCH_BUMP: this late count must stand even where the
+            // hooks do not (the mutation run takes them out through it).
+            __atomic_fetch_add(&ctl_epoch, 1u, __ATOMIC_SEQ_CST);
+            e = ctl_epoch;
+        }
         c.fp = f;
-        c.epoch++;
     }
+    c.fp_epoch = e;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +183,7 @@ static void dev_block(ctlw_t *w) {
     ctlw_str(w, "boot", c.boot);
     ctlw_uint(w, "up_ms", now_ms());
     ctlw_uint(w, "seq", ++c.seq);
-    ctlw_uint(w, "epoch", c.epoch);
+    ctlw_uint(w, "epoch", ctl_epoch);
     ctlw_end_obj(w);
 }
 
@@ -180,12 +202,21 @@ static uint32_t finish(ctlw_t *w, bool send) {
     return w->len;
 }
 
+// detach's failure result (SPEC-v1 3.3, 4.12): the state it left, known.
+static bool fail_detach;
 static uint32_t send_error(bool id_ok, uint32_t id, uint8_t outcome, uint8_t retry, uint8_t err,
                            const char *msg, const char *why, const char *field, bool send) {
     ctlw_t w;
     begin(&w, id_ok, id);
     ctlw_bool(&w, "ok", false);
     ctlw_str(&w, "outcome", ctl_outcome_name[outcome]);
+    if (fail_detach) {
+        fail_detach = false;
+        ctlw_obj(&w, "result");
+        ctlw_bool(&w, "detached", false);
+        ctlw_bool(&w, "mounted", is_mounted);
+        ctlw_end_obj(&w);
+    }
     ctlw_str(&w, "retry", ctl_retry_name[retry]);
     ctlw_obj(&w, "err");
     ctlw_str(&w, "code", ctl_err_name[err]);
@@ -295,11 +326,30 @@ static const char *engine_name(uint8_t flags) {
     return (flags & 8) ? "SOFTWARE" : (flags & 2) ? "PASS" : (flags & 4) ? "FAIL" : "NOT_RUN";
 }
 
+static const char *const setup_name[CTL_SRC_COUNT] = {
+    "NONE", "TUI_DETECT_NORMAL", "TUI_DETECT_LARGE", "TUI_DETECT_LBA", "TUI_MANUAL", "TUI_FORCE",
+    "TUI_CTRLG_IDP", "TUI_CTRLG_NATIVE", "API_CTRLG_IDP", "API_CTRLG_NATIVE", "AUTO_MOUNT",
+};
+static const char *const wp_last_name[] = { "BOOT", "TUI", "API" };
+
+// The wp object of status and of wp.on's result (SPEC-v1 4.3, 4.12).
+static void write_wp(ctlw_t *w) {
+    ctlw_obj(w, "wp");
+    ctlw_bool(w, "effective", ide_write_protected());
+    ctlw_bool(w, "config", config.drive_write_protected);
+    ctlw_arr(w, "forced_by");
+    if (ide_mchs_no_identify()) ctlw_str(w, 0, "CTRLG");     // review C, C-4 (ide.c)
+    ctlw_end_arr(w);
+    uint8_t wl = ctl_wp_last;
+    ctlw_str(w, "last_change", wl <= CTL_WP_API ? wp_last_name[wl] : "UNKNOWN");
+    ctlw_end_obj(w);
+}
+
 static void write_status(ctlw_t *w) {
     ctlw_bool(w, "mounted", is_mounted);
-    uint32_t ms = c.mount_seq;
+    uint32_t ms = ctl_mount_seq;
     ctlw_uint(w, "mount_seq", ms);
-    if (ms) ctlw_uint(w, "mount_log_seq", c.mount_log_seq); else ctlw_null(w, "mount_log_seq");
+    if (ms) ctlw_uint(w, "mount_log_seq", ctl_mount_log_seq); else ctlw_null(w, "mount_log_seq");
     ctlw_obj(w, "geometry");
     ctlw_str(w, "mode", config.use_lba_mode ? "LBA" : "CHS");
     ctlw_uint(w, "cyls", config.cyls);
@@ -309,26 +359,19 @@ static void write_status(ctlw_t *w) {
     ctlw_uint(w, "total_sectors", config.use_lba_mode ? config.lba_sectors
                                   : (uint64_t)config.cyls * config.heads * config.spt);
     ctlw_end_obj(w);
-    // Which path set the geometry up is a new RAM field every set-up path
-    // must write (4.3). Stage 1 does not track it yet, and says so.
+    // Which path set the geometry up: every set-up path writes it (4.3,
+    // ctl_state.h), and every path that clears the geometry sets NONE.
+    uint8_t src = ctl_setup_src;
     ctlw_obj(w, "setup");
-    ctlw_str(w, "source", "UNKNOWN");
-    ctlw_str(w, "at_ms", "UNKNOWN");
+    ctlw_str(w, "source", src < CTL_SRC_COUNT ? setup_name[src] : "UNKNOWN");
+    ctlw_uint(w, "at_ms", ctl_setup_at_ms);
     ctlw_end_obj(w);
     ctlw_str(w, "device", config.dev_base == 0xB0 ? "SLAVE" : "MASTER");
-    bool noid = ide_mchs_no_identify();
-    ctlw_obj(w, "wp");
-    ctlw_bool(w, "effective", ide_write_protected());
-    ctlw_bool(w, "config", config.drive_write_protected);
-    ctlw_arr(w, "forced_by");
-    if (noid) ctlw_str(w, 0, "CTRLG");          // review C, C-4 (ide.c)
-    ctlw_end_arr(w);
-    ctlw_str(w, "last_change", c.wp_last ? "TUI" : "BOOT");
-    ctlw_end_obj(w);
+    write_wp(w);
     ctlw_obj(w, "rules");
-    ctlw_bool(w, "no_identify_ctrlg", noid);
-    ctlw_bool(w, "identify_forbidden", false);  // stage 2 (identify.forbid)
-    ctlw_bool(w, "identify_barred", noid);
+    ctlw_bool(w, "no_identify_ctrlg", ide_mchs_no_identify());
+    ctlw_bool(w, "identify_forbidden", ide_identify_forbidden());
+    ctlw_bool(w, "identify_barred", ide_identify_barred());
     ctlw_bool(w, "manual_chs_active", ide_manual_chs_active());
     ctlw_bool(w, "native_active", ide_manual_chs_native_active());
     ctlw_bool(w, "native_declared", ide_native_drive());
@@ -398,7 +441,7 @@ static void write_status(ctlw_t *w) {
     ctlw_uint(w, "tx_abandoned", c.tx_abandoned);
     ctlw_uint(w, "parse_errors", c.parse_errors);
     ctlw_end_obj(w);
-    ctlw_uint(w, "epoch", c.epoch);
+    ctlw_uint(w, "epoch", ctl_epoch);
     ctlw_uint(w, "up_ms", now_ms());
 }
 
@@ -411,12 +454,13 @@ static int op_status(ctlw_t *w, const ctlj_doc_t *d, int args) {
     for (int tries = 0; tries < 3; tries++) {
         epoch_poll();
         ctl_fp_t before = c.fp;
-        uint32_t ms_before = c.mount_seq;
+        uint32_t e_before = ctl_epoch, ms_before = ctl_mount_seq;
         *w = start;
         write_status(w);
         ctl_fp_t after;
         fingerprint(&after);
-        if (memcmp(&before, &after, sizeof after) == 0 && ms_before == c.mount_seq) return CTL_E_NONE;
+        if (memcmp(&before, &after, sizeof after) == 0 && ms_before == ctl_mount_seq && e_before == ctl_epoch)
+            return CTL_E_NONE;
     }
     *w = start;
     return CTL_E_BUSY_STATE;
@@ -621,6 +665,63 @@ static int op_chip_info(ctlw_t *w, const ctlj_doc_t *d, int args) {
     return CTL_E_NONE;
 }
 
+// ---------------------------------------------------------------------------
+//  The ratchet on core 0 (Tier S; SPEC-v1 4.12): wp.on, pipelined.off,
+//  identify.forbid. No lease, no jumper; allowed while a job runs. Each is
+//  one RAM store toward the safe value, never back, taking effect at once
+//  (between USB callbacks, never inside one: both are core 0's). What each
+//  races is stated in SPEC-v1 4.12 and 6.2. Each DONE writes one API entry
+//  into the command log (5.4) after its store; a refusal writes nothing.
+// ---------------------------------------------------------------------------
+
+// expect_epoch, when given (4.3): the state is still the one the client saw.
+static int epoch_named(const ctlj_doc_t *d, int args) {
+    int n = ctlj_find(d, args, "expect_epoch");
+    if (n > 0 && (uint32_t)d->node[n].num != ctl_epoch) { c.err_field = "expect_epoch"; return CTL_E_STALE; }
+    return CTL_E_NONE;
+}
+
+static int op_wp_on(ctlw_t *w, const ctlj_doc_t *d, int args) {
+    int e = epoch_named(d, args);
+    if (e) return e;
+    bool was = config.drive_write_protected;
+    config.drive_write_protected = true;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);    // seen by the next WRITE(10) check (usb.c, TinyUSB)
+    if (!was) { ctl_wp_last = CTL_WP_API; CTL_EPOCH_BUMP(); }
+    uint32_t seq = obs_api(CTL_OP_WP_ON, c.cur_id, OBS_API_DONE);
+    write_wp(w);
+    ctlw_bool(w, "changed", !was);
+    ctlw_uint(w, "log_seq", seq);
+    return CTL_E_NONE;
+}
+
+// Taken at the next READ(10) (usb.c); a READ(10) in progress ends as it began.
+static int op_pipelined_off(ctlw_t *w, const ctlj_doc_t *d, int args) {
+    int e = epoch_named(d, args);
+    if (e) return e;
+    bool was = config.pipelined_reads;
+    config.pipelined_reads = false;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (was) CTL_EPOCH_BUMP();
+    (void)obs_api(CTL_OP_PIPELINED_OFF, c.cur_id, OBS_API_DONE);
+    ctlw_bool(w, "pipelined_reads", config.pipelined_reads);
+    ctlw_bool(w, "changed", was);
+    return CTL_E_NONE;
+}
+
+// Sticky until power-up (ide.c). The API entry comes after the store: an
+// ECh logged after it is a finding, never "forbidden in time" (4.12).
+static int op_identify_forbid(ctlw_t *w, const ctlj_doc_t *d, int args) {
+    int e = epoch_named(d, args);
+    if (e) return e;
+    bool changed = ide_identify_forbid();
+    uint32_t seq = obs_api(CTL_OP_IDENTIFY_FORBID, c.cur_id, OBS_API_DONE);
+    ctlw_bool(w, "identify_forbidden", ide_identify_forbidden());
+    ctlw_bool(w, "changed", changed);
+    ctlw_uint(w, "log_seq", seq);
+    return CTL_E_NONE;
+}
+
 // job.last (4.11): the last job that ran (its API_BEGIN was written). A job
 // refused at pickup, or withdrawn before it, never ran and is not kept.
 static int op_job_last(ctlw_t *w, const ctlj_doc_t *d, int args) {
@@ -651,6 +752,9 @@ static ctl_op_fn core0_fn(int op) {
     case CTL_OP_SELFTEST_STATUS: return op_selftest_status;
     case CTL_OP_CHIP_INFO:       return op_chip_info;
     case CTL_OP_JOB_LAST:        return op_job_last;
+    case CTL_OP_WP_ON:           return op_wp_on;
+    case CTL_OP_PIPELINED_OFF:   return op_pipelined_off;
+    case CTL_OP_IDENTIFY_FORBID: return op_identify_forbid;
     default:
 #if ATABOY_HOST_TEST
         return ctl_test_op[op];
@@ -669,11 +773,15 @@ static uint32_t run_core0(int op, uint32_t id, const ctlj_doc_t *d, int args) {
     ctlw_bool(&w, "ok", true);
     ctlw_str(&w, "outcome", "DONE");
     ctlw_obj(&w, "result");
+    c.cur_id = id;
+    c.err_field = 0;
     int e = fn ? fn(&w, d, args) : CTL_E_UNKNOWN_OP;
     if (e != CTL_E_NONE)
-        return send_error(true, id, CTL_OUT_NOT_EXECUTED, CTL_RETRY_SAFE, (uint8_t)e,
-                          e == CTL_E_BUSY_STATE ? "the state kept changing while it was read" : "not available",
-                          0, 0, true);
+        return send_error(true, id, CTL_OUT_NOT_EXECUTED, e == CTL_E_STALE ? CTL_RETRY_AFTER_STATUS : CTL_RETRY_SAFE,
+                          (uint8_t)e,
+                          e == CTL_E_BUSY_STATE ? "the state kept changing while it was read" :
+                          e == CTL_E_STALE ? "the state changed since expect_epoch" : "not available",
+                          0, c.err_field, true);
     ctlw_end_obj(&w);
     uint32_t n = finish(&w, true);
     if (w.overflow)     // never with this build's ops and limits; tested at their largest
@@ -686,16 +794,50 @@ static uint32_t run_core0(int op, uint32_t id, const ctlj_doc_t *d, int args) {
 //  Jobs: queued here, run by core 1 (ctl_job.c), answered here
 // ---------------------------------------------------------------------------
 
-static bool queue_job(int op, uint32_t id, const uint8_t digest[32]) {
-    // Arrival checks for taskfile.snapshot (4.6); every refusal NOT_EXECUTED.
+// Arrival checks for taskfile.snapshot (4.6); every refusal NOT_EXECUTED.
+static bool taskfile_arrival_ok(uint32_t id) {
     if (is_mounted) { refuse(true, id, CTL_E_STATE, "mounted: the bus is the host's", 0); return false; }
     if (usb_msc_ide_busy() || ide_recovery_pending()) {
         refuse(true, id, CTL_E_BUS_BUSY, "a USB command or its reset is still running", 0);
         return false;
     }
+    return true;
+}
+
+// Arrival checks for unmount and detach (4.12; owner decision on R-API-1
+// finding 11): the mount they name is the current one, and the epoch the
+// one they give. Compared again at pickup (ctl_job.c). A mismatch changes
+// nothing (I-27): only the replay table keeps the refusal.
+static bool names_current_now(uint32_t id, const ctlj_doc_t *d, int args, uint32_t *ms, bool *has_e, uint32_t *ep) {
+    int m = ctlj_find(d, args, "expect_mount_seq");     // required: the schema refused it missing (ctl_policy.c)
+    *ms = m > 0 ? (uint32_t)d->node[m].num : 0xFFFFFFFFu;
+    int n = ctlj_find(d, args, "expect_epoch");
+    *has_e = n > 0;
+    *ep = *has_e ? (uint32_t)d->node[n].num : 0;
+    if (*ms != ctl_mount_seq) {
+        send_error(true, id, CTL_OUT_NOT_EXECUTED, CTL_RETRY_AFTER_STATUS, CTL_E_STALE,
+                   "expect_mount_seq is not the current mount", 0, "expect_mount_seq", true);
+        return false;
+    }
+    if (*has_e && *ep != ctl_epoch) {
+        send_error(true, id, CTL_OUT_NOT_EXECUTED, CTL_RETRY_AFTER_STATUS, CTL_E_STALE,
+                   "the state changed since expect_epoch", 0, "expect_epoch", true);
+        return false;
+    }
+    return true;
+}
+
+static bool queue_job(int op, uint32_t id, const uint8_t digest[32], const ctlj_doc_t *d, int args) {
+    uint32_t ms = 0, ep = 0;
+    bool has_e = false;
+    if (op == CTL_OP_TASKFILE_SNAPSHOT && !taskfile_arrival_ok(id)) return false;
+    if ((op == CTL_OP_UNMOUNT || op == CTL_OP_DETACH) && !names_current_now(id, d, args, &ms, &has_e, &ep)) return false;
     if (ctl_job.state != CTL_JOB_EMPTY) { refuse(true, id, CTL_E_INFLIGHT, "another job is in flight", 0); return false; }
     ctl_job.op = (uint8_t)op;
     ctl_job.id = id;
+    ctl_job.expect_mount_seq = ms;
+    ctl_job.has_epoch = has_e;
+    ctl_job.expect_epoch = ep;
     memcpy(ctl_job.digest, digest, 32);
     ctl_job.queued_ms = now_ms();
     c.job_port_gen = c.port_gen;
@@ -710,7 +852,25 @@ static void answer_job(void) {
     bool send = c.job_port_gen == c.port_gen && c.dtr;
     ctlw_t w;
     uint32_t n;
-    if (j->outcome == CTL_OUT_DONE) {
+    if (j->outcome == CTL_OUT_DONE && j->op == CTL_OP_UNMOUNT) {
+        begin(&w, true, j->id);
+        ctlw_bool(&w, "ok", true);
+        ctlw_str(&w, "outcome", "DONE");
+        ctlw_obj(&w, "result");
+        ctlw_bool(&w, "mounted", is_mounted);
+        ctlw_bool(&w, "changed", j->changed);
+        ctlw_bool(&w, "native_mode_ended", j->native_ended);
+        ctlw_end_obj(&w);
+        n = finish(&w, send);
+    } else if (j->outcome == CTL_OUT_DONE && j->op == CTL_OP_DETACH) {
+        begin(&w, true, j->id);
+        ctlw_bool(&w, "ok", true);
+        ctlw_str(&w, "outcome", "DONE");
+        ctlw_obj(&w, "result");
+        ctlw_bool(&w, "detached", true);
+        ctlw_end_obj(&w);
+        n = finish(&w, send);
+    } else if (j->outcome == CTL_OUT_DONE) {
         begin(&w, true, j->id);
         ctlw_bool(&w, "ok", true);
         ctlw_str(&w, "outcome", "DONE");
@@ -731,8 +891,9 @@ static void answer_job(void) {
         ctlw_end_obj(&w);
         n = finish(&w, send);
     } else {
-        uint8_t retry = j->outcome == CTL_OUT_NOT_EXECUTED ? CTL_RETRY_SAFE : CTL_RETRY_AFTER_STATUS;
-        n = send_error(true, j->id, j->outcome, retry, j->err, j->msg, 0, 0, send);
+        uint8_t retry = j->outcome == CTL_OUT_NOT_EXECUTED && j->err != CTL_E_STALE ? CTL_RETRY_SAFE : CTL_RETRY_AFTER_STATUS;
+        fail_detach = j->op == CTL_OP_DETACH && j->outcome == CTL_OUT_FAILED;
+        n = send_error(true, j->id, j->outcome, retry, j->err, j->msg, 0, j->field, send);
     }
     if (j->ran) {
         c.jl_present = true;
@@ -862,7 +1023,7 @@ static void handle_line(uint32_t len) {
         }
     }
     if (ctl_ops[r.op].job) {
-        if (queue_job(r.op, r.id, digest)) { c.job_slot = slot; return; }
+        if (queue_job(r.op, r.id, digest, d, r.args)) { c.job_slot = slot; return; }
         if (slot >= 0) ctl_replay_finish(&c.replay, slot, c.resp, c.resp_len - 1);
         return;
     }
@@ -961,12 +1122,6 @@ void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts) {
 
 void ctl_on_usb_mount(void) { usb_mounted = true; }
 
-void ctl_mount_noted(uint32_t marker_log_seq) {
-    c.mount_log_seq = marker_log_seq;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    c.mount_seq = c.mount_seq + 1;              // only core 1 writes it
-}
-
 void ctl_init(void) {
     pico_get_unique_board_id_string(c.serial, sizeof c.serial);
     uint64_t b = get_rand_64();
@@ -977,6 +1132,7 @@ void ctl_init(void) {
     ctl_rate_init(&c.rate);
     c.job_slot = -1;
     fingerprint(&c.fp);
+    c.fp_epoch = ctl_epoch;
     c.prev_pass_ms = now_ms();
 }
 

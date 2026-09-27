@@ -5,32 +5,50 @@ runs can reach what it must never do.
     python tests/host/check_ctl.py <ATAboy.elf> [objdump] [--forbid NAME ...]
 
 The call graph is read from `objdump -d`: every bl/b/blx to a symbol, a
-linker veneer (__name_veneer, for code in RAM) taken as the name. The
+linker veneer (__name_veneer, for code in RAM) taken as the name, and a
+compiler's clone of a function (name.constprop.0, name.part.0, name.isra.0,
+name.cold) taken as the function itself, so a static function GCC split or
+specialised is still found by its name (stage 2: run_unmount.constprop.0,
+menu_unmount.part.0). The
 op functions are called through a pointer (ctl.c, core0_fn), which objdump
 cannot follow, so ctl_task and run_core0 are given edges to every op_*
 function by name. From the API's entry points (core 0: ctl_task, ctl_init,
-the two callbacks; core 1: ctl_core1_idle, ctl_tui_busy, ctl_mount_noted)
-no path may reach:
+the two callbacks; core 1: ctl_core1_idle, ctl_tui_busy, ctl_mount_noted,
+ctl_setup_noted), and from each of stage 2's ratchet ops on its own (core
+0: op_wp_on, op_pipelined_off, op_identify_forbid; the jobs run_unmount and
+run_detach, and the menus.c parts they call), no path may reach:
   config_save, flash_range_erase, flash_range_program   the settings (I-5)
   ide_write_sectors                                     30h/34h (I-6)
   reset_usb_boot, rom_reset_usb_boot                    firmware update (I-20)
   ide_write_reg, ide_write_control, ide_reset_drive,    any command, Device Control
-  ide_probe_devices, ide_manual_chs, ide_identify       or RESET- (stage 1 has no
-                                                        op that sends one)
+  ide_probe_devices, ide_manual_chs, ide_identify       or RESET- (no op of stages
+                                                        1 and 2 sends one: unmount
+                                                        and detach only wait for
+                                                        USB, as the TUI's unmount)
   queue_add_blocking, queue_try_remove                  the TUI's queues (I-23)
 --forbid adds a name to that list: `--forbid ide_read_reg` must fail (the
-taskfile.snapshot job reads registers), which shows the check can.
+taskfile.snapshot job reads registers), and so must `--forbid menu_unmount`
+(the unmount and detach jobs run the TUI's own unmount), which shows the
+check can.
 Prints "N checks, M failed"; COULD NOT RUN (exit 98) without the ELF or the
 Arm objdump, never a pass.
 """
 import re, subprocess, sys
 
 ENTRIES = ['ctl_task', 'ctl_init', 'ctl_on_usb_mount', 'tud_cdc_line_state_cb',
-           'ctl_core1_idle', 'ctl_tui_busy', 'ctl_mount_noted']
+           'ctl_core1_idle', 'ctl_tui_busy', 'ctl_mount_noted', 'ctl_setup_noted',
+           # stage 2, the ratchet, each on its own
+           'op_wp_on', 'op_pipelined_off', 'op_identify_forbid', 'run_unmount', 'run_detach',
+           'menus_api_unmount', 'menus_api_detach_clear']
 FORBIDDEN = ['config_save', 'flash_range_erase', 'flash_range_program', 'ide_write_sectors',
              'reset_usb_boot', 'rom_reset_usb_boot', 'ide_write_reg', 'ide_write_control',
              'ide_reset_drive', 'ide_probe_devices', 'ide_manual_chs', 'ide_manual_chs_native',
              'ide_identify', 'queue_add_blocking', 'queue_try_remove']
+
+
+def base_name(n):
+    """The function a GCC clone or split part belongs to."""
+    return re.sub(r'(\.(constprop|part|isra|cold|lto_priv)(\.\d+)?)+$', '', n)
 
 
 def main():
@@ -51,14 +69,14 @@ def main():
     for line in dis.splitlines():
         m = re.match(r'^[0-9a-f]+ <([^>]+)>:$', line)
         if m:
-            cur = m.group(1)
-            calls[cur] = set()
+            cur = base_name(m.group(1))
+            calls.setdefault(cur, set())
             continue
         m = re.search(r'\tb(?:l|lx|\.w|\.n)?\s+[0-9a-f]+ <([^>+]+)', line)
         if cur and m:
             # A call from flash to code in RAM (SCRATCH_X: ide_read_reg and the
             # other bus routines) goes through a linker veneer, __name_veneer.
-            g = re.sub(r'^__(.+)_veneer$', r'\1', m.group(1))
+            g = base_name(re.sub(r'^__(.+)_veneer$', r'\1', m.group(1)))
             if g != cur:
                 calls[cur].add(g)
     ops = {f for f in calls if f.startswith('op_')}

@@ -4,7 +4,10 @@
 // (tui_compare.py --session). With ATABOY_CTL=1 the ATAboy Control API is
 // compiled in, with its real ctl*.c, and idle: nothing on its port. Its hook
 // at the loop's top then runs every pass and must change no byte the TUI
-// sends; only the banner may differ (the version).
+// sends; only the banner may differ (the version). Core 0's ctl_task() runs
+// every 1 ms of the session too (the port closed), so the epoch's
+// cross-check (ctl.c epoch_poll) watches every change the session makes; a
+// change no hook counted fails the run (SPEC-v1 4.3, ctl_state.h).
 //
 //   tui_session <out file>
 #include "mock_pico.h"
@@ -23,7 +26,10 @@ static std::vector<Arrival> rx;
 static size_t rxi;
 static std::string tty;
 static const char *out_path;
+static uint32_t epoch_missed();
+static void core0_pass();
 static void finish() {
+    if (epoch_missed()) { printf("FAIL: %u state change(s) with no epoch hook\n", epoch_missed()); exit(1); }
     FILE *f = fopen(out_path, "wb");
     fwrite(tty.data(), 1, tty.size(), f);
     fclose(f);
@@ -32,6 +38,7 @@ static void finish() {
 }
 static inline void queue_add_blocking(queue_t *, const void *c) { tty.push_back(*(const char *)c); }
 static inline bool queue_try_remove(queue_t *, void *out) {
+    core0_pass();
     if (rxi < rx.size() && get_absolute_time() >= rx[rxi].at_us) { *(char *)out = rx[rxi++].c; return true; }
     if (rxi == rx.size() && get_absolute_time() > rx.back().at_us + 20000000ull) finish();
     return false;
@@ -60,6 +67,16 @@ uint64_t get_rand_64(void) { return 1; }
 void pico_get_unique_board_id_string(char *o, unsigned n) { snprintf(o, n, "0123456789ABCDEF"); }
 void config_flash_copy(config_t *out) { *out = config; }
 bool config_loaded_from_flash(void) { return false; }
+static uint64_t core0_last_ns = 0;
+static void core0_pass() {
+    if (mock_now_ns - core0_last_ns < 1000000) return;
+    core0_last_ns = mock_now_ns;
+    ctl_task();
+}
+static uint32_t epoch_missed() { return c.epoch_missed; }
+#else
+static void core0_pass() {}
+static uint32_t epoch_missed() { return 0; }
 #endif
 
 bool core1_stack_intact(void) { return true; }

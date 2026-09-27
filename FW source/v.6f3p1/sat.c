@@ -166,6 +166,11 @@ int32_t sat_scsi(uint8_t lun, uint8_t const cdb[16], void *buffer, uint16_t host
     // follows one today (menus.c clears the geometry); this does not rely
     // on that.
     in.manual_chs = ide_manual_chs_active() || ide_mchs_no_identify();
+#if ATABOY_CTL
+    // identify.forbid (palimpsest api/SPEC-v1.md 1.4, I-1): the API's own
+    // no-IDENTIFY rule closes pass-through the same way.
+    if (ide_identify_forbidden()) in.manual_chs = true;
+#endif
 
     sat_taskfile_t tf;
     sat_verdict_t v = sat_policy_check(&in, &tf);

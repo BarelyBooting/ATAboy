@@ -1,15 +1,22 @@
-// Host tests for the ATAboy Control API, stage 1 (palimpsest api/SPEC-v1.md,
-// section 12.1): the parser and writer, the op table against a hand-written
-// copy of SPEC-v1 4.0, the envelope and its order of checks, the line layer
-// (limits, CR, DTR, the partial-line timeout), the rate window, the
-// non-blocking writer, the replay table (digest-keyed, E_ID_REUSED,
-// E_STALE_ID, max_mutating_id), every Tier R op, the taskfile.snapshot job
-// on core 1, and the hooks in menus.c. Everything runs the real ctl*.c,
-// menus.c, ide.c and obs.c (ctl_harness.hpp).
+// Host tests for the ATAboy Control API, stages 1 and 2 (palimpsest
+// api/SPEC-v1.md, section 12.1): the parser and writer, the op table against
+// a hand-written copy of SPEC-v1 4.0, the envelope and its order of checks,
+// the line layer (limits, CR, DTR, the partial-line timeout), the rate
+// window, the non-blocking writer, the replay table (digest-keyed,
+// E_ID_REUSED, E_STALE_ID, max_mutating_id), every Tier R op, the
+// taskfile.snapshot job on core 1, the hooks in menus.c, and stage 2's
+// ratchet (Tier S): wp.on, pipelined.off and identify.forbid on core 0,
+// unmount and detach as jobs naming the mount, identify.forbid's guards,
+// and the epoch counted where the state changes. Everything runs the real
+// ctl*.c, menus.c, ide.c and obs.c (ctl_harness.hpp).
 //
 //   test_ctl            the tests; exit status is the number of failed checks
 //   test_ctl core1      core 1's real loop (core1_entry) takes a job at its idle
 //                       point and not in a confirm box; run.sh runs it after
+//   test_ctl core1-tui  core 1's real loop with keys: the Features toggles and
+//                       their epoch (a change and its reversal inside one
+//                       core-0 pass), F: Force after identify.forbid, and an
+//                       API unmount from the MOUNTED screen
 //   test_ctl serve      the firmware's Control port on stdin/stdout, for
 //                       ctl_e2e.py and the real host client (api/ataboy_ctl.py)
 //
@@ -28,7 +35,44 @@ static const char *current = "";
     printf("FAIL [%s] %s:%d: %s -- ", current, __FILE__, __LINE__, #cond); \
     printf(__VA_ARGS__); printf("\n"); } } while (0)
 
-static void fresh(const char *name) { current = name; power_up(); }
+// The epoch's cross-check (ctl.c epoch_poll) must have found nothing the
+// hooks missed in the test that just ended.
+static void fresh(const char *name) {
+    CHECK(c.epoch_missed == 0, "%u state change(s) with no epoch hook in [%s]", (unsigned)c.epoch_missed, current);
+    current = name;
+    power_up();
+}
+
+// A state change the firmware counts on a path these tests do not run (the
+// key handling inside core 1's loop, which test_ctl core1-tui drives): the
+// store, then the bump, as the hook there does.
+static void hooked() { CTL_EPOCH_BUMP(); }
+static void human_wp(bool on) { config.drive_write_protected = on; ctl_wp_last = CTL_WP_TUI; hooked(); }
+static void human_pipelined(bool on) { config.pipelined_reads = on; hooked(); }
+static void set_mounted(bool m) { is_mounted = m; hooked(); }
+// The TUI's set-up (the picker's first row) and mount (confirm-3), through
+// menus.c's own functions where there are any.
+static void tui_setup_chs(uint16_t cyls, uint8_t heads, uint8_t spt) {
+    use_lba_mode = false; cur_cyls = cyls; cur_heads = heads; cur_spt = spt; total_lba_sectors = 0;
+    strcpy(hdd_model_raw, "SIM DRIVE");
+    sync_to_config();
+    ctl_setup_noted(CTL_SRC_TUI_DETECT_NORMAL);
+}
+static void tui_mount() {
+    log_mount(OBS_EV_MOUNT, OBS_MNT_MENU); is_mounted = true; media_changed_waiting = true;
+    current_screen = SCREEN_MOUNTED; hooked();
+}
+// API entries in the command log for one op and id (SPEC-v1 5.4).
+static int api_entries(uint8_t op, uint32_t id, int outcome = -1) {
+    int n = 0;
+    uint32_t lo = log_next > OBS_LOG_ENTRIES ? log_next - OBS_LOG_ENTRIES : 1;
+    for (uint32_t q = lo; q < log_next; q++) {
+        const obs_log_entry_t &e = log_ring[q % OBS_LOG_ENTRIES];
+        uint32_t eid = e.tf[0] | (e.tf[1] << 8) | (e.tf[2] << 16) | ((uint32_t)e.tf[3] << 24);
+        if (e.seq == q && e.kind == OBS_EV_API && e.value == op && eid == id && (outcome < 0 || e.outcome == outcome)) n++;
+    }
+    return n;
+}
 
 // Send one request line, run the loop, and return every response read.
 static std::vector<std::string> ask(const std::string &line, uint32_t ms = 60) {
@@ -163,9 +207,9 @@ static void test_op_table() {
         { "hashes.read", CTL_TIER_R, false, 20, true }, { "debug.e", CTL_TIER_R, false, 5, true },
         { "selftest.status", CTL_TIER_R, false, 5, true }, { "chip.info", CTL_TIER_R, false, 5, true },
         { "job.last", CTL_TIER_R, false, 5, true },
-        { "wp.on", CTL_TIER_S, false, 5, false }, { "pipelined.off", CTL_TIER_S, false, 5, false },
-        { "identify.forbid", CTL_TIER_S, false, 5, false }, { "unmount", CTL_TIER_S, true, 30000, false },
-        { "detach", CTL_TIER_S, true, 30000, false }, { "session.open", CTL_TIER_SESSION, false, 5, false },
+        { "wp.on", CTL_TIER_S, false, 5, true }, { "pipelined.off", CTL_TIER_S, false, 5, true },
+        { "identify.forbid", CTL_TIER_S, false, 5, true }, { "unmount", CTL_TIER_S, true, 30000, true },
+        { "detach", CTL_TIER_S, true, 30000, true }, { "session.open", CTL_TIER_SESSION, false, 5, false },
         { "session.close", CTL_TIER_SESSION, false, 5, false }, { "setup.ctrlg", CTL_TIER_M, true, 75000, false },
         { "mount", CTL_TIER_M, true, 1000, false },
     };
@@ -218,7 +262,7 @@ static void test_hello() {
     CHECK(caps.obj.size() == CTL_OP_COUNT + CTL_HUMAN_ONLY_COUNT + CTL_NOT_IN_V1_COUNT, "%zu caps", caps.obj.size());
     for (int i = 0; i < CTL_OP_COUNT; i++) {
         const J &cap = caps[ctl_ops[i].name];
-        if (i <= CTL_OP_JOB_LAST)
+        if (i <= CTL_OP_DETACH)             // Tier R and, from stage 2, Tier S
             CHECK(cap["state"].is("OPERATIONAL") && !cap.get("why"), "%s not OPERATIONAL", ctl_ops[i].name);
         else
             CHECK(cap["state"].is("ABSENT") && cap["why"].is("NOT_BUILT"), "%s not ABSENT/NOT_BUILT", ctl_ops[i].name);
@@ -237,7 +281,7 @@ static void test_hello() {
     for (auto &x : want) CHECK(lim[x.k].t == J::INT && lim[x.k].n == x.v, "limits.%s = %llu", x.k, (unsigned long long)lim[x.k].n);
     CHECK(res["board"]["die"].is("RP2350") && res["board"]["stepping"].n == 4 && res["board"]["package"].is("UNKNOWN"), "board");
     // Every op listed ABSENT is refused as unknown, and a human-only one too.
-    for (const char *op : { "wp.on", "unmount", "session.open", "setup.ctrlg", "mount", "wp.off", "debug.r",
+    for (const char *op : { "session.open", "session.close", "setup.ctrlg", "mount", "wp.off", "debug.r",
                             "setup.detect", "setup.geometry", "no.such" })
         CHECK(is_refusal(ask1(req(2, op)), "E_UNKNOWN_OP"), "%s not E_UNKNOWN_OP", op);
 }
@@ -504,18 +548,23 @@ static void test_replay_table() {
     CHECK(ctl_replay_check(&t, 5, da, &slot) == CTL_RPV_LOST, "an oversize response replayed");
 }
 
-// Stage 1 has no mutating op, so these drive the dispatcher's replay path
-// through a host-test stand-in for wp.on: each run counts one execution.
-static int executed = 0;
-static int stand_in(ctlw_t *w, const ctlj_doc_t *, int) { executed++; ctlw_bool(w, "changed", true); return CTL_E_NONE; }
+// The replay path, through the real wp.on (stage 1 drove it through a
+// stand-in): each run writes one API entry for its id, so the entries count
+// the executions.
+static int executed_ids(std::initializer_list<uint32_t> ids) {
+    int n = 0;
+    for (uint32_t id : ids) n += api_entries(CTL_OP_WP_ON, id);
+    return n;
+}
 static void test_replay_dispatch() {
     fresh("replay through the dispatcher");
-    ctl_test_op[CTL_OP_WP_ON] = stand_in;
-    executed = 0;
+    int executed = 0;
     std::string l7 = req(7, "wp.on");
     J a = ask1(l7);
+    executed = executed_ids({ 7 });
     CHECK(a["outcome"].is("DONE") && executed == 1 && !a.get("replayed"), "first send");
     std::vector<std::string> r = ask(l7);
+    executed = executed_ids({ 7 });
     J b;
     CHECK(r.size() == 1 && parse_response(r[0], b) && executed == 1 && b["replayed"].t == J::BOOL && b["replayed"].b,
           "a byte-identical resend ran again, or was not marked (executed %d)", executed);
@@ -531,15 +580,19 @@ static void test_replay_dispatch() {
     // A \r\n resend is the same line (the digest is over the line without \r\n).
     std::string l7crlf = l7; l7crlf.insert(l7crlf.size() - 1, "\r");
     J b2 = ask1(l7crlf);
+    executed = executed_ids({ 7 });
     CHECK(b2["replayed"].b && executed == 1, "\\r\\n resend not replayed");
     // The same id with another line: E_ID_REUSED, UNSAFE, not run, and never the other's response.
     J c1 = ask1(req(7, "wp.on", "{\"expect_epoch\":0}"));
+    executed = executed_ids({ 7 });
     CHECK(is_refusal(c1, "E_ID_REUSED") && c1["retry"].is("UNSAFE") && executed == 1 && !c1.get("replayed"),
           "same id, other line: %s", c1["err"]["code"].s.c_str());
     // A lower id not in the table: E_STALE_ID; a higher one runs.
     J d = ask1(req(6, "wp.on"));
+    executed = executed_ids({ 6, 7 });
     CHECK(is_refusal(d, "E_STALE_ID") && executed == 1, "stale id");
     J e = ask1(req(8, "wp.on"));
+    executed = executed_ids({ 6, 7, 8 });
     CHECK(e["outcome"].is("DONE") && executed == 2, "a higher id");
     J h = ask1(req(3, "hello"));
     CHECK(h["result"]["limits"]["max_mutating_id"].n == 8, "hello max_mutating_id %llu", (unsigned long long)h["result"]["limits"]["max_mutating_id"].n);
@@ -550,6 +603,7 @@ static void test_replay_dispatch() {
     CHECK(h2["outcome"].is("DONE") && !h2.get("replayed"), "a read with a used id");
     // The replay check comes after the envelope: a resend with a schema error is refused as such.
     J f = ask1("{\"v\":1,\"id\":7,\"op\":\"wp.on\",\"args\":{},\"x\":1}\n");
+    executed = executed_ids({ 6, 7, 8 });
     CHECK(is_refusal(f, "E_SCHEMA") && executed == 2, "schema before replay");
     // Refused requests of a mutating op keep their answer too (not run twice).
     J g = ask1(req(9, "wp.on", "{\"expect_epoch\":\"x\"}"));
@@ -585,11 +639,12 @@ static void test_status() {
           r["wp"]["effective"].b && r["wp"]["last_change"].is("BOOT") && r["wp"]["forced_by"].arr.empty() &&
           r["tui"]["state"].is("MAIN") && r["jumpers"]["jp1"].is("NOT_BUILT") && !r["presence"]["waiting"].b &&
           r["presence"]["op"].is("NONE") && !r["lease"]["held"].b && r["job"]["running"].is("NONE") &&
-          r["job"]["id"].t == J::NUL && r["setup"]["source"].is("UNKNOWN") && r["hashes"]["engine"].is("SOFTWARE") &&
+          r["job"]["id"].t == J::NUL && r["setup"]["source"].is("NONE") && r["setup"]["at_ms"].n == 0 &&
+          r["hashes"]["engine"].is("SOFTWARE") && !r["rules"]["identify_forbidden"].b && !r["rules"]["identify_barred"].b &&
           r["log"]["next_seq"].n >= 2, "values at power-up");
     uint64_t e0 = r["epoch"].n;
     // The human turns write protect off in the TUI: epoch moves, last_change TUI.
-    config.drive_write_protected = false;
+    human_wp(false);
     pump(2);
     J s2 = ask1(req(2, "status"));
     CHECK(s2["result"]["epoch"].n == e0 + 1 && s2["result"]["wp"]["last_change"].is("TUI") && !s2["result"]["wp"]["effective"].b &&
@@ -598,18 +653,20 @@ static void test_status() {
     J s3 = ask1(req(3, "status"));
     CHECK(s3["result"]["epoch"].n == e0 + 1, "epoch moved with nothing changed");
     // Mounted through the menus' own path: mount_seq and the marker's log seq.
-    cur_cyls = 980; cur_heads = 10; cur_spt = 17; sync_to_config();
-    log_mount(OBS_EV_MOUNT, OBS_MNT_MENU); is_mounted = true;
+    tui_setup_chs(980, 10, 17);
+    tui_mount();
     J m = ask1(req(4, "status"));
+    CHECK(m["result"]["setup"]["source"].is("TUI_DETECT_NORMAL") && m["result"]["setup"]["at_ms"].n > 0, "setup.source %s",
+          m["result"]["setup"]["source"].s.c_str());
     CHECK(m["result"]["mounted"].b && m["result"]["mount_seq"].n == 1 && m["result"]["mount_log_seq"].n == obs_last_marker_seq() &&
           m["result"]["geometry"]["total_sectors"].n == 980u * 10 * 17 && m["result"]["epoch"].n > e0 + 1, "after a mount");
-    log_mount(OBS_EV_UNMOUNT, OBS_UNM_MENU); is_mounted = false;
-    log_mount(OBS_EV_MOUNT, OBS_MNT_MENU); is_mounted = true;
+    log_mount(OBS_EV_UNMOUNT, OBS_UNM_MENU); set_mounted(false);
+    log_mount(OBS_EV_MOUNT, OBS_MNT_MENU); set_mounted(true);
     m = ask1(req(5, "status"));
     CHECK(m["result"]["mount_seq"].n == 2, "mount_seq %llu after a second mount", (unsigned long long)m["result"]["mount_seq"].n);
     // A Ctrl+G since power-up forces write protect (review C, C-4).
-    is_mounted = false;
-    mchs_no_identify = true;
+    set_mounted(false);
+    mchs_no_identify = true; hooked();
     m = ask1(req(6, "status"));
     CHECK(m["result"]["wp"]["effective"].b && m["result"]["wp"]["forced_by"].arr.size() == 1 &&
           m["result"]["wp"]["forced_by"].arr[0]->is("CTRLG") && m["result"]["rules"]["no_identify_ctrlg"].b &&
@@ -623,7 +680,7 @@ static void test_config_get() {
     CHECK(g["outcome"].is("DONE") && all_keys(r, { "ram", "flash", "dirty", "loaded_from" }) && r["ram"].obj.size() == 13 &&
           r["flash"].obj.size() == 14 && r["flash"]["valid"].b && !r["dirty"].b && r["loaded_from"].is("FLASH"),
           "a clean state: valid %d dirty %d", r["flash"]["valid"].b, r["dirty"].b);
-    config.pipelined_reads = true;
+    human_pipelined(true);
     g = ask1(req(2, "config.get"));
     CHECK(g["result"]["dirty"].b && g["result"]["ram"]["pipelined_reads"].b && !g["result"]["flash"]["pipelined_reads"].b, "RAM changed");
     flash_sector.crc ^= 1;
@@ -689,7 +746,7 @@ static void test_identify_cached() {
     CHECK(x["sha256"].s == hex(dg, 32) && bytes.size() == 512 && (bytes[2] | (bytes[3] << 8)) == 980, "hex or digest (cyls %u)",
           bytes.size() == 512 ? (unsigned)(bytes[2] | (bytes[3] << 8)) : 0);
     // Unmount: stale. A new probe: gone (PROBE). A Ctrl+G: gone (CTRLG).
-    is_mounted = true;
+    set_mounted(true);
     menu_unmount();
     r = ask1(req(3, "identify.cached"));
     CHECK(r["result"]["present"].b && r["result"]["stale"].b, "not stale after unmount");
@@ -796,13 +853,13 @@ static void test_taskfile() {
     CHECK(rr.size() == 1 && parse_response(rr[0], k) && is_refusal(k, "E_TUI_BUSY"), "core 1 away");
     // Mounted: refused at arrival, and at pickup.
     fresh("taskfile.snapshot: mounted");
-    is_mounted = true;
+    set_mounted(true);
     core1_runs = false;                             // refused at arrival: core 1 never sees it
     CHECK(is_refusal(ask1(req(47, "taskfile.snapshot")), "E_STATE") && ctl_job.state == CTL_JOB_EMPTY, "mounted at arrival");
-    is_mounted = false;
+    set_mounted(false);
     host_send(req(48, "taskfile.snapshot"));
     pump(5);
-    is_mounted = true;                              // the human mounted while it waited
+    set_mounted(true);                              // the human mounted while it waited
     core1_runs = true;
     rr = ask("", 20);
     CHECK(rr.size() == 1 && parse_response(rr[0], k) && is_refusal(k, "E_STATE") && sim.reg_writes == 0, "mounted at pickup");
@@ -910,6 +967,750 @@ static void test_core1_confirm() {
     core1_entry();
 }
 
+// ---- 14. stage 2: the ratchet on core 0 (SPEC-v1 4.12, I-8, I-19) ------------
+// What a refusal must leave as it was (I-10, I-27): everything but the
+// protocol's own bookkeeping (dev.seq, the replay table, max_mutating_id).
+static std::string state2() {
+    std::string s((const char *)&config, sizeof config);
+    uint8_t h[OBS_PAGE_HEADER];
+    obs_log_page(0, h, sizeof h); s.append((const char *)h + 16, 8);
+    obs_hash_page(0, h, sizeof h); s.append((const char *)h + 16, 8);
+    char b[256];
+    snprintf(b, sizeof b, "/e%u m%d s%d ms%u src%u f%d n%d a%d nd%d idc%d%d wl%u jl%d%u rw%d cmd%zu tty%zu",
+             (unsigned)ctl_epoch, (int)is_mounted, (int)current_screen, (unsigned)ctl_mount_seq, (unsigned)ctl_setup_src,
+             (int)identify_forbidden, (int)mchs_no_identify, (int)manual_chs_active, (int)native_declared,
+             (int)idc.present, (int)idc.stale, (unsigned)ctl_wp_last, (int)c.jl_present, (unsigned)c.jl_id,
+             sim.reg_writes, sim.cmd_log.size(), tty.size());
+    return s + b + hdd_model_raw;
+}
+static uint32_t epoch_now() { return ctl_epoch; }
+static bool log_entry_is(uint32_t seq, uint8_t op, uint32_t id, uint8_t outcome) {
+    const obs_log_entry_t &e = log_ring[seq % OBS_LOG_ENTRIES];
+    return e.seq == seq && e.kind == OBS_EV_API && e.value == op && e.outcome == outcome &&
+           (e.tf[0] | (e.tf[1] << 8) | (e.tf[2] << 16) | ((uint32_t)e.tf[3] << 24)) == id;
+}
+static std::string eargs(const char *k, uint64_t v) { return "{\"" + std::string(k) + "\":" + std::to_string(v) + "}"; }
+
+static void test_wp_on() {
+    fresh("wp.on");
+    human_wp(false);                                // the human turned write protect off in Features
+    J s0 = ask1(req(1, "status"));
+    CHECK(!s0["result"]["wp"]["effective"].b && s0["result"]["wp"]["last_change"].is("TUI"), "setup");
+    uint32_t e0 = epoch_now(), log0 = log_next;
+    J r = ask1(req(10, "wp.on"));
+    const J &x = r["result"];
+    CHECK(r["outcome"].is("DONE") && all_keys(x, { "wp", "changed", "log_seq" }) &&
+          all_keys(x["wp"], { "effective", "config", "forced_by", "last_change" }) && x["wp"]["effective"].b &&
+          x["wp"]["config"].b && x["wp"]["last_change"].is("API") && x["changed"].b, "wp.on result");
+    CHECK(config.drive_write_protected && ide_write_protected(), "write protect not on in RAM");
+    CHECK(epoch_now() == e0 + 1 && r["dev"]["epoch"].n == e0 + 1, "epoch %u, was %u", (unsigned)epoch_now(), (unsigned)e0);
+    CHECK(log_next == log0 + 1 && x["log_seq"].n == log0 && log_entry_is(log0, CTL_OP_WP_ON, 10, OBS_API_DONE),
+          "one API entry, its seq in the result (%u entries)", (unsigned)(log_next - log0));
+    CHECK(saves == 0, "wp.on saved the settings (5.5)");
+    // Again: nothing changes but the log; changed false, epoch kept, last_change stays API.
+    r = ask1(req(11, "wp.on"));
+    CHECK(r["outcome"].is("DONE") && !r["result"]["changed"].b && r["result"]["wp"]["effective"].b &&
+          epoch_now() == e0 + 1 && r["result"]["wp"]["last_change"].is("API") && log_entry_is(log0 + 1, CTL_OP_WP_ON, 11, OBS_API_DONE),
+          "wp.on twice: changed %d epoch %u", r["result"]["changed"].b, (unsigned)epoch_now());
+    // Never a toggle (X2), and nothing on the bus.
+    for (uint32_t id = 12; id < 16; id++) ask1(req(id, "wp.on"));
+    CHECK(config.drive_write_protected && sim.reg_writes == 0 && sim.cmd_log.empty(), "wp.on toggled or touched the bus");
+    J st = ask1(req(2, "status"));
+    CHECK(st["result"]["wp"]["effective"].b && st["result"]["wp"]["last_change"].is("API") && st["result"]["epoch"].n == e0 + 1,
+          "status after wp.on");
+    // expect_epoch (4.3): the wrong one is E_STALE and changes nothing; the right one runs.
+    human_wp(false);
+    std::string d0 = state2();
+    r = ask1(req(20, "wp.on", eargs("expect_epoch", epoch_now() + 1).c_str()));
+    CHECK(is_refusal(r, "E_STALE") && r["retry"].is("AFTER_STATUS") && r["err"]["field"].is("expect_epoch") && state2() == d0 &&
+          api_entries(CTL_OP_WP_ON, 20) == 0, "a stale expect_epoch: %s", r["err"]["code"].s.c_str());
+    r = ask1(req(21, "wp.on", eargs("expect_epoch", epoch_now() - 1).c_str()));
+    CHECK(is_refusal(r, "E_STALE") && state2() == d0, "an older expect_epoch");
+    r = ask1(req(22, "wp.on", eargs("expect_epoch", epoch_now()).c_str()));
+    CHECK(r["outcome"].is("DONE") && r["result"]["changed"].b && config.drive_write_protected, "the current expect_epoch refused");
+    // A Ctrl+G's forced write protect shows in wp.on's result too.
+    mchs_no_identify = true; hooked();
+    r = ask1(req(23, "wp.on"));
+    CHECK(r["result"]["wp"]["forced_by"].arr.size() == 1 && r["result"]["wp"]["forced_by"].arr[0]->is("CTRLG"), "forced_by");
+    // Allowed while a job waits for the TUI (4.12: no lease, jobs do not block it).
+    fresh("wp.on while a job waits");
+    human_wp(false);
+    core1_screen = CTL_TUI_CONFIRM;
+    host_send(req(30, "taskfile.snapshot"));
+    pump(5);
+    r = ask1(req(31, "wp.on"));
+    CHECK(r["outcome"].is("DONE") && config.drive_write_protected && ctl_job.state == CTL_JOB_QUEUED, "wp.on refused while a job waits");
+    core1_screen = CTL_TUI_MAIN;
+    pump(50);
+    host_lines();
+}
+
+static void test_pipelined_off() {
+    fresh("pipelined.off");
+    human_pipelined(true);
+    uint32_t e0 = epoch_now(), log0 = log_next;
+    J r = ask1(req(10, "pipelined.off"));
+    CHECK(r["outcome"].is("DONE") && all_keys(r["result"], { "pipelined_reads", "changed" }) &&
+          !r["result"]["pipelined_reads"].b && r["result"]["changed"].b && !config.pipelined_reads, "pipelined.off result");
+    CHECK(epoch_now() == e0 + 1 && log_next == log0 + 1 && log_entry_is(log0, CTL_OP_PIPELINED_OFF, 10, OBS_API_DONE),
+          "epoch %u log %u", (unsigned)(epoch_now() - e0), (unsigned)(log_next - log0));
+    for (uint32_t id = 11; id < 15; id++) {
+        r = ask1(req(id, "pipelined.off"));
+        CHECK(r["outcome"].is("DONE") && !r["result"]["changed"].b && !config.pipelined_reads, "pipelined.off %u toggled", id);
+    }
+    CHECK(epoch_now() == e0 + 1 && saves == 0 && sim.reg_writes == 0, "a no-op moved the epoch, saved, or touched the bus");
+    human_pipelined(true);
+    std::string d0 = state2();
+    r = ask1(req(20, "pipelined.off", eargs("expect_epoch", epoch_now() + 5).c_str()));
+    CHECK(is_refusal(r, "E_STALE") && r["err"]["field"].is("expect_epoch") && state2() == d0 && config.pipelined_reads,
+          "a stale expect_epoch");
+    r = ask1(req(21, "pipelined.off", eargs("expect_epoch", epoch_now()).c_str()));
+    CHECK(r["outcome"].is("DONE") && !config.pipelined_reads, "the current expect_epoch");
+}
+
+// identify.forbid (4.12) and every guard it adds (1.4; I-1, I-22; R-API-1
+// finding 6). Each guard is driven both ways: IDENTIFY goes out before it,
+// and after it nothing is sent.
+static void test_identify_forbid() {
+    fresh("identify.forbid");
+    sim.nsect = 980u * 10 * 17;
+    uint16_t buf[256];
+    // Before: every path sends IDENTIFY.
+    CHECK(ide_identify(buf) && sim.cmd_count[0xEC] == 1, "IDENTIFY before the forbid (%d)", sim.cmd_count[0xEC]);
+    uint32_t e0 = epoch_now(), log0 = log_next;
+    J r = ask1(req(10, "identify.forbid"));
+    const J &x = r["result"];
+    CHECK(r["outcome"].is("DONE") && all_keys(x, { "identify_forbidden", "changed", "log_seq" }) && x["identify_forbidden"].b &&
+          x["changed"].b && x["log_seq"].n == log0 && log_entry_is(log0, CTL_OP_IDENTIFY_FORBID, 10, OBS_API_DONE) &&
+          epoch_now() == e0 + 1, "identify.forbid result");
+    J st = ask1(req(1, "status"));
+    CHECK(st["result"]["rules"]["identify_forbidden"].b && st["result"]["rules"]["identify_barred"].b &&
+          !st["result"]["rules"]["no_identify_ctrlg"].b,
+          "status.rules after identify.forbid");
+    CHECK(!mchs_no_identify, "identify.forbid set Ctrl+G's rule (whose screen texts are about a Ctrl+G)");
+    r = ask1(req(11, "identify.forbid"));
+    CHECK(r["outcome"].is("DONE") && !r["result"]["changed"].b && epoch_now() == e0 + 1, "twice");
+    // ide_identify (every IDENTIFY the firmware sends for itself) refuses, nothing sent.
+    uint32_t call0 = refused.identify_call, run0 = refused.identify_run;
+    int reg0 = sim.reg_writes;
+    CHECK(!ide_identify(buf) && sim.cmd_count[0xEC] == 1 && refused.identify_call == call0 + 1 && sim.reg_writes == reg0,
+          "ide_identify sent after identify.forbid");
+    // identify_send, the last layer before the strobe, refuses on its own.
+    CHECK(identify_run(buf) == 0 && refused.identify_run == run0 + 1 && sim.cmd_count[0xEC] == 1, "identify_run sent");
+    // Auto Detect's probe clears Ctrl+G's rule, never this one.
+    (void)ide_probe_devices();
+    CHECK(ide_identify_forbidden() && !ide_identify(buf) && sim.cmd_count[0xEC] == 1, "the probe cleared identify.forbid");
+    // The tripwire (I-22), with every layer above it taken away: ECh strobed
+    // straight at ide_write_reg stops, before the strobe.
+    int ec0 = sim.cmd_count[0xEC];
+    trip_expected = true;
+    if (!setjmp(trip_jb)) {
+        ide_write_reg(7, 0xEC);
+        CHECK(false, "the tripwire let ECh through after identify.forbid");
+    }
+    trip_expected = false;
+    CHECK(trip.tripped && trip.opcode == 0xEC && trip.rule == IDE_TRIP_FORBIDDEN && sim.cmd_count[0xEC] == ec0,
+          "tripwire record: rule %u, ECh sent %d", trip.rule, sim.cmd_count[0xEC] - ec0);
+    // Both ways: without identify.forbid the same strobe goes out.
+    fresh("identify.forbid: the tripwire lets ECh through without it");
+    trip_expected = true;
+    if (!setjmp(trip_jb)) ide_write_reg(7, 0xEC);
+    trip_expected = false;
+    CHECK(!trip.tripped && sim.cmd_count[0xEC] == 1, "ECh refused with no rule set");
+    // A stale expect_epoch changes nothing.
+    std::string d0 = state2();
+    r = ask1(req(12, "identify.forbid", eargs("expect_epoch", epoch_now() + 1).c_str()));
+    CHECK(is_refusal(r, "E_STALE") && !ide_identify_forbidden() && state2() == d0, "a stale expect_epoch");
+}
+
+// The TUI's own pre-checks after identify.forbid (R-API-1 finding 6): Debug
+// I and S, Auto Detect's Enter and its Y refuse before anything is sent,
+// with the new text. Both ways.
+static void test_forbid_tui_prechecks() {
+    fresh("identify.forbid: the TUI's pre-checks, before");
+    sim.nsect = 980u * 10 * 17;
+    // Before: Enter on Auto Detect asks Y/N (nothing sent yet), Debug I sends IDENTIFY.
+    CHECK(auto_detect_enter() && current_screen == SCREEN_CONFIRM && sim.hw_resets == 0, "Auto Detect's Enter before");
+    current_screen = SCREEN_DEBUG;
+    debug_key('i');
+    CHECK(sim.cmd_count[0xEC] == 1, "Debug I did not send IDENTIFY before the forbid");
+    fresh("identify.forbid: the TUI's pre-checks, after");
+    sim.nsect = 980u * 10 * 17;
+    ask1(req(10, "identify.forbid"));
+    int reg0 = sim.reg_writes, hw0 = sim.hw_resets;
+    for (int k : { 'i', 'I', 's', 'S' }) {
+        size_t t0 = tty.size();
+        current_screen = SCREEN_DEBUG;
+        debug_key(k);
+        std::string out = tty.substr(t0);
+        CHECK(out.find(API_FORBIDDEN_TEXT) != std::string::npos && out.find("Nothing sent.") != std::string::npos &&
+              sim.reg_writes == reg0 && sim.cmd_count[0xEC] == 0, "Debug %c after identify.forbid", k);
+    }
+    // Enter on Auto Detect: refused at once (no Y/N), the box says why, nothing sent.
+    current_screen = SCREEN_MAIN;
+    rx.clear(); rxi = 0;
+    rx.push_back({ mock_now_ns / 1000 + 1000, '\r' });     // the key that closes the box
+    size_t t0 = tty.size();
+    CHECK(!auto_detect_enter() && current_screen == SCREEN_MAIN, "Enter on Auto Detect asked Y/N after identify.forbid");
+    CHECK(tty.substr(t0).find(API_FORBIDDEN_BOX) != std::string::npos && sim.hw_resets == hw0 && sim.reg_writes == reg0 &&
+          !force_detect && !show_detect_result, "Auto Detect's Enter: the box, and no RESET- (%d resets)", sim.hw_resets - hw0);
+    // Y at the question (the question was open before the forbid came).
+    rx.clear(); rxi = 0;
+    rx.push_back({ mock_now_ns / 1000 + 1000, '\r' });
+    t0 = tty.size();
+    CHECK(!run_auto_detect() && tty.substr(t0).find(API_FORBIDDEN_BOX) != std::string::npos && sim.hw_resets == hw0 &&
+          sim.reg_writes == reg0 && !force_detect, "Auto Detect's Y after identify.forbid");
+    // With a Ctrl+G's rule as well, the Ctrl+G text comes first, as before.
+    mchs_no_identify = true; hooked();
+    current_screen = SCREEN_DEBUG;
+    t0 = tty.size();
+    debug_key('i');
+    CHECK(tty.substr(t0).find(DEBUG_REFUSED_MCHS) != std::string::npos && sim.reg_writes == reg0, "both rules: the Ctrl+G text");
+    // The box texts fit their boxes (50 columns; the Debug screen 68).
+    CHECK(strlen(API_FORBIDDEN_BOX) <= 50 && strlen(API_FORBIDDEN_TEXT) <= 68 && visible_strlen(API_FORBIDDEN_FORCE) <= 50,
+          "a refusal text is wider than its box");
+}
+
+// ---- 15. stage 2: unmount and detach, naming the mount (4.12; I-24, I-27, I-28) ----
+static std::string named(uint32_t ms) { return eargs("expect_mount_seq", ms); }
+static std::string named_e(uint32_t ms, uint32_t ep) {
+    return "{\"expect_mount_seq\":" + std::to_string(ms) + ",\"expect_epoch\":" + std::to_string(ep) + "}";
+}
+static void test_unmount() {
+    fresh("unmount");
+    sim.nsect = 980u * 10 * 17;
+    // expect_mount_seq is required (X66), for both.
+    J r = ask1(req(10, "unmount"));
+    CHECK(is_refusal(r, "E_SCHEMA") && r["err"]["field"].is("expect_mount_seq"), "unmount without expect_mount_seq");
+    r = ask1(req(11, "detach"));
+    CHECK(is_refusal(r, "E_SCHEMA") && r["err"]["field"].is("expect_mount_seq"), "detach without expect_mount_seq");
+    tui_setup_chs(980, 10, 17);
+    tui_mount();
+    CHECK(ctl_mount_seq == 1 && is_mounted, "mounted");
+    // One lower, one higher: refused at arrival, nothing changes (I-27, X68).
+    for (uint32_t bad : { 0u, 2u, 7u }) {
+        std::string d0 = state2();
+        uint32_t lg = log_next;
+        r = ask1(req(20 + bad, "unmount", named(bad).c_str()));
+        CHECK(is_refusal(r, "E_STALE") && r["retry"].is("AFTER_STATUS") && r["err"]["field"].is("expect_mount_seq") &&
+              state2() == d0 && log_next == lg && is_mounted, "unmount naming mount %u of 1", bad);
+    }
+    // Refused at arrival, at once, never queued: with core 1 away the answer
+    // still comes (a pickup check alone would wait 30 s for the TUI).
+    core1_runs = false;
+    r = ask1(req(28, "unmount", named(0).c_str()));
+    CHECK(is_refusal(r, "E_STALE") && r["err"]["field"].is("expect_mount_seq") && ctl_job.state == CTL_JOB_EMPTY,
+          "a stale mount name not refused at arrival");
+    r = ask1(req(29, "detach", named_e(1, epoch_now() + 3).c_str()));
+    CHECK(is_refusal(r, "E_STALE") && r["err"]["field"].is("expect_epoch") && ctl_job.state == CTL_JOB_EMPTY,
+          "a stale expect_epoch not refused at arrival");
+    core1_runs = true;
+    // The current mount: DONE, the confirm-4 path, the main menu.
+    uint32_t e0 = epoch_now(), lg = log_next;
+    std::string tty0 = tty;
+    int regs0 = sim.reg_writes;
+    r = ask1(req(30, "unmount", named(1).c_str()));
+    const J &x = r["result"];
+    CHECK(r["outcome"].is("DONE") && all_keys(x, { "mounted", "changed", "native_mode_ended" }) && !x["mounted"].b &&
+          x["changed"].b && !x["native_mode_ended"].b, "unmount result");
+    CHECK(!is_mounted && current_screen == SCREEN_MAIN && needs_full_redraw, "the screen does not follow (I-24): %d", current_screen);
+    CHECK(epoch_now() > e0 && ctl_mount_seq == 1, "epoch or mount_seq");
+    // API_BEGIN, the UNMOUNT marker, API_END; nothing on the bus, nothing to the TUI.
+    CHECK(log_next == lg + 3 && log_entry_is(lg, CTL_OP_UNMOUNT, 30, OBS_API_BEGIN) &&
+          log_ring[(lg + 1) % OBS_LOG_ENTRIES].kind == OBS_EV_UNMOUNT && log_entry_is(lg + 2, CTL_OP_UNMOUNT, 30, OBS_API_DONE),
+          "log: %u entries", (unsigned)(log_next - lg));
+    CHECK(sim.reg_writes == regs0 && tty == tty0, "unmount touched the bus or the TUI's queue");
+    J jl = ask1(req(2, "job.last"));
+    CHECK(jl["result"]["op"].is("unmount") && jl["result"]["id"].n == 30 && jl["result"]["response"]["result"]["changed"].b, "job.last");
+    // Unmounted, naming that mount: DONE, nothing changed.
+    std::string d1 = state2();
+    lg = log_next;
+    r = ask1(req(31, "unmount", named(1).c_str()));
+    CHECK(r["outcome"].is("DONE") && !r["result"]["changed"].b && !r["result"]["mounted"].b && log_next == lg + 2 &&
+          api_entries(CTL_OP_UNMOUNT, 31) == 2, "unmount while unmounted");
+    // A byte-identical resend is the stored answer, not a second run.
+    std::string l30 = req(30, "unmount", named(1).c_str());
+    std::vector<std::string> rr = ask(l30);
+    J k;
+    CHECK(rr.size() == 1 && parse_response(rr[0], k) && k["replayed"].b && api_entries(CTL_OP_UNMOUNT, 30) == 2, "resend of unmount");
+    // expect_epoch as well: stale at arrival refused, current runs.
+    tui_mount();
+    r = ask1(req(40, "unmount", named_e(2, epoch_now() + 1).c_str()));
+    CHECK(is_refusal(r, "E_STALE") && r["err"]["field"].is("expect_epoch") && is_mounted, "unmount with a stale expect_epoch");
+    r = ask1(req(41, "unmount", named_e(2, epoch_now()).c_str()));
+    CHECK(r["outcome"].is("DONE") && !is_mounted, "unmount with the current epoch");
+}
+
+// A mount between arrival and pickup (X67): caught at pickup, nothing changes.
+static void test_unmount_pickup() {
+    fresh("unmount: a new mount before pickup");
+    tui_setup_chs(980, 10, 17);
+    tui_mount();
+    core1_screen = CTL_TUI_CONFIRM;                 // the human has a box open: the job waits
+    host_send(req(10, "unmount", named(1).c_str()));
+    pump(20);
+    CHECK(ctl_job.state == CTL_JOB_QUEUED, "not queued");
+    menu_unmount(); current_screen = SCREEN_MAIN;   // the human's own unmount, then mount again
+    tui_mount();
+    CHECK(ctl_mount_seq == 2, "mount_seq %u", (unsigned)ctl_mount_seq);
+    std::string d0 = state2();
+    uint32_t lg = log_next;
+    core1_screen = CTL_TUI_MOUNTED;
+    std::vector<std::string> rr = ask("", 40);
+    J k;
+    CHECK(rr.size() == 1 && parse_response(rr[0], k) && is_refusal(k, "E_STALE") && k["err"]["field"].is("expect_mount_seq") &&
+          k["retry"].is("AFTER_STATUS") && is_mounted && log_next == lg, "the newer mount was cut (%zu answers)", rr.size());
+    CHECK(state2().substr(0, sizeof config) == d0.substr(0, sizeof config) && !c.jl_present, "state or job.last changed");
+    // The epoch named, changed while it waited (a WP toggle): caught at pickup too.
+    fresh("unmount: the epoch moves before pickup");
+    tui_setup_chs(980, 10, 17);
+    tui_mount();
+    core1_screen = CTL_TUI_CONFIRM;
+    host_send(req(11, "unmount", named_e(1, epoch_now()).c_str()));
+    pump(20);
+    human_wp(false);
+    core1_screen = CTL_TUI_MOUNTED;
+    rr = ask("", 40);
+    CHECK(rr.size() == 1 && parse_response(rr[0], k) && is_refusal(k, "E_STALE") && k["err"]["field"].is("expect_epoch") &&
+          is_mounted, "a stale epoch at pickup");
+    // And both ways: with nothing changed meanwhile, the queued one runs.
+    fresh("unmount: queued, then run");
+    tui_setup_chs(980, 10, 17);
+    tui_mount();
+    core1_screen = CTL_TUI_CONFIRM;
+    host_send(req(12, "unmount", named_e(1, epoch_now()).c_str()));
+    pump(20);
+    core1_screen = CTL_TUI_MOUNTED;
+    rr = ask("", 40);
+    CHECK(rr.size() == 1 && parse_response(rr[0], k) && k["outcome"].is("DONE") && !is_mounted, "the queued unmount did not run");
+    // Another job in flight: E_INFLIGHT, the queued one untouched.
+    fresh("unmount: another job in flight");
+    core1_screen = CTL_TUI_CONFIRM;
+    host_send(req(13, "taskfile.snapshot"));
+    pump(5);
+    J r = ask1(req(14, "unmount", named(0).c_str()));
+    CHECK(is_refusal(r, "E_INFLIGHT") && ctl_job.state == CTL_JOB_QUEUED && ctl_job.id == 13, "unmount with a job queued");
+    core1_screen = CTL_TUI_MAIN;
+    pump(50);
+    host_lines();
+}
+
+// Ctrl+G's power-up default mode (native): the unmount waits for a USB read
+// as confirm-4 does, and says whether the mode ended.
+static void test_unmount_native() {
+    for (int busy = 0; busy < 2; busy++) {
+        fresh(busy ? "unmount, native, a USB read still running" : "unmount, native");
+        uint8_t st;
+        CHECK(ide_manual_chs_native(10, 17, &st) == IDE_MCHS_OK, "native Ctrl+G");
+        use_lba_mode = false; cur_cyls = 980; cur_heads = 10; cur_spt = 17; total_lba_sectors = 0;
+        strcpy(hdd_model_raw, MCHS_MODEL_NATIVE);
+        sync_to_config();
+        ctl_setup_noted(CTL_SRC_TUI_CTRLG_NATIVE);
+        tui_mount();
+        if (busy) busy_until_ns = mock_now_ns + 60000000000ull;     // longer than the 25 s wait
+        J r = ask1(req(10, "unmount", named(1).c_str()), nullptr, busy ? 26000 : 60);
+        CHECK(r["outcome"].is("DONE") && !r["result"]["mounted"].b && r["result"]["changed"].b &&
+              r["result"]["native_mode_ended"].b == !busy, "native_mode_ended %d", r["result"]["native_mode_ended"].b);
+        CHECK(ide_native_drive() && ide_mchs_no_identify(), "the no-91h or no-IDENTIFY rule ended");
+        J s = ask1(req(1, "status"));
+        CHECK(s["result"]["setup"]["source"].is("NONE") && s["result"]["rules"]["native_active"].b == (busy != 0),
+              "status after: source %s native_active %d", s["result"]["setup"]["source"].s.c_str(), s["result"]["rules"]["native_active"].b);
+        busy_until_ns = 0;
+    }
+}
+
+static void test_detach() {
+    fresh("detach");
+    uint8_t st;
+    CHECK(ide_manual_chs_native(10, 17, &st) == IDE_MCHS_OK, "native Ctrl+G");
+    use_lba_mode = false; cur_cyls = 980; cur_heads = 10; cur_spt = 17; total_lba_sectors = 0;
+    strcpy(hdd_model_raw, MCHS_MODEL_NATIVE);
+    sync_to_config();
+    ctl_setup_noted(CTL_SRC_TUI_CTRLG_NATIVE);
+    tui_mount();
+    uint16_t w[256] = { 0 };
+    ide_idcache_put(w, IDE_IDC_DEBUG_I);            // an IDENTIFY held from before (to be dropped)
+    std::string d0 = state2();
+    J r = ask1(req(9, "detach", named(0).c_str()));
+    CHECK(is_refusal(r, "E_STALE") && state2() == d0, "a stale detach changed something");
+    uint32_t lg = log_next;
+    int regs0 = sim.reg_writes;
+    std::string tty0 = tty;
+    r = ask1(req(10, "detach", named(1).c_str()));
+    CHECK(r["outcome"].is("DONE") && all_keys(r["result"], { "detached" }) && r["result"]["detached"].b, "detach result");
+    CHECK(!is_mounted && config.cyls == 0 && config.heads == 0 && config.spt == 0 && cur_cyls == 0 && !ide_manual_chs_native_active(),
+          "the geometry is still set");
+    CHECK(!strcmp(hdd_model_raw, MCHS_MODEL_CLEARED) && current_screen == SCREEN_MAIN && !idc.present && idc.why == IDE_IDC_WHY_DETACH,
+          "model %s, screen %d, identify.cached present %d", hdd_model_raw, current_screen, idc.present);
+    CHECK(ide_native_drive() && ide_mchs_no_identify(), "detach ended a sticky rule");
+    CHECK(sim.reg_writes == regs0 && tty == tty0, "detach touched the bus or the TUI queue");
+    CHECK(log_entry_is(lg, CTL_OP_DETACH, 10, OBS_API_BEGIN) && log_entry_is(log_next - 1, CTL_OP_DETACH, 10, OBS_API_DONE),
+          "API markers");
+    J s = ask1(req(1, "status"));
+    CHECK(s["result"]["setup"]["source"].is("NONE") && s["result"]["geometry"]["total_sectors"].n == 0 &&
+          s["result"]["mount_seq"].n == 1, "status after detach");
+    // Nothing can mount it again without a new set-up: Mount finds nothing.
+    J ic = ask1(req(2, "identify.cached"));
+    CHECK(!ic["result"]["present"].b && ic["result"]["why"].is("DETACH"), "identify.cached after detach");
+    // Unmounted, a set-up made, no mount yet: detach names the last mount (0 here).
+    fresh("detach: a set-up, never mounted");
+    tui_setup_chs(980, 10, 17);
+    r = ask1(req(11, "detach", named(1).c_str()));
+    CHECK(is_refusal(r, "E_STALE") && config.cyls == 980, "a detach naming a mount that never was");
+    r = ask1(req(12, "detach", named(0).c_str()));
+    CHECK(r["outcome"].is("DONE") && config.cyls == 0 && hdd_model_raw[0] == 0 && ctl_setup_src == CTL_SRC_NONE, "detach of a set-up");
+}
+
+// A USB read still running after the wait: FAILED, E_BUS_BUSY, and nothing
+// cleared (R-API-1 finding 8, X57).
+static void test_detach_busy() {
+    fresh("detach: a USB read still running");
+    tui_setup_chs(980, 10, 17);
+    tui_mount();
+    busy_until_ns = mock_now_ns + 60000000000ull;
+    uint32_t lg = log_next;
+    J r = ask1(req(10, "detach", named(1).c_str()), nullptr, 26000);
+    CHECK(r["outcome"].is("FAILED") && r["err"]["code"].is("E_BUS_BUSY") && r["retry"].is("AFTER_STATUS") &&
+          r["result"].t == J::OBJ && all_keys(r["result"], { "detached", "mounted" }) && !r["result"]["detached"].b &&
+          !r["result"]["mounted"].b, "detach while busy: %s %s", r["outcome"].s.c_str(), r["err"]["code"].s.c_str());
+    CHECK(!is_mounted && config.cyls == 980 && config.heads == 10 && config.spt == 17 && cur_cyls == 980 &&
+          ctl_setup_src == CTL_SRC_TUI_DETECT_NORMAL, "detach cleared the geometry under a running read");
+    CHECK(log_entry_is(log_next - 1, CTL_OP_DETACH, 10, OBS_API_FAILED) && log_entry_is(lg, CTL_OP_DETACH, 10, OBS_API_BEGIN),
+          "API_END FAILED");
+    J jl = ask1(req(1, "job.last"));
+    CHECK(jl["result"]["present"].b && jl["result"]["response"]["outcome"].is("FAILED"), "job.last of the FAILED detach");
+    busy_until_ns = 0;
+    // The read ended: the same detach again (a new id) clears it.
+    r = ask1(req(11, "detach", named(1).c_str()));
+    CHECK(r["outcome"].is("DONE") && config.cyls == 0, "detach after the read ended");
+    // A read that ends within the wait: detach waits for it (every mode,
+    // not only native), then clears.
+    fresh("detach: waits for a USB read to end");
+    tui_setup_chs(980, 10, 17);
+    tui_mount();
+    busy_until_ns = mock_now_ns + 10000000000ull;  // 10 s more
+    uint64_t t0 = mock_now_ns;
+    r = ask1(req(12, "detach", named(1).c_str()), nullptr, 12000);
+    CHECK(r["outcome"].is("DONE") && config.cyls == 0 && mock_now_ns - t0 >= 10000000000ull, "detach did not wait: %s",
+          r["outcome"].s.c_str());
+    busy_until_ns = 0;
+}
+
+// No terminal on interface 0 (R-API-1 finding 1): the TUI's queue full and
+// nobody reading. The jobs end within their time and put nothing in it.
+static void test_ratchet_no_terminal() {
+    fresh("the ratchet with no terminal");
+    cdc_connected = false;
+    tty.assign(4096, 'q');
+    tui_setup_chs(980, 10, 17);
+    tui_mount();
+    std::string tty0 = tty;
+    uint64_t t0 = mock_now_ns;
+    J r = ask1(req(10, "unmount", named(1).c_str()));
+    CHECK(r["outcome"].is("DONE") && tty == tty0 && mock_now_ns - t0 < 30000000000ull, "unmount with no terminal");
+    r = ask1(req(11, "detach", named(1).c_str()));
+    CHECK(r["outcome"].is("DONE") && tty == tty0, "detach with no terminal");
+    for (const char *op : { "wp.on", "pipelined.off", "identify.forbid" }) {
+        static uint32_t id = 20;
+        r = ask1(req(id++, op));
+        CHECK(r["outcome"].is("DONE") && tty == tty0, "%s with no terminal", op);
+    }
+    cdc_connected = false;
+}
+
+// ---- 16. stage 2: the epoch, counted where the state changes (4.3, ctl_state.h) ----
+static void test_epoch_hooks() {
+    fresh("epoch hooks");
+    sim.nsect = 980u * 10 * 17;
+    struct Step { const char *what; std::function<void()> act; bool moves; };
+    uint8_t st;
+    uint16_t buf[256];
+    std::vector<Step> steps = {
+        { "sync_to_config, a new geometry", [] { cur_cyls = 500; cur_heads = 4; cur_spt = 20; sync_to_config(); }, true },
+        { "sync_to_config, the same", [] { sync_to_config(); }, false },
+        { "ide_select_device, another device", [] { ide_select_device(0xB0); }, true },
+        { "ide_select_device, the same", [] { ide_select_device(0xB0); }, false },
+        { "back to the master", [] { ide_select_device(0xA0); }, true },
+        { "a native Ctrl+G (no 91h since boot)", [&] { (void)ide_manual_chs_native(4, 20, &st); }, true },
+        { "the TUI's set-up source", [] { ctl_setup_noted(CTL_SRC_TUI_CTRLG_NATIVE); }, true },
+        { "a clear, then a clear of nothing", [] { ctl_setup_noted(CTL_SRC_NONE); ctl_setup_noted(CTL_SRC_NONE); }, true },
+        { "a clear of nothing", [] { ctl_setup_noted(CTL_SRC_NONE); }, false },
+        { "mount_nothing_to_mount (unmounted)", [] { mount_nothing_to_mount(); show_detect_result = false; }, true },
+        { "detect_result_dismiss", [] { detect_result_dismiss(); }, true },
+        { "Auto Detect's probe (native and the rule ended)", [] { (void)ide_probe_devices(); }, true },
+        { "ide_set_geometry, the first 91h since boot", [] { (void)ide_set_geometry(4, 20); }, true },
+        { "ide_set_geometry, a second 91h", [] { (void)ide_set_geometry(4, 20); }, false },
+        { "a Ctrl+G (the no-IDENTIFY rule)", [&] { (void)ide_manual_chs(4, 20, &st); }, true },
+        { "IDENTIFY refused after it", [&] { (void)ide_identify(buf); }, false },
+        { "the probe (the rule ended)", [] { (void)ide_probe_devices(); }, true },
+        { "an IDENTIFY that answers (Ctrl+G's pass-through bar ends)", [&] { (void)ide_identify(buf); }, true },
+        { "an IDENTIFY that answers, nothing to end", [&] { (void)ide_identify(buf); }, false },
+    };
+    for (auto &s : steps) {
+        uint32_t e0 = epoch_now();
+        s.act();
+        uint32_t e1 = epoch_now();                  // at once, before any core-0 pass
+        CHECK(s.moves ? e1 > e0 : e1 == e0, "%s: epoch %u -> %u", s.what, (unsigned)e0, (unsigned)e1);
+        pump(2);
+        CHECK(c.epoch_missed == 0, "%s: a change no hook counted", s.what);
+    }
+    // try_auto_mount at boot: a mount and its source.
+    fresh("epoch hooks: auto-mount");
+    sim.nsect = 980u * 10 * 17;
+    config.auto_mount = true; config.use_lba_mode = false; config.cyls = 980; config.heads = 10; config.spt = 17;
+    hooked();
+    uint32_t e0 = epoch_now();
+    try_auto_mount();
+    CHECK(is_mounted && epoch_now() > e0 && ctl_setup_src == CTL_SRC_AUTO_MOUNT && ctl_mount_seq == 1, "auto-mount");
+    pump(2);
+    // A change and its reversal inside one core-0 pass (one long USB
+    // callback): stage 1's polling saw nothing; the hooks count both.
+    fresh("epoch hooks: a change and its reversal in one pass");
+    e0 = epoch_now();
+    cur_cyls = 500; cur_heads = 4; cur_spt = 20; sync_to_config();
+    cur_cyls = 0; cur_heads = 0; cur_spt = 0; sync_to_config();
+    pump(2);
+    J s = ask1(req(1, "status"));
+    CHECK(s["result"]["epoch"].n == e0 + 2 && c.epoch_missed == 0, "epoch %llu after a change and its reversal, was %u",
+          (unsigned long long)s["result"]["epoch"].n, (unsigned)e0);
+    // The cross-check can fail: a store with no hook is counted, and moves
+    // the epoch late rather than never.
+    fresh("epoch hooks: the cross-check");
+    e0 = epoch_now();
+    config.dev_base = 0xB0;                         // a store no firmware path makes without its hook
+    pump(2);
+    CHECK(c.epoch_missed == 1 && epoch_now() == e0 + 1, "the cross-check missed a store: missed %u, epoch %u",
+          (unsigned)c.epoch_missed, (unsigned)(epoch_now() - e0));
+    c.epoch_missed = 0;                             // seen: not this test's failure
+}
+
+// Inside a Ctrl+G (a minute of it on a slow drive), each rule is counted as
+// it is stored, not when the Ctrl+G returns: at its RESET- the no-IDENTIFY
+// rule is already counted, and each later store once more (ctl_state.h).
+static uint32_t pulse_epoch;
+static bool pulse_seen, pulse_noid;
+static void at_pulse(bool high) {
+    if (high || pulse_seen) return;
+    pulse_seen = true; pulse_epoch = ctl_epoch; pulse_noid = mchs_no_identify;
+}
+static void test_epoch_inside_ctrlg() {
+    for (int native = 0; native < 2; native++) {
+        fresh(native ? "epoch inside a native Ctrl+G" : "epoch inside a Ctrl+G");
+        sim.nsect = 980u * 10 * 17;
+        pulse_seen = false;
+        sim_reset_hook = at_pulse;
+        uint32_t e0 = epoch_now();
+        uint8_t st;
+        int r = native ? ide_manual_chs_native(10, 17, &st) : ide_manual_chs(10, 17, &st);
+        sim_reset_hook = nullptr;
+        CHECK(r == IDE_MCHS_OK && pulse_seen && pulse_noid && pulse_epoch > e0,
+              "at RESET-: rule %d, epoch %u (was %u)", pulse_noid, (unsigned)pulse_epoch, (unsigned)e0);
+        // After RESET-: the 91h mode stores idp_written, then manual_chs_active;
+        // the native mode stores its declaration once.
+        CHECK(epoch_now() == pulse_epoch + (native ? 1 : 2), "after RESET-: epoch +%u", (unsigned)(epoch_now() - pulse_epoch));
+        pump(2);
+    }
+}
+
+// status.setup through the TUI's own Auto Detect (the picker's first row).
+static void test_setup_source() {
+    fresh("setup.source from Auto Detect");
+    sim.nsect = 980u * 10 * 17;
+    rx.clear(); rxi = 0;
+    rx.push_back({ mock_now_ns / 1000 + 100000000ull, '\r' });
+    run_auto_detect();                              // the picker starts on the LBA row for an LBA drive
+    J s = ask1(req(1, "status"));
+    CHECK(s["result"]["setup"]["source"].is("TUI_DETECT_LBA") && s["result"]["geometry"]["mode"].is("LBA"), "after Auto Detect: %s",
+          s["result"]["setup"]["source"].s.c_str());
+    fresh("setup.source from Auto Detect, the first row");
+    sim.nsect = 980u * 10 * 17;
+    rx.clear(); rxi = 0;
+    uint64_t t0 = mock_now_ns / 1000 + 100000000ull;
+    for (char ch : std::string("\x1b[A\x1b[A\r")) { rx.push_back({ t0, ch }); t0 += 1000; }
+    run_auto_detect();
+    s = ask1(req(1, "status"));
+    CHECK(s["result"]["setup"]["source"].is("TUI_DETECT_NORMAL") && s["result"]["geometry"]["cyls"].n == 980, "the first row: %s",
+          s["result"]["setup"]["source"].s.c_str());
+    // Auto Detect's probe clears the old set-up: an IDENTIFY that then fails
+    // leaves none (NONE), not the one from before.
+    fresh("setup.source: Auto Detect that fails");
+    sim.nsect = 980u * 10 * 17;
+    tui_setup_chs(980, 10, 17);
+    sim.identify_err_drq = true;
+    run_auto_detect();
+    s = ask1(req(1, "status"));
+    CHECK(s["result"]["setup"]["source"].is("NONE") && show_detect_result && force_detect, "after a failed Auto Detect: %s",
+          s["result"]["setup"]["source"].s.c_str());
+    show_detect_result = false; force_detect = false;
+    // The picker's MANUAL row (Tab, then the three numbers): TUI_MANUAL.
+    fresh("setup.source from the picker's MANUAL row");
+    sim.nsect = 980u * 10 * 17;
+    rx.clear(); rxi = 0;
+    t0 = mock_now_ns / 1000 + 100000000ull;
+    for (char ch : std::string("\t980\r10\r17\r")) { rx.push_back({ t0, ch }); t0 += 1000; }
+    run_auto_detect();
+    s = ask1(req(1, "status"));
+    CHECK(s["result"]["setup"]["source"].is("TUI_MANUAL") && s["result"]["geometry"]["heads"].n == 10, "the MANUAL row: %s",
+          s["result"]["setup"]["source"].s.c_str());
+    // The Ctrl+G box's Y: TUI_CTRLG_IDP; a failure: NONE.
+    fresh("setup.source from Ctrl+G");
+    rx.clear(); rxi = 0;
+    uint64_t t = mock_now_ns / 1000 + 1000;
+    for (char ch : std::string("980\r10\r17\ry")) { rx.push_back({ t, ch }); t += 1000; }
+    run_manual_chs();
+    s = ask1(req(2, "status"));
+    CHECK(s["result"]["setup"]["source"].is("TUI_CTRLG_IDP") && s["result"]["rules"]["no_identify_ctrlg"].b, "after Ctrl+G: %s",
+          s["result"]["setup"]["source"].s.c_str());
+    fresh("setup.source after a Ctrl+G that failed");
+    sim.reject_idp = true;
+    rx.clear(); rxi = 0;
+    t = mock_now_ns / 1000 + 1000;
+    for (char ch : std::string("980\r10\r17\ry")) { rx.push_back({ t, ch }); t += 1000; }
+    ctl_setup_noted(CTL_SRC_TUI_DETECT_NORMAL);     // a set-up from before
+    run_manual_chs();
+    s = ask1(req(3, "status"));
+    CHECK(s["result"]["setup"]["source"].is("NONE"), "after a failed Ctrl+G: %s", s["result"]["setup"]["source"].s.c_str());
+}
+
+// ---- 17. core 1's real loop with keys (its own run: test_ctl core1-tui) -----
+// The hooks inside core1_entry's key handling (the Features toggles,
+// confirm-3), the F: Force refusal after identify.forbid, and an API
+// unmount taken at the MOUNTED screen's idle point. Keys arrive on the mock
+// clock; core 0's passes come from core 1's own input polls (core0_tick),
+// except while core0_hold says core 0 is inside a long USB callback.
+static uint64_t T(double s) { return (uint64_t)(s * 1e6); }        // us of the run
+static void key_at(double s, const char *k) {
+    uint64_t t = T(s);
+    for (const char *p = k; *p; p++) { rx.push_back({ t, *p }); t += 200; }
+}
+static void at(double s, std::function<void()> f) { timeline.push_back({ T(s), f }); }
+static uint32_t mark_e;
+static int mark_91, mark_hw;
+static J last_answer(bool *ok) {
+    std::vector<std::string> r = host_lines();
+    J j;
+    *ok = r.size() == 1 && parse_response(r[0], j) && envelope_problem(j).empty();
+    return j;
+}
+static void core1_tui_done() {
+    CHECK(c.epoch_missed == 0, "core1-tui: %u change(s) with no hook", (unsigned)c.epoch_missed);
+    CHECK(rxi == rx.size(), "core1-tui: %zu keys left unread", rx.size() - rxi);
+    printf("%d checks, %d failed\n", checks, failures);
+    exit(failures > 255 ? 255 : failures);
+}
+static void test_core1_tui() {
+    setvbuf(stdout, nullptr, _IONBF, 0);            // a run that stops early still shows how far it got
+    fresh("core 1's loop with keys");
+    sim.nsect = 980u * 10 * 17;
+    core1_runs = false;                             // core 1 is its real loop, not the stepper
+    cdc_connected = true;
+    config.drive_write_protected = true;            // the settings' default
+    fingerprint(&c.fp); c.fp_epoch = ctl_epoch;
+    uint64_t base = mock_now_ns / 1000;
+    auto B = [base](double s) { return (base + T(s)) / 1e6; };      // seconds, absolute
+    // 1. Features, Write Protect: Enter turns it off (a TUI change: epoch, last_change).
+    key_at(B(1.0), "\x1b[C");                       // main menu: to Features
+    key_at(B(1.5), "\r");
+    at(B(1.9), [] { mark_e = ctl_epoch; CHECK(current_screen == SCREEN_FEATURES && config.feat_selected == 0, "not on Features"); });
+    key_at(B(2.0), "\r");
+    at(B(2.5), [] {
+        CHECK(!config.drive_write_protected && ctl_wp_last == CTL_WP_TUI && ctl_epoch == mark_e + 1,
+              "WP toggle: wp %d last %u epoch +%u", config.drive_write_protected, ctl_wp_last, (unsigned)(ctl_epoch - mark_e));
+    });
+    // 2. On and off again while core 0 is away (a 1 s USB callback): the
+    // cross-check sees nothing move, the hooks count both.
+    at(B(2.9), [] { core0_hold = true; mark_e = ctl_epoch; });
+    key_at(B(3.0), "\r");
+    key_at(B(3.1), "\r");
+    at(B(3.6), [] {
+        CHECK(ctl_epoch == mark_e + 2 && !config.drive_write_protected, "a change and its reversal: epoch +%u",
+              (unsigned)(ctl_epoch - mark_e));
+        core0_hold = false;
+    });
+    at(B(3.8), [] { CHECK(c.epoch_missed == 0 && ctl_epoch == mark_e + 2, "after core 0 came back: +%u", (unsigned)(ctl_epoch - mark_e)); });
+    // 3. Pipelined Reads (the sixth row): on, then off.
+    key_at(B(4.0), "\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B");
+    at(B(4.4), [] { mark_e = ctl_epoch; CHECK(config.feat_selected == 5, "row %u", config.feat_selected); });
+    key_at(B(4.5), "\r");
+    at(B(4.9), [] { CHECK(config.pipelined_reads && ctl_epoch == mark_e + 1, "Pipelined Reads on: epoch +%u", (unsigned)(ctl_epoch - mark_e)); });
+    key_at(B(5.0), "\r");
+    at(B(5.4), [] { CHECK(!config.pipelined_reads && ctl_epoch == mark_e + 2, "Pipelined Reads off"); });
+    key_at(B(5.5), "\x1b");                         // back to the main menu (on Features)
+    // 4. Load Setup Defaults: write protect back on, by the TUI.
+    key_at(B(6.0), "\x1b[B");                       // Features -> Load Defaults
+    key_at(B(6.3), "\r");
+    at(B(6.6), [] {
+        mark_e = ctl_epoch;
+        CHECK(current_screen == SCREEN_CONFIRM && !config.drive_write_protected, "no Load Defaults question");
+        ctl_wp_last = CTL_WP_BOOT;                  // so the check below sees Load Defaults set it
+    });
+    key_at(B(6.7), "y");
+    at(B(7.2), [] {
+        CHECK(config.drive_write_protected && ctl_wp_last == CTL_WP_TUI && ctl_epoch == mark_e + 1 && saves == 1,
+              "Load Defaults: wp %d last %u epoch +%u", config.drive_write_protected, ctl_wp_last, (unsigned)(ctl_epoch - mark_e));
+    });
+    key_at(B(7.5), "\x1b[A\x1b[D");                 // Load Defaults -> Features -> Auto Detect
+    // 5. Auto Detect on a drive whose IDENTIFY fails: the error box offers
+    // F: Force. The API forbids IDENTIFY while it is open. (The Force entry
+    // itself is not driven here: its picker computes the LARGE row from the
+    // zero IDENTIFY words, 0 heads, and x86 traps on the division where the
+    // RP2350 gives 0; menus.c get_large_geometry.)
+    at(B(7.9), [] { sim.identify_err_drq = true; CHECK(current_screen == SCREEN_MAIN && config.main_selected == 0, "not on Auto Detect"); });
+    key_at(B(8.0), "\r");
+    key_at(B(8.5), "y");
+    at(B(15.0), [] {
+        CHECK(show_detect_result && force_detect, "no IDENTIFY-failed box with F: Force (%d %d)", show_detect_result, force_detect);
+        host_send(req(50, "identify.forbid"));
+        mark_91 = sim.cmd_count[0x91]; mark_hw = sim.hw_resets;
+    });
+    at(B(15.5), [] {
+        bool ok;
+        J r = last_answer(&ok);
+        CHECK(ok && r["outcome"].is("DONE") && ide_identify_forbidden(), "identify.forbid during the box");
+    });
+    // F now: refused, and the box says why (R-API-1 finding 6).
+    key_at(B(16.0), "f");
+    at(B(16.5), [] {
+        CHECK(show_detect_result && !force_detect && strstr(hdd_status_text, "Forbidden by ATAboy Control") &&
+              strcmp(hdd_model_raw, "Manually Forced Drive") && ctl_setup_src != CTL_SRC_TUI_FORCE && sim.cmd_count[0x91] == mark_91,
+              "F: Force after identify.forbid: force %d, text %s", force_detect, hdd_status_text);
+    });
+    key_at(B(17.0), "\r");                          // dismiss
+    // 6. Auto Detect's Enter now: refused at once, the new box, no RESET-.
+    key_at(B(18.0), "\r");
+    at(B(18.5), [] {
+        CHECK(tty.find(API_FORBIDDEN_BOX) != std::string::npos && current_screen == SCREEN_MAIN && sim.hw_resets == mark_hw,
+              "Auto Detect after identify.forbid: resets %d", sim.hw_resets - mark_hw);
+    });
+    key_at(B(19.0), " ");                           // the box's key
+    // 7. Mount through confirm-3 (the hook there), then an API unmount taken
+    // at the MOUNTED screen's idle point: the TUI follows to the main menu.
+    at(B(20.0), [] {
+        use_lba_mode = false; cur_cyls = 980; cur_heads = 10; cur_spt = 17; total_lba_sectors = 0;
+        strcpy(hdd_model_raw, "SIM DRIVE"); sync_to_config(); ctl_setup_noted(CTL_SRC_TUI_DETECT_NORMAL);
+    });
+    key_at(B(20.5), "\x1b[B");                      // to Mount
+    key_at(B(21.0), "\r");
+    at(B(21.4), [] { mark_e = ctl_epoch; CHECK(current_screen == SCREEN_CONFIRM, "Mount did not ask"); });
+    key_at(B(21.5), "y");
+    at(B(22.0), [] {
+        CHECK(is_mounted && current_screen == SCREEN_MOUNTED && ctl_mount_seq == 1 && ctl_epoch == mark_e + 1,
+              "confirm-3: mounted %d, epoch +%u", (int)is_mounted, (unsigned)(ctl_epoch - mark_e));
+        host_send(req(60, "unmount", named(1).c_str()));
+    });
+    at(B(23.0), [] {
+        bool ok;
+        J r = last_answer(&ok);
+        CHECK(ok && r["outcome"].is("DONE") && r["result"]["changed"].b && !is_mounted && current_screen == SCREEN_MAIN,
+              "API unmount from the MOUNTED screen: %s, screen %d", r["outcome"].s.c_str(), current_screen);
+        CHECK(ctl_tui_state == CTL_TUI_MAIN, "published state %u", ctl_tui_state);
+    });
+    idle_after_ns = (base + T(25.0)) * 1000;
+    on_idle = core1_tui_done;
+    core0_in_loop = true;
+    core1_entry();
+}
+
 // ---- serve: the Control port on stdin/stdout, for ctl_e2e.py ------------------
 static void serve() {
 #ifdef _WIN32
@@ -920,6 +1721,14 @@ static void serve() {
     port.got.clear();
     // A mounted drive's worth of log, so log.read has something to return.
     for (int i = 0; i < 5; i++) obs_marker(OBS_EV_MOUNT, 9, 0, 0, 0, (uint16_t)i, 0xA0);
+    // Stage 2: a drive set up and mounted through the menus' own path, so
+    // unmount and detach have something to end (mount_seq 1).
+    sim.nsect = 980u * 10 * 17;
+    config.drive_write_protected = false; ctl_wp_last = CTL_WP_TUI; hooked();
+    config.pipelined_reads = true; hooked();
+    tui_setup_chs(980, 10, 17);
+    tui_mount();
+    pump(2);
     static char buf[4096];
     for (;;) {
         size_t n = fread(buf, 1, 1, stdin);        // one byte at a time: never waits for more than the host sent
@@ -936,6 +1745,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "serve")) { serve(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "core1")) test_core1_loop();          // does not return
     if (argc > 1 && !strcmp(argv[1], "core1-confirm")) test_core1_confirm(); // does not return
+    if (argc > 1 && !strcmp(argv[1], "core1-tui")) test_core1_tui();       // does not return
     test_parser();
     test_writer_sha();
     test_op_table();
@@ -953,6 +1763,20 @@ int main(int argc, char **argv) {
     test_debug_e_selftest_chip();
     test_taskfile();
     test_garbage_changes_nothing();
+    test_wp_on();
+    test_pipelined_off();
+    test_identify_forbid();
+    test_forbid_tui_prechecks();
+    test_unmount();
+    test_unmount_pickup();
+    test_unmount_native();
+    test_detach();
+    test_detach_busy();
+    test_ratchet_no_terminal();
+    test_epoch_hooks();
+    test_epoch_inside_ctrlg();
+    test_setup_source();
+    fresh("end");                                   // the last test's epoch cross-check
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;
 }
