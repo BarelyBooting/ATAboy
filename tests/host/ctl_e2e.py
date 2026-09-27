@@ -182,7 +182,8 @@ def main():
               f'{op} without expect_mount_seq: {x!r}, {len(ports[0].lines_out) - sent} lines sent')
     # A stale name: sent, refused by the firmware, nothing changed.
     x = c.request('unmount', {'expect_mount_seq': st['mount_seq'] + 1})
-    check(x.state == 'CouldNotRun' and x.response['err']['code'] == 'E_STALE' and len(ports[0].lines_out) == sent + 1,
+    check(x.state == 'CouldNotRun' and x.response is not None and x.response['err']['code'] == 'E_STALE' and
+          len(ports[0].lines_out) == sent + 1,
           f'a stale unmount: {x!r}')
     check(c.request('status').result['mounted'] is True, 'a stale unmount unmounted')
     x = c.request('unmount', {'expect_mount_seq': st['mount_seq']})
@@ -242,7 +243,7 @@ def main():
                   f"{op} while mounted: {resp['outcome']} {resp.get('err')}")
         elif op in tier_r or op in tier_s:
             check(resp['outcome'] == 'DONE', f"{op}: {resp['outcome']} {resp.get('err')}")
-            if op in ctl.RESULT_SCHEMA:
+            if op in ctl.RESULT_SCHEMA and resp['outcome'] == 'DONE':
                 check(ctl.check(resp['result'], ctl.RESULT_SCHEMA[op], 'result') is None,
                       f"{op}: {ctl.check(resp['result'], ctl.RESULT_SCHEMA[op], 'result')}")
         else:
