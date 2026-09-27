@@ -1652,7 +1652,7 @@ static void check_trip_record(uint8_t op, uint8_t rule, const char *rule_text) {
     snprintf(op_text, sizeof op_text, "Refused: command %02Xh", op);
     snprintf(seq_text, sizeof seq_text, "Command log: entry %lu ", (unsigned long)t.log_seq);
     CHECK(has("ATAboy STOPPED by the tripwire") && has(op_text) && has("It was NOT sent") && has(rule_text) && has(seq_text),
-          "the screen does not name opcode, rule and log entry:\n%s", tty.c_str());
+          "the screen does not name opcode, rule and log entry (%zu bytes on the console)", tty.size());
     fault_rec.magic = 0;
 }
 #endif
@@ -1929,7 +1929,7 @@ static void q7_core1_done() {
     for (size_t at = tty.find("ATAboy STOPPED by the tripwire"); at != std::string::npos;
          at = tty.find("ATAboy STOPPED by the tripwire", at + 1)) shown++;
     CHECK(has("Refused: command ECh (IDENTIFY DEVICE)") && has("Rule: no IDENTIFY after a Ctrl+G") && has(seq_text) &&
-          shown >= 2, "the record not on the console (drawn %zu times):\n%s", shown, tty.c_str());
+          shown >= 2, "the record not on the console (drawn %zu times, %zu bytes)", shown, tty.size());
     CHECK(sim.cmd_log.size() == q7_cmds0 && sim.reg_writes == q7_writes0 && sim.hw_resets == q7_resets0 && saves == 0,
           "the drive was sent %zu commands, %d register writes, %d resets after the trip; %d saves",
           sim.cmd_log.size() - q7_cmds0, sim.reg_writes - q7_writes0, sim.hw_resets - q7_resets0, saves);

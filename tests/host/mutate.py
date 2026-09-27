@@ -1380,7 +1380,8 @@ def run_tests(srcdir, outdir):
     env = dict(os.environ, OUT=outdir)
     try:
         return subprocess.run(['sh', os.path.join(HERE, 'run.sh'), srcdir], env=env,
-                              capture_output=True, text=True, timeout=900)
+                              capture_output=True, text=True, timeout=900,
+                              encoding='utf-8', errors='replace')   # the TUI's box characters are UTF-8
     except subprocess.TimeoutExpired:
         return None
 
