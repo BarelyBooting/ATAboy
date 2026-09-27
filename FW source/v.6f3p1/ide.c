@@ -195,6 +195,36 @@ void __not_in_flash_func(ide_fault_release_bus)(void) {
     for (unsigned pin = 0; pin < 16; pin++) pin_to_sio(pin);
 }
 
+// ---------------------------------------------------------------------------
+//  The tripwire (owner decision 2026-09-26, API question Q7; ide.h)
+// ---------------------------------------------------------------------------
+// ide_write_reg() calls this for ECh and 91h only, before anything of that
+// write reaches the bus. The rules are read here, from the flags themselves,
+// not from a copy that could fall out of step with them.
+extern volatile bool is_mounted;                        // ATAboy.c
+static ide_trip_t trip;
+
+bool ide_tripped(void) { return trip.tripped; }
+void ide_trip_record(ide_trip_t *out) { *out = trip; }
+
+// Not inlined: ide_write_reg stays as it was in SCRATCH_X apart from the one
+// compare, with this cold path in ordinary RAM.
+static void __attribute__((noinline)) __not_in_flash_func(cmd_tripwire)(uint8_t op) {
+    uint8_t rule = (op == 0xEC) ? (mchs_no_identify ? IDE_TRIP_NO_IDENTIFY : 0)
+                                : (native_declared ? IDE_TRIP_NO_91H : 0);
+    if (!rule) return;                                  // allowed: it goes out as before
+    ide_fault_release_bus();                            // first: nothing more reaches the drive
+    is_mounted = false;                                 // USB refuses every drive command from here on
+    trip.opcode = op;
+    trip.rule = rule;
+    trip.core = (uint8_t)get_core_num();
+    trip.log_seq = obs_refused(op);                     // READ BUFFER 4Ch still answers
+    ide_fault_record(trip.core, 0, 0, IDE_FAULT_TRIPWIRE | op);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);            // the record before the flag core 1 looks at
+    trip.tripped = true;
+    ide_trip_stop();
+}
+
 // IDENTIFY word 22 for READ LONG (0.6f3p9, ide.h), in every build. Set only
 // by the firmware's own IDENTIFY (ide_identify: detection, auto-mount, the
 // debug screen), on core 1 while nothing is mounted; cleared by a probe, a
@@ -293,6 +323,9 @@ static void __scratch_x("ide_bus") xcvr_write(void) {
 // ---------------------------------------------------------------------------
 
 void __scratch_x("ide_bus") ide_write_reg(uint8_t reg, uint8_t val) {
+    // Q7, the tripwire (above): one compare per command, before anything of
+    // it goes out. The product is 0 for ECh and for 91h and nothing else.
+    if (reg == 7 && (val - 0xEC) * (val - 0x91) == 0) cmd_tripwire(val);
     if (reg == 7) sentinel_armed = false;   // a command: the registers are the drive's now
     // F1 stage 1: logged before it goes out (obs.h). Every command register
     // write in the firmware comes through here.

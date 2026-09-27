@@ -135,6 +135,21 @@ void obs_tf_write(uint8_t reg, uint8_t val) {
     tf_written |= (uint16_t)(1u << i);
 }
 
+// The tripwire (ide.h): a command that was NOT written. Its task file as
+// written for it, then the entry is closed at once (failed, final). Not a
+// bus event: nothing reached the drive, so the current command is left as
+// it was.
+uint32_t obs_refused(uint8_t opcode) {
+    uint32_t seq;
+    obs_log_entry_t *e = log_claim(&seq, OBS_EV_REFUSED, opcode);
+    memcpy(e->tf, tf_shadow, sizeof e->tf);
+    memcpy(e->hob, hob_shadow, sizeof e->hob);
+    e->bits |= tf_written | OBS_B_FINISHED | OBS_B_FROZEN;
+    e->outcome = OBS_OUT_FAILED;
+    log_publish(e, seq);
+    return seq;
+}
+
 uint32_t obs_cmd(uint8_t opcode) {
     uint32_t seq;
     obs_log_entry_t *e = log_claim(&seq, OBS_EV_CMD, opcode);

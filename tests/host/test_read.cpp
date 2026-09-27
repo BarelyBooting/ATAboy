@@ -50,6 +50,19 @@ static std::string current;
     std::printf("FAIL [%s] %s:%d: %s -- ", current.c_str(), __FILE__, __LINE__, #cond); \
     std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
 
+// Q7: the tripwire's stop (ATAboy.c in the firmware, where it never
+// returns). Here it throws to the test that expected it; anywhere else it
+// fails the run, so every test here is also a test that it does not fire.
+struct TripStop {};
+static bool trip_expected = false;
+void ide_trip_stop(void) {
+    if (!trip_expected) {
+        std::printf("FAIL [%s]: the tripwire fired where nothing should trip it\n", current.c_str());
+        std::exit(251);
+    }
+    throw TripStop{};
+}
+
 // The fixed margin over the budget that ide.h allows: the 52 ms of a RESET-
 // pulse started near the end, polls in flight, and register reads.
 static const uint64_t HOST_MARGIN_MS = 100;
@@ -243,6 +256,9 @@ static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
     chs_geometry_lost = false;
     manual_chs_active = false;
     native_geo.on = false; idp_written = false; mchs_no_identify = false;   // 0.6f3p10: power-up
+#ifdef IDE_FAULT_TRIPWIRE
+    memset(&trip, 0, sizeof trip);                  // Q7: not tripped
+#endif
 #ifdef IDE_SENTINEL_SC
     memset(&self_resets, 0, sizeof self_resets); sentinel_armed = false; sentinel_proven = 0;
 #endif
@@ -4480,6 +4496,51 @@ static void test_obs_cursor() {
     CHECK(!gap && hs.size() == 40 && hs.front().seq == 0x00FFFFFAu, "hashes across the wrap: %zu", hs.size());
 }
 
+// Q7 (owner decision 2026-09-26): after the tripwire has stopped a command
+// (test_manual_chs has the trip itself), USB hands the drive nothing more:
+// READ(10), WRITE(10) and pass-through are refused with nothing on the bus,
+// not even a status read. READ BUFFER 4Ch still answers, and the refused
+// command is its last entry, as refused, never as a command.
+static void test_q7_usb_after_trip() {
+    setup("Q7: USB after the tripwire", LBA);
+    config.drive_write_protected = false;
+    uint32_t from = log_next;                       // obs.c: the next entry's seq
+    uint16_t id[256];
+    (void)ide_identify(id);                         // an ECh that went out, before the rule
+    mchs_no_identify = true;                        // as after a Ctrl+G
+    size_t n0 = sim.cmd_log.size();
+    bool stopped = false;
+    trip_expected = true;
+    try { ide_write_reg(7, 0xEC); } catch (TripStop &) { stopped = true; }
+    trip_expected = false;
+    int w0 = sim.reg_writes, c0 = sim.commands;
+    f2_reads = 0;
+    sim_on_read = [] { f2_reads++; };
+    HostRead h = host_read10(100, 8);
+    std::vector<uint8_t> w = fill512(1, 3);
+    int32_t wr = host_write10(MW, w.data(), 1);
+    bool sat_refused = true;
+#if ATABOY_SAT
+    SatResult s = sat_cmd(pt12(4, 0x0E, 0, 1, 0, 0xA0, 0xEC), 512, true);
+    sat_refused = !s.ok();
+#endif
+    sim_on_read = nullptr;
+    CHECK(stopped && !h.ok && wr < 0 && sat_refused && sim.cmd_log.size() == n0 && sim.reg_writes == w0 &&
+          sim.commands == c0 && f2_reads == 0, "stopped %d; read %d, write %d, pass-through refused %d; %d writes, %d reads",
+          stopped, h.ok, (int)wr, sat_refused, sim.reg_writes - w0, f2_reads);
+#ifdef IDE_FAULT_TRIPWIRE
+    bool gap = false;
+    std::vector<obs_log_entry_t> log = obs_log_all(from, &gap);
+    int ec_cmds = 0;
+    for (auto &e : log) if (e.kind == OBS_EV_CMD && e.value == 0xEC) ec_cmds++;
+    CHECK(!gap && !log.empty() && log.back().kind == OBS_EV_REFUSED && log.back().value == 0xEC && ec_cmds == 1,
+          "gap %d, last entry kind %u value %02X, ECh commands %d", gap, log.empty() ? 0 : log.back().kind,
+          log.empty() ? 0 : log.back().value, ec_cmds);
+#else
+    (void)from;
+#endif
+}
+
 // Who wrote an entry: inside a host command or not, core 0 or core 1; and the
 // markers never become the "current" command.
 static void test_obs_flags() {
@@ -4796,6 +4857,7 @@ int main() {
     test_obs_selftest();
     test_obs_cursor();
     test_obs_flags();
+    test_q7_usb_after_trip();
     test_obs_cost();
     // F1 stage 2: Pipelined Reads
     test_pipe_reads_ahead();

@@ -35,6 +35,9 @@
 #define OBS_EV_MOUNT    4   // the drive was mounted (value: OBS_MNT_*)
 #define OBS_EV_UNMOUNT  5   // the drive was unmounted (value: OBS_UNM_*)
 #define OBS_EV_BOOT     6   // the log began (power-up or reset of the ATAboy)
+// 7 is kept for the API's own entries (palimpsest api/SPEC-v1.md, OBS_EV_API).
+#define OBS_EV_REFUSED  8   // the tripwire refused a command: NOT sent (value: the opcode;
+                            // tf: the task file as written for it). Always the last entry.
 
 // Where a RESET- pulse came from.
 #define OBS_RST_RESET_DRIVE 1   // ide_reset_drive: Debug R, auto-mount at boot
@@ -121,6 +124,7 @@ void     obs_set_read_ahead(bool on);           // usb.c: a pipelined read ahead
 // Bus events (ide.c). Only the core using the bus calls these.
 void     obs_tf_write(uint8_t reg, uint8_t val);    // registers 1 to 6
 uint32_t obs_cmd(uint8_t opcode);                   // returns the entry's seq
+uint32_t obs_refused(uint8_t opcode);               // the tripwire (ide.h); returns the entry's seq
 void     obs_ctrl(uint8_t val);
 void     obs_reset(uint8_t where);
 void     obs_status(uint8_t st);                    // a Status read (register 7)

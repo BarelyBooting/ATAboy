@@ -667,9 +667,9 @@ MUTANTS = [
     # (menus.c, bus_free_wait; test_p10_n1_unmount_during_recovery), so
     # nothing changes it from outside either. The line's condition is never
     # true where it stands, and without it ide_set_geometry's own zero check
-    # would refuse with nothing sent anyway. Shown for ab81985 by
-    # D:\Development\ATAboy-chs-builds\p10-<this round>\m1-equivalence
-    # (every state of chs_geometry_ok's inputs, the same transcript with and
+    # would refuse with nothing sent anyway. Shown for ab81985 and for the
+    # head of the round that removed it, in m1-equivalence\ in that round's
+    # D:\Development\ATAboy-chs-builds\p10-<head> folder (every state of chs_geometry_ok's inputs, the same transcript with and
     # without the line, and the line's condition true 0 times in the whole
     # suite). Replaced by the mutant below, which removes what now does the
     # job: the zero terms of the holistic M-1 line.
@@ -1325,6 +1325,44 @@ MUTANTS = [
      '            else if (k == KEY_DOWN && config.feat_selected < 5) config.feat_selected++;', '            else if (k == KEY_DOWN && config.feat_selected < 4) config.feat_selected++;'),
     ('F2: read ahead blocks not flagged', 'obs.c',
      '    e->flags = (uint8_t)(flags | (read_ahead ? OBS_H_PREFETCH : 0));', '    e->flags = flags;'),
+    # --- owner decision 2026-09-26, Q7: the tripwire in ide_write_reg (ide.h) ---
+    ('Q7: tripwire compare removed', 'ide.c',
+     '    if (reg == 7 && (val - 0xEC) * (val - 0x91) == 0) cmd_tripwire(val);\n', ''),
+    ('Q7: wrong opcode (EDh for ECh)', 'ide.c',
+     '    if (reg == 7 && (val - 0xEC) * (val - 0x91) == 0) cmd_tripwire(val);',
+     '    if (reg == 7 && (val - 0xED) * (val - 0x91) == 0) cmd_tripwire(val);'),
+    ('Q7: wrong opcode (90h for 91h)', 'ide.c',
+     '    if (reg == 7 && (val - 0xEC) * (val - 0x91) == 0) cmd_tripwire(val);',
+     '    if (reg == 7 && (val - 0xEC) * (val - 0x90) == 0) cmd_tripwire(val);'),
+    ('Q7: ECh judged by the 91h rule', 'ide.c',
+     '    uint8_t rule = (op == 0xEC) ? (mchs_no_identify', '    uint8_t rule = (op == 0x91) ? (mchs_no_identify'),
+    ('Q7: fires whatever the rules (a normal drive stopped)', 'ide.c',
+     '    if (!rule) return;                                  // allowed: it goes out as before',
+     '    if (!rule) rule = IDE_TRIP_NO_IDENTIFY;'),
+    ('Q7: fires but does not stop', 'ide.c',
+     '    trip.tripped = true;\n    ide_trip_stop();\n', '    trip.tripped = true;\n'),
+    ('Q7: stops without releasing the bus', 'ide.c',
+     '    ide_fault_release_bus();                            // first: nothing more reaches the drive\n', ''),
+    ('Q7: USB still hands the drive commands after a trip', 'ide.c',
+     '    is_mounted = false;                                 // USB refuses every drive command from here on\n', ''),
+    ('Q7: fires but emits no record (opcode and rule)', 'ide.c',
+     '    trip.opcode = op;\n    trip.rule = rule;\n', ''),
+    ('Q7: fires but emits no record (not flagged for core 1)', 'ide.c',
+     '    trip.tripped = true;\n    ide_trip_stop();\n', '    ide_trip_stop();\n'),
+    ('Q7: not in the command log', 'ide.c',
+     '    trip.log_seq = obs_refused(op);', '    trip.log_seq = 0;'),
+    ('Q7: the command log calls it a command', 'obs.c',
+     '    obs_log_entry_t *e = log_claim(&seq, OBS_EV_REFUSED, opcode);', '    obs_log_entry_t *e = log_claim(&seq, OBS_EV_CMD, opcode);'),
+    ('Q7: no fault record', 'ide.c',
+     '    ide_fault_record(trip.core, 0, 0, IDE_FAULT_TRIPWIRE | op);\n', ''),
+    ('Q7: the screen does not name the rule', 'menus.c',
+     '    cdc_printf("Rule: %s\\r\\n",', '    if (0) cdc_printf("Rule: %s\\r\\n",'),
+    ('Q7: the screen does not give the log entry', 'menus.c',
+     '    cdc_printf("Command log: entry %lu (READ BUFFER 4Ch still answers)\\r\\n", (unsigned long)t.log_seq);\n', ''),
+    ('Q7: core 1 does not show a trip from core 0', 'menus.c',
+     '        if (ide_tripped()) trip_screen_forever();\n', ''),
+    ('Q7: the screen is drawn once only', 'menus.c',
+     '        while (queue_try_remove(&cdc_rx_queue, &c)) shown = false;', '        while (queue_try_remove(&cdc_rx_queue, &c)) (void)0;'),
 ]
 
 
@@ -1333,8 +1371,9 @@ MUTANTS = [
 # twice each (with and without the SMART opt-in). This list said two programs
 # while run.sh ran three from 0a6cb06 on; a surviving mutant would then have
 # been reported as "not run" instead of SURVIVED (fixed in 0.6f3p7).
+# test_manual_chs twice: its own run, then "q7-core1" (Q7, core 1's loop).
 PROGRAMS = ['test_read', 'test_read_pipelined', 'transcripts', 'test_read_shipping', 'test_fwupdate', 'test_fwupdate_smart', 'test_manual_chs',
-            'test_usb_desc', 'test_pio_timing']
+            'test_manual_chs', 'test_usb_desc', 'test_pio_timing']
 
 
 def run_tests(srcdir, outdir):

@@ -69,6 +69,10 @@ bool core1_stack_intact(void) { return true; }
 uint32_t ide_unwitnessed_blocks(void) { return 0; }
 void fault_stop(uint32_t) { abort(); }
 #endif
+#ifdef IDE_FAULT_TRIPWIRE
+bool ide_tripped(void) { return false; }                    // Q7: never tripped here
+void ide_trip_record(ide_trip_t *out) { memset(out, 0, sizeof *out); }
+#endif
 #ifdef IDE_FAIL_SELF_RESET
 void ide_self_resets(ide_self_resets_t *o) { memset(o, 0, sizeof *o); }
 #endif

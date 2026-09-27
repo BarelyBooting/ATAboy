@@ -66,6 +66,9 @@ ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indenta
     -I "$here/mock" -I "$here" -I "$src" \
     -o "$out/test_manual_chs" "$here/test_manual_chs.cpp"
 "$out/test_manual_chs"
+# Q7: core 1's main loop after a trip on core 0, as its own run (the loop
+# never returns; see test_q7_core1_loop).
+"$out/test_manual_chs" q7-core1
 # The USB serial number is the board's own (0.6f3p9): usb_descriptors.c with
 # a stand-in board id (see test_usb_desc.cpp).
 ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function $defs \

@@ -86,6 +86,19 @@ bool usb_msc_ide_busy(void) {
     printf("FAIL [%s] %s:%d: %s -- ", current, __FILE__, __LINE__, #cond); \
     printf(__VA_ARGS__); printf("\n"); } } while (0)
 static const char *current = "";
+// Q7: the tripwire's stop (ATAboy.c in the firmware, where it never
+// returns). Here it notes the bus as it is when the stop is reached and
+// throws to the test that expected it; anywhere else it fails the run, so
+// every other test here is also a test that the tripwire does not fire.
+struct TripStop {};
+static bool trip_expected = false;
+static uint32_t trip_out_at_stop, trip_oe_at_stop;
+static bool trip_pio_at_stop;
+void ide_trip_stop(void) {
+    if (!trip_expected) { printf("FAIL [%s]: the tripwire fired where nothing should trip it\n", current); exit(251); }
+    trip_out_at_stop = mock_gpio_out; trip_oe_at_stop = mock_gpio_oe; trip_pio_at_stop = mock_pio_stopped;
+    throw TripStop{};
+}
 
 static uint64_t now_us() { return mock_now_ns / 1000; }
 
@@ -124,6 +137,10 @@ static void fresh(const char *name) {
 #ifdef IDE_SENTINEL_SC
     memset(&self_resets, 0, sizeof self_resets); sentinel_armed = false; sentinel_proven = 0;
 #endif
+#endif
+#ifdef IDE_FAULT_TRIPWIRE
+    memset(&trip, 0, sizeof trip);                  // Q7: not tripped
+    mock_pio_stopped = false;
 #endif
     sim_on_read = nullptr;
     saves = 0; busy_until_ns = 0; pend_at_ns = 0;
@@ -1587,6 +1604,146 @@ static int sim_count_since(size_t from, uint8_t c) {
     return n;
 }
 
+// ---- Q7: the tripwire (owner decision 2026-09-26) ------------------------------
+// ide_write_reg() will not strobe ECh while the no-IDENTIFY rule is set, or
+// 91h in the power-up default mode. Every guard above it is bypassed here:
+// the command register is written directly, or through ide.c's pass-through
+// entry with sat.c's policy left out. The drive must see no command, the
+// bus must be released when the stop is reached, USB must stop handing the
+// drive anything, and the record must be on the console, in the command log
+// and in the fault record. Built against code without the tripwire (the red
+// run), only the first checks of each part compile.
+template <class F> static bool trip_attempt(F f) {
+    trip_expected = true;
+    bool stopped = false;
+    try { f(); } catch (TripStop &) { stopped = true; }
+    trip_expected = false;
+    return stopped;
+}
+// The bus as a stalled command would leave it, so only the release can put
+// it right before the stop. CS1- stays high: with both chip selects low the
+// simulator would take no register write at all, and a command that got
+// past the tripwire would not be seen.
+static void bus_driven() { mock_pio_stopped = false; mock_gpio_out = 1u << IDE_CS1; mock_gpio_oe = 0xFFFFFFFFu; }
+#ifdef IDE_FAULT_TRIPWIRE
+static bool released_at_stop() {
+    uint32_t high = (1u << IDE_OE) | (1u << IDE_OE1) | (1u << IDE_CS0) | (1u << IDE_CS1) | (1u << IDE_RESET) |
+                    (1u << IDE_DIOR) | (1u << IDE_DIOW);
+    return trip_pio_at_stop && (trip_out_at_stop & high) == high && (trip_oe_at_stop & high) == high &&
+           !(trip_out_at_stop & ((1u << IDE_DIR) | (1u << IDE_DIR1))) && !(trip_oe_at_stop & 0xFFFFu);
+}
+// Everything the trip leaves behind, for one refused opcode and rule.
+static void check_trip_record(uint8_t op, uint8_t rule, const char *rule_text) {
+    CHECK(released_at_stop(), "bus at the stop: out %08X oe %08X pio stopped %d", (unsigned)trip_out_at_stop,
+          (unsigned)trip_oe_at_stop, trip_pio_at_stop);
+    CHECK(!is_mounted, "USB still hands the drive commands");
+    ide_trip_t t; ide_trip_record(&t);
+    CHECK(ide_tripped() && t.opcode == op && t.rule == rule && t.core == 0 && t.log_seq != 0,
+          "record: tripped %d op %02X rule %u core %u seq %lu", ide_tripped(), t.opcode, t.rule, t.core, (unsigned long)t.log_seq);
+    const obs_log_entry_t &e = log_ring[t.log_seq % OBS_LOG_ENTRIES];
+    CHECK(e.seq == t.log_seq && e.kind == OBS_EV_REFUSED && e.value == op && e.outcome == OBS_OUT_FAILED &&
+          obs_current_cmd() != t.log_seq, "log entry %lu: kind %u value %02X outcome %02X", (unsigned long)e.seq, e.kind,
+          e.value, e.outcome);
+    ide_fault_t fr;
+    CHECK(ide_fault_last(&fr) && fr.cfsr == (IDE_FAULT_TRIPWIRE | op), "fault record cfsr %08lX", (unsigned long)fr.cfsr);
+    tty.clear();
+    trip_screen_draw();
+    char op_text[40], seq_text[48];
+    snprintf(op_text, sizeof op_text, "Refused: command %02Xh", op);
+    snprintf(seq_text, sizeof seq_text, "Command log: entry %lu ", (unsigned long)t.log_seq);
+    CHECK(has("ATAboy STOPPED by the tripwire") && has(op_text) && has("It was NOT sent") && has(rule_text) && has(seq_text),
+          "the screen does not name opcode, rule and log entry:\n%s", tty.c_str());
+    fault_rec.magic = 0;
+}
+#endif
+static void test_q7_tripwire() {
+    // ECh after a Ctrl+G (91h mode, accepted), straight to the command register.
+    fresh("Q7: ECh after a Ctrl+G, written directly");
+    ctrl_g();
+    is_mounted = true;
+    CHECK(ide_mchs_no_identify() && sim.cmd_log == (std::vector<uint8_t>{ 0x10, 0x91 }), "Ctrl+G did not set up the drive");
+    size_t n0 = sim.cmd_log.size();
+    int w0 = sim.reg_writes;
+    bus_driven();
+    bool stopped = trip_attempt([] { ide_write_reg(7, 0xEC); });
+    CHECK(stopped && sim.cmd_log.size() == n0 && sim.reg_writes == w0 && no_identify(),
+          "stopped %d, %zu commands and %d register writes reached the drive", stopped, sim.cmd_log.size() - n0,
+          sim.reg_writes - w0);
+#ifdef IDE_FAULT_TRIPWIRE
+    check_trip_record(0xEC, IDE_TRIP_NO_IDENTIFY, "Rule: no IDENTIFY after a Ctrl+G");
+#endif
+
+    // The same through ide.c's pass-through entry, as a broken SAT gate would
+    // send it (F-1's refusal left out). The task file goes out; ECh does not.
+#if ATABOY_SAT
+    fresh("Q7: pass-through IDENTIFY after a Ctrl+G, sat.c's policy left out");
+    ctrl_g();
+    is_mounted = true;
+    n0 = sim.cmd_log.size();
+    sat_taskfile_t tf{};
+    tf.command = 0xEC; tf.protocol = SAT_PROTO_PIO_IN; tf.sectors = 1; tf.count = 1;
+    static uint8_t sbuf[512];
+    ide_sat_regs_t regs{};
+    stopped = trip_attempt([&] {
+        ide_host_cmd_begin(); ide_host_cmd_enter();
+        (void)ide_sat_pio_in(&tf, sbuf, &regs);
+        ide_host_cmd_leave();
+    });
+    if (stopped) ide_host_cmd_leave();              // the firmware never comes back to it; the tests go on
+    CHECK(stopped && sim.cmd_log.size() == n0 && no_identify(), "stopped %d, commands %zu", stopped, sim.cmd_log.size() - n0);
+#ifdef IDE_FAULT_TRIPWIRE
+    check_trip_record(0xEC, IDE_TRIP_NO_IDENTIFY, "Rule: no IDENTIFY after a Ctrl+G");
+#endif
+#endif
+
+    // 91h in the power-up default mode, straight to the command register
+    // (ide_set_geometry refuses it above: test_p10_layers).
+    native_drive("Q7: 91h in the power-up default mode, written directly");
+    ctrl_g_native();
+    is_mounted = true;
+    CHECK(ide_native_drive() && idp_sent() == 0, "not a native Ctrl+G");
+    n0 = sim.cmd_log.size();
+    w0 = sim.reg_writes;
+    bus_driven();
+    stopped = trip_attempt([] { ide_write_reg(7, 0x91); });
+    CHECK(stopped && sim.cmd_log.size() == n0 && sim.reg_writes == w0 && idp_sent() == 0, "stopped %d, 91h sent %d",
+          stopped, idp_sent());
+#ifdef IDE_FAULT_TRIPWIRE
+    check_trip_record(0x91, IDE_TRIP_NO_91H, "Rule: no 91h in Ctrl+G's power-up default mode");
+#endif
+    // ...and ECh there too, under its own rule.
+    native_drive("Q7: ECh in the power-up default mode, written directly");
+    ctrl_g_native();
+    is_mounted = true;
+    n0 = sim.cmd_log.size();
+    bus_driven();
+    stopped = trip_attempt([] { ide_write_reg(7, 0xEC); });
+    CHECK(stopped && sim.cmd_log.size() == n0 && no_identify(), "stopped %d", stopped);
+#ifdef IDE_FAULT_TRIPWIRE
+    check_trip_record(0xEC, IDE_TRIP_NO_IDENTIFY, "Rule: no IDENTIFY after a Ctrl+G");
+#endif
+
+    // Where it must not fire (ide_trip_stop fails the run if it does): a
+    // normal drive's Auto Detect (ECh), a CHS geometry (91h) and reads; and
+    // 91h to a drive set up by Ctrl+G's 91h mode, whose rule is only ECh.
+    fresh("Q7: a normal drive: Auto Detect, 91h and reads");
+    sim.identify_ok = true;
+    keys("\r");
+    run_auto_detect();
+    int ids = sim.id_commands();
+    config.use_lba_mode = false; config.cyls = C; config.heads = H; config.spt = S;
+    bool geo = ide_set_geometry(H, S);
+    CHECK(ids >= 1 && geo && idp_sent() == 1 && read_right(1234) && read_right(5000), "IDENTIFY %d, 91h %d", ids, idp_sent());
+    fresh("Q7: 91h again after a 91h-mode Ctrl+G");
+    ctrl_g();
+    bool g2 = ide_set_geometry(H, S);
+    bool r77 = read_right(77);
+    CHECK(g2 && idp_sent() == 2 && r77, "91h %d, accepted %d, read %d", idp_sent(), g2, r77);
+#ifdef IDE_FAULT_TRIPWIRE
+    CHECK(!ide_tripped(), "tripped where nothing should trip it");
+#endif
+}
+
 static void test_obs_proof() {
     // Native mode through everything that resets the drive: the log proves
     // no ECh and no 91h, and the drive agrees.
@@ -1647,7 +1804,12 @@ static void test_obs_proof() {
     log_mount(OBS_EV_MOUNT, OBS_MNT_MENU);
     is_mounted = true;
     read_right(1234);
+    // Since Q7 the tripwire stops a 91h here (test_q7_tripwire). The log is
+    // checked on its own: the planted 91h goes out as if the tripwire's
+    // flag had been lost, and the log must still show it.
+    native_declared = false;
     ide_write_reg(6, 0xA0 | (NH - 1)); ide_write_reg(2, NS); ide_write_reg(7, 0x91);   // no firmware path does this
+    native_declared = true;
     mock_now_ns += 10000000;
     p = proof_since_mount();
     CHECK(p.complete && p.idp == 1, "planted 91h: log %d", p.idp);
@@ -1751,8 +1913,51 @@ static void test_iordy_note() {
     is_mounted = false;
 }
 
-int main() {
+// ---- Q7: core 1's loop after a trip on core 0 (its own run) --------------------
+#ifdef IDE_FAULT_TRIPWIRE
+// run.sh runs this program a second time with "q7-core1", since the main
+// loop never returns. Core 0 has tripped inside a USB command; core 1's loop
+// must put the record on the console at its next pass and stay there,
+// drawing it again for a key, and sending the drive nothing whatever keys
+// come (Ctrl+G, Unmount, F10, Debug).
+static size_t q7_cmds0; static int q7_writes0, q7_resets0;
+static uint32_t q7_seq;
+static void q7_core1_done() {
+    char seq_text[48];
+    snprintf(seq_text, sizeof seq_text, "Command log: entry %lu ", (unsigned long)q7_seq);
+    size_t shown = 0;
+    for (size_t at = tty.find("ATAboy STOPPED by the tripwire"); at != std::string::npos;
+         at = tty.find("ATAboy STOPPED by the tripwire", at + 1)) shown++;
+    CHECK(has("Refused: command ECh (IDENTIFY DEVICE)") && has("Rule: no IDENTIFY after a Ctrl+G") && has(seq_text) &&
+          shown >= 2, "the record not on the console (drawn %zu times):\n%s", shown, tty.c_str());
+    CHECK(sim.cmd_log.size() == q7_cmds0 && sim.reg_writes == q7_writes0 && sim.hw_resets == q7_resets0 && saves == 0,
+          "the drive was sent %zu commands, %d register writes, %d resets after the trip; %d saves",
+          sim.cmd_log.size() - q7_cmds0, sim.reg_writes - q7_writes0, sim.hw_resets - q7_resets0, saves);
+    printf("%d checks, %d failed\n", checks, failures);
+    exit(failures > 255 ? 255 : failures);
+}
+static void test_q7_core1_loop() {
+    fresh("Q7: core 1 shows a trip from core 0 and stays there");
+    ctrl_g();
+    is_mounted = true;
+    bool stopped = trip_attempt([] { ide_write_reg(7, 0xEC); });    // as core 0, inside a USB command
+    ide_trip_t t; ide_trip_record(&t);
+    q7_seq = t.log_seq;
+    CHECK(stopped && ide_tripped(), "no trip to show");
+    q7_cmds0 = sim.cmd_log.size(); q7_writes0 = sim.reg_writes; q7_resets0 = sim.hw_resets;
+    tty.clear();
+    keys("\x07" "1045\r2\r40\ry" "u" "y" "\x1b[21~" "y" "d" "i", 500);
+    idle_after_ns = mock_now_ns + 5000000000ull;
+    on_idle = q7_core1_done;
+    core1_entry();
+}
+#else
+static void test_q7_core1_loop() { printf("FAIL: no tripwire in this source\n1 checks, 1 failed\n"); exit(1); }
+#endif
+
+int main(int argc, char **argv) {
     ide_hw_init();                                  // the bus idle, as at power-up
+    if (argc > 1 && strcmp(argv[1], "q7-core1") == 0) test_q7_core1_loop();    // does not return
     test_power_up();                                // first: the state as the program starts
     test_decisions();
     test_accepted();
@@ -1794,6 +1999,7 @@ int main() {
 #ifdef IDE_FAULT_MAGIC
     test_holistic_menus();
 #endif
+    test_q7_tripwire();                             // owner decision 2026-09-26, Q7
     test_obs_proof();                               // F1 stage 1
     test_core1();                                   // does not return
     printf("%d checks, %d failed\n", checks, failures);

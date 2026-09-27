@@ -148,6 +148,37 @@ void    ide_fault_release_bus(void);
 // The record from before this boot, if any (Debug E).
 bool    ide_fault_last(ide_fault_t *out);
 
+// Owner decision 2026-09-26 (API question Q7): the tripwire. ide_write_reg()
+// will not strobe ECh (IDENTIFY) into the command register while the
+// no-IDENTIFY rule is set (any Ctrl+G since the ATAboy started), nor 91h
+// while Ctrl+G's power-up default mode is declared (native_declared). It is
+// the last layer behind the guards that refuse these above it, so it only
+// fires if one of them failed. When it fires, in this order: the bus is
+// released (ide_fault_release_bus), USB stops handing the drive anything
+// (is_mounted false: every read, write and pass-through is refused, READ
+// BUFFER still answers), the refusal goes into the command log (OBS_EV_REFUSED,
+// never sent) and into the fault record (cfsr IDE_FAULT_TRIPWIRE | opcode,
+// kept over a warm reset for Debug E), the record below is set, and
+// ide_trip_stop() is called, which never returns. The command is never
+// written, and nothing is written to the drive after it.
+#define IDE_FAULT_TRIPWIRE 0xEC9100u    // cfsr: this | the refused opcode
+#define IDE_TRIP_NO_IDENTIFY 1          // ECh with the no-IDENTIFY rule set (mchs_no_identify)
+#define IDE_TRIP_NO_91H      2          // 91h in the power-up default mode (native_declared)
+typedef struct {
+    bool     tripped;
+    uint8_t  opcode;        // ECh or 91h
+    uint8_t  rule;          // IDE_TRIP_*
+    uint8_t  core;          // the core that tried to send it
+    uint32_t log_seq;       // its OBS_EV_REFUSED entry in the command log
+} ide_trip_t;
+bool    ide_tripped(void);
+void    ide_trip_record(ide_trip_t *out);
+// The firmware's (ATAboy.c; the host tests have their own): never returns.
+// On core 1 it shows the record on the console and stays there; on core 0
+// (inside a USB callback) it goes back to core 0's main loop, which keeps
+// USB and the console going while core 1 shows the record.
+void    ide_trip_stop(void) __attribute__((noreturn));
+
 // Holistic review L-3: the 48-bit capacity from IDENTIFY words 100 to 103,
 // or 0 unless word 83 says the drive has the 48-bit feature set (bit 10)
 // with a valid word (bits 15:14 = 01b). A drive older than ATA-6 may have

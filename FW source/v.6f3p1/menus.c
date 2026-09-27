@@ -1511,6 +1511,44 @@ static bool save_setup(void) {
 
 
 // ---------------------------------------------------------------------------
+//  The tripwire's screen (owner decision 2026-09-26, Q7; ide.h)
+// ---------------------------------------------------------------------------
+// What stopped, named so it can be read off the console before anyone
+// unplugs the ATAboy (which is the only way out, and loses it). Nothing
+// here touches the bus.
+static void trip_screen_draw(void) {
+    ide_trip_t t;
+    ide_trip_record(&t);
+    cdc_puts(RESET CLR_SCR "\033[1;1H" FG_RED "\033[1m");
+    cdc_puts("ATAboy STOPPED by the tripwire (owner decision Q7)\r\n\r\n" RESET);
+    cdc_printf("Refused: command %02Xh (%s), from core %u. It was NOT sent.\r\n", t.opcode,
+               t.opcode == 0xEC ? "IDENTIFY DEVICE" : t.opcode == 0x91 ? "INITIALIZE DEVICE PARAMETERS" : "?",
+               (unsigned)t.core);
+    cdc_printf("Rule: %s\r\n",
+               t.rule == IDE_TRIP_NO_IDENTIFY ? "no IDENTIFY after a Ctrl+G (any, since the ATAboy started)" :
+               t.rule == IDE_TRIP_NO_91H ? "no 91h in Ctrl+G's power-up default mode" : "?");
+    cdc_printf("Command log: entry %lu (READ BUFFER 4Ch still answers)\r\n", (unsigned long)t.log_seq);
+    cdc_puts("\r\nThe bus is released and nothing more goes to the drive. USB answers\r\n"
+             "NOT READY. Write this screen down, then unplug the ATAboy to recover.\r\n");
+}
+
+// Core 1, for good: the screen above, drawn again when a terminal connects
+// or any key is pressed. Keys do nothing else. Called by ide_trip_stop() on
+// core 1, and by the menu loop when core 0 was the one that tripped.
+void trip_screen_forever(void) __attribute__((noreturn));
+void trip_screen_forever(void) {
+    bool shown = false;
+    for (;;) {
+        bool connected = cdc_connected;
+        if (!connected) shown = false;
+        char c;
+        while (queue_try_remove(&cdc_rx_queue, &c)) shown = false;
+        if (connected && !shown) { trip_screen_draw(); shown = true; }
+        sleep_ms(100);
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  Core 1 entry point
 // ---------------------------------------------------------------------------
 
@@ -1530,6 +1568,8 @@ void core1_entry(void) {
         // Holistic review L-4: core 1's stack canary (ATAboy.c). A stack
         // that ran into it has overwritten something: stop, bus released.
         if (!core1_stack_intact()) fault_stop(IDE_FAULT_CANARY);
+        // Q7: core 0 tripped (a USB command): show it and stay (ide.h).
+        if (ide_tripped()) trip_screen_forever();
         bool connected = cdc_connected;
         if (connected && !last_cdc_connected) { sleep_ms(200); needs_full_redraw = true; }
         last_cdc_connected = connected;
