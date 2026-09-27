@@ -2371,8 +2371,21 @@ static void test_identify_err_drq() {
     setup("IDENTIFY ends at once with ERR and data", LBA);
     sim.identify_err_drq = true; sim.intrq_wired = false; sim.t_sector = 0;
     uint16_t id[256];
+    for (auto &w : id) w = 0x5A5A;                  // anything written into it shows
     CHECK(!ide_identify(id), "an aborted IDENTIFY taken as its answer");
     CHECK(!(sim.read_status(mock_now_ns + 1000000) & 0x08) && sim.violations == 0, "DRQ left, or violations %d", sim.violations);
+    // Mutation run of ab81985: since the holistic review's end check (L-3)
+    // the return value alone no longer shows it. Without the DRQ rule the
+    // aborted block went into the caller's buffer and the log counted it as
+    // taken; only the ERR still there after the block made IDENTIFY fail.
+    // The block is drained, never taken: the buffer is as it was.
+    bool untouched = true;
+    for (auto w : id) untouched = untouched && w == 0x5A5A;
+    uint32_t seq = obs_current_cmd();
+    const obs_log_entry_t &e = log_ring[seq % OBS_LOG_ENTRIES];
+    CHECK(untouched && seq && e.value == 0xEC && e.witnessed == 0 && e.unwitnessed == 0 && e.handed == 0 &&
+          e.outcome == OBS_OUT_FAILED, "the aborted block taken: buffer %s, log taken %u+%u outcome %02X",
+          untouched ? "untouched" : "written", e.witnessed, e.unwitnessed, e.outcome);
 }
 
 // ---------------------------------------------------------------------------

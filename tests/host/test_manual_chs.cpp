@@ -1222,6 +1222,18 @@ static void test_p10_layers() {
           refused.idp_zero, sim.cmd_log.size());
     config.heads = 4;                               // 0 sectors only
     CHECK(!chs_geometry_ok(0) && refused.idp_zero == 0 && sim.cmd_log.empty(), "zero refusals %u (spt 0)", refused.idp_zero);
+    // Mutation run of ab81985: since the holistic review it is the first
+    // line of chs_geometry_ok (0 heads, over 16, or 0 sectors) that refuses
+    // no geometry; the later zero check is never reached (mutate.py). That
+    // line on its own: the geometry not marked lost, so nothing after it
+    // would stop a CHS address being worked out with 0 heads or 0 sectors.
+    fresh("layers: no geometry refused first, the geometry not marked lost");
+    config.cyls = 0; config.heads = 0; config.spt = 40; chs_geometry_lost = false;
+    CHECK(!chs_geometry_ok(0) && refused.idp_zero == 0 && sim.reg_writes == 0, "0 heads: zero refusals %u, %d writes",
+          refused.idp_zero, sim.reg_writes);
+    config.heads = 4; config.spt = 0;
+    CHECK(!chs_geometry_ok(0) && refused.idp_zero == 0 && sim.reg_writes == 0, "0 sectors: zero refusals %u, %d writes",
+          refused.idp_zero, sim.reg_writes);
     // ide_set_geometry's own zero check.
     fresh("layers: ide_set_geometry refuses 0 heads or 0 sectors");
     CHECK(!ide_set_geometry(0, 40) && !ide_set_geometry(4, 0) && refused.idp_zero == 2 && sim.cmd_log.empty(),

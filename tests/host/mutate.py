@@ -654,8 +654,28 @@ MUTANTS = [
     ('M-1: Auto Detect clears the geometry on screen, not in config', 'menus.c',
      '    cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;\n    sync_to_config();\n    id_w49_known = false;',
      '    cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;\n    id_w49_known = false;'),
-    ('M-1: 0x91 sent with no geometry at all', 'ide.c',
-     '    if (config.heads == 0 || config.spt == 0) return false;\n', ''),
+    # 'M-1: 0x91 sent with no geometry at all' (removing chs_geometry_ok's
+    # "if (config.heads == 0 || config.spt == 0) return false;") is no longer
+    # listed: since the holistic review (40b1695) it is an equivalent mutant,
+    # and the ab81985 full run is where it survived. The holistic M-1 line at
+    # the top of chs_geometry_ok returns false for 0 heads or 0 sectors before
+    # anything else, so the later line is only reached with both non-zero.
+    # Nothing between the two writes config: native_geometry_in_use() only
+    # reads, and the self-reset check only reads registers and writes
+    # sentinel_armed, self_resets, last_fail and chs_geometry_lost. Core 1
+    # changes the geometry in config only with no USB command running
+    # (menus.c, bus_free_wait; test_p10_n1_unmount_during_recovery), so
+    # nothing changes it from outside either. The line's condition is never
+    # true where it stands, and without it ide_set_geometry's own zero check
+    # would refuse with nothing sent anyway. Shown for ab81985 by
+    # D:\Development\ATAboy-chs-builds\p10-<this round>\m1-equivalence
+    # (every state of chs_geometry_ok's inputs, the same transcript with and
+    # without the line, and the line's condition true 0 times in the whole
+    # suite). Replaced by the mutant below, which removes what now does the
+    # job: the zero terms of the holistic M-1 line.
+    ('M-1: no geometry at all passes chs_geometry_ok (its first check without the zero terms)', 'ide.c',
+     '    if (config.heads == 0 || config.heads > 16 || config.spt == 0) return false;\n    bool native',
+     '    if (config.heads > 16) return false;\n    bool native'),
     # The review's surviving mutants, as it wrote them.
     ('Ctrl+G: Enter also confirms (review N3)', 'menus.c',
      "        while (k != 'y' && k != 'Y' && k != 'n' && k != 'N' && k != KEY_ESC);",
