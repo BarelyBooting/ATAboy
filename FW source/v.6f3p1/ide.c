@@ -100,6 +100,7 @@ static struct {
     uint32_t idp_zero;          // ide_set_geometry with 0 heads or 0 sectors
 } refused;
 bool ide_mchs_no_identify(void) { return mchs_no_identify; }
+bool ide_write_protected(void) { return config.drive_write_protected || mchs_no_identify; }
 
 // Review C round 2, C2-1: a drive that resets on its own. 91h goes out once
 // per mount again (0.6f3p10's first design sent it before every CHS command,
@@ -2038,6 +2039,9 @@ int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
     uint32_t s = 0;
     uint8_t st = 0;
     uint8_t fail_kind = IDE_FAIL_TIMEOUT;
+    // Owner decision 2026-09-26, F-2: write protect is enforced here too,
+    // before anything touches the bus, not only by WRITE(10) in usb.c.
+    if (ide_write_protected()) return -1;
     if (count == 0) return -1;
     if (!recovery_gate()) return -1;                       // as for a read (review M-1)
     if (!time_to_send(lba, count)) return -1;

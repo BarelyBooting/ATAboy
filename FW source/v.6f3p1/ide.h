@@ -317,6 +317,12 @@ bool    ide_idp_sent_since_boot(void);
 // whoever asks (Debug I, the Debug seek test).
 bool    ide_mchs_no_identify(void);
 
+// Write protect: Features says so, or a Ctrl+G has started sending since the
+// ATAboy started (review C, C-4). The one predicate for WRITE(10) (usb.c)
+// and for ide_write_sectors() itself, which refuses at its top with nothing
+// on the bus (owner decision 2026-09-26, F-2).
+bool    ide_write_protected(void);
+
 // True from a Ctrl+G whose 0x91 the drive accepted until an IDENTIFY answers
 // (ide_identify). RAM only. While true, sat.c refuses every pass-through
 // command (review of 0.6f3p8, L-2), and menus.c will not save the geometry

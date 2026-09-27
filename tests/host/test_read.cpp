@@ -2439,6 +2439,38 @@ static void test_min_window_e2() {
 // enough for the 8 s the sector takes. A new host command at the failed
 // sector is not held to it: the sector that took 14 s is read again, once,
 // by the host's next command.
+// Owner decision 2026-09-26 (API Q1-Q7), F-2: ide_write_sectors refuses by
+// itself when write protected, with the predicate WRITE(10) uses (Features,
+// or any Ctrl+G since the ATAboy started), and with nothing on the bus, not
+// even a status read. usb.c refuses first, so only a direct call shows this
+// layer. The donor W1 test (WRITE(10) with write protect deliberately off,
+// no Ctrl+G) still writes, through both.
+static int f2_reads;
+static void test_write_protect_in_ide() {
+    for (int why = 0; why < 2; why++) {
+        setup(why ? "F-2: ide_write_sectors refuses a Ctrl+G drive" : "F-2: ide_write_sectors refuses with write protect on", LBA);
+        config.drive_write_protected = (why == 0);
+        mchs_no_identify = (why == 1);
+        std::vector<uint8_t> w = fill512(2, 11);
+        int writes = sim.reg_writes, cmds = sim.commands;
+        f2_reads = 0;
+        sim_on_read = [] { f2_reads++; };
+        int32_t r = ide_write_sectors(MW, 2, w.data());
+        sim_on_read = nullptr;
+        CHECK(r < 0 && sim.reg_writes == writes && sim.commands == cmds && f2_reads == 0 && sim.written.empty(),
+              "r %d: %d register writes, %d commands, %d reads, %zu sectors written", (int)r, sim.reg_writes - writes,
+              sim.commands - cmds, f2_reads, sim.written.size());
+        size_t held = sim.written.size();
+        CHECK(host_write10(MW, w.data(), 2) < 0 && sim.written.size() == held, "WRITE(10) went through");
+    }
+    setup("F-2: donor W1, write protect deliberately off", LBA);
+    config.drive_write_protected = false;
+    std::vector<uint8_t> w = fill512(2, 12);
+    CHECK(ide_write_sectors(MW, 1, w.data()) == 512 && written_is(MW, w.data()), "direct write refused");
+    CHECK(host_write10(MW + 1, w.data() + 512, 1) == 512 && written_is(MW + 1, w.data() + 512), "WRITE(10) refused");
+    CHECK(sim.violations == 0, "violations %d", sim.violations);
+}
+
 static void test_min_window_e3() {
     for (uint64_t P : { 0ull, 3000ull, 7400ull, 9000ull, 12000ull, 13400ull }) {
         std::string n = "min window E3: 8-sector READ(10), ERR at sector 3 after " + std::to_string(P) + " ms more";
@@ -4732,6 +4764,7 @@ int main() {
     test_identify_err_drq();
     // review of 0.6f3p7: the least time a command is sent with, and the LOWs
     test_min_window_e2();
+    test_write_protect_in_ide();
     test_min_window_e3();
     test_min_window_e4();
     test_min_window_e5();

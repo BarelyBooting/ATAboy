@@ -202,9 +202,10 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8],
 // Review C, C-4: a drive set up by Ctrl+G (either mode, until the ATAboy is
 // power-cycled) is write protected whatever Features says: nothing it is
 // for needs a write, and a saved "Disabled" from a donor session must not
-// reach it.
+// reach it. The predicate lives in ide.c (ide_write_protected), which
+// ide_write_sectors() also checks (owner decision 2026-09-26, F-2).
 static bool write_protected(void) {
-    return config.drive_write_protected || ide_mchs_no_identify();
+    return ide_write_protected();
 }
 
 bool tud_msc_is_writable_cb(uint8_t lun) {

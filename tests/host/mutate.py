@@ -1031,8 +1031,17 @@ MUTANTS = [
     ('C-3: Auto Detect runs without asking', 'menus.c',
      '    current_screen = SCREEN_CONFIRM;\n    confirm_type = 6;\n    needs_full_redraw = true;\n    return true;',
      '    (void)run_auto_detect();\n    return false;'),
-    ('C-4: a Ctrl+G drive writable when Features says so', 'usb.c',
-     '    return config.drive_write_protected || ide_mchs_no_identify();', '    return config.drive_write_protected;'),
+    # (Retargeted for F-2: the predicate moved from usb.c into ide.c, which
+    # WRITE(10) and ide_write_sectors both use.)
+    ('C-4: a Ctrl+G drive writable when Features says so', 'ide.c',
+     'bool ide_write_protected(void) { return config.drive_write_protected || mchs_no_identify; }',
+     'bool ide_write_protected(void) { return config.drive_write_protected; }'),
+    # Owner decision 2026-09-26, F-2: the check at the top of ide_write_sectors.
+    ('F-2: ide_write_sectors does not check write protect (the old code)', 'ide.c',
+     '    if (ide_write_protected()) return -1;\n    if (count == 0) return -1;', '    if (count == 0) return -1;'),
+    ('F-2: ide_write_sectors checks it only after the bus is used', 'ide.c',
+     '    if (ide_write_protected()) return -1;\n    if (count == 0) return -1;\n    if (!recovery_gate()) return -1;                       // as for a read (review M-1)\n    if (!time_to_send(lba, count)) return -1;\n    if (!ide_wait_until_ready(work_ms(5000))) {',
+     '    if (count == 0) return -1;\n    if (!recovery_gate()) return -1;                       // as for a read (review M-1)\n    if (!time_to_send(lba, count)) return -1;\n    if (!ide_wait_until_ready(work_ms(5000))) {\n        record_failure(IDE_FAIL_NOT_READY, 0, ide_read_reg(7), lba, 0, count);\n        return -1;\n    }\n    if (ide_write_protected()) return -1;\n    if (0) {'),
     # 'C-5: outputs enabled with their latches at 0' removed in the holistic
     # review: B1 drives the active-low lines high before anything else, so
     # the C-5 line after gpio_init_mask no longer decides it; the B1 mutants
