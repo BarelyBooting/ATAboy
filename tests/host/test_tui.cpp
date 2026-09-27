@@ -19,6 +19,8 @@ static inline bool time_reached(absolute_time_t t) { return get_absolute_time() 
 #include "obs.c"
 #endif
 #include "menus.c"
+#define CTL_STUB_IDCACHE
+#include "ctl_stubs.h"              // ATABOY_CTL: the API's hooks in menus.c
 
 uint64_t mock_now_ns = 0;
 int mock_usb_boot_requests = 0;

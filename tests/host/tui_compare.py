@@ -6,6 +6,14 @@
 show something different; differences there are counted but do not fail.
 A screen name of * means every screen (e.g. *:1 for a new version banner).
 
+--new-defs "-DNAME=1 ..." builds the new tree with those defines (the ATAboy
+Control API: -DATABOY_CTL=1); the old tree is built as before, without.
+
+--session also runs tui_session.cpp against both trees: a whole session
+through core 1's real loop (Auto Detect, Mount, Unmount, Features, Debug,
+Ctrl+G, F10), byte for byte. The two must be identical once the banner
+line (the version) is taken out of each; any other byte fails.
+
 Builds test_tui.cpp against each source tree, renders every captured screen
 with pyte (the emulator the console harness uses), and reports:
 
@@ -27,7 +35,7 @@ Note: pyte's ESC[2J only repaints cells that were written before, so on a
 fresh screen pyte shows the frame's interior in the default colours even
 with background-colour erase. That is why (1) sees the fill at all.
 """
-import os, subprocess, sys, tempfile
+import os, re, subprocess, sys, tempfile
 import pyte
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -53,17 +61,32 @@ class NoBceScreen(pyte.Screen):
         self._plain(super().erase_characters, *a, **k)
 
 
-def build_and_capture(src, work):
+def build_and_capture(src, work, defs=()):
     os.makedirs(work, exist_ok=True)
     exe = os.path.join(work, 'test_tui.exe')
     cxx = os.environ.get('CXX', 'g++')
-    subprocess.run([cxx, '-std=c++17', '-O1', '-w', '-I', os.path.join(HERE, 'mock'),
+    subprocess.run([cxx, '-std=c++17', '-O1', '-w', *defs, '-I', os.path.join(HERE, 'mock'),
                     '-I', HERE, '-I', src, '-o', exe, os.path.join(HERE, 'test_tui.cpp')],
                    check=True)
     out = os.path.join(work, 'screens')
     os.makedirs(out, exist_ok=True)
     subprocess.run([exe, out], check=True)
     return {f[:-4]: open(os.path.join(out, f), 'rb').read() for f in os.listdir(out)}
+
+
+BANNER = re.compile(rb'\x1b\[1;\d+H\x1b\[37;1mATAboy Setup Utility v[0-9a-z.]+ \([a-z+]+\) - \(C\) 2026 obsoletetech\.us')
+
+
+def session(src, work, defs=()):
+    """The session's bytes, and how many banners were taken out of them."""
+    os.makedirs(work, exist_ok=True)
+    exe = os.path.join(work, 'tui_session.exe')
+    out = os.path.join(work, 'session.bin')
+    subprocess.run([os.environ.get('CXX', 'g++'), '-std=c++17', '-O1', '-w', *defs, '-I', os.path.join(HERE, 'mock'),
+                    '-I', HERE, '-I', src, '-o', exe, os.path.join(HERE, 'tui_session.cpp')], check=True)
+    subprocess.run([exe, out], check=True, stdout=subprocess.DEVNULL)
+    data = open(out, 'rb').read()
+    return BANNER.subn(b'<BANNER>', data), data
 
 
 def render(data, cls=pyte.Screen):
@@ -79,16 +102,25 @@ def cells(scr):
 def main():
     old_src, new_src = sys.argv[1], sys.argv[2]
     expect = {}
+    new_defs, with_session = [], False
     args = sys.argv[3:]
     while args:
-        if args[0] != '--expect' or len(args) < 2:
-            raise SystemExit('usage: tui_compare.py OLD NEW [--expect screen:row,row ...]')
-        scr, rows = args[1].split(':')
-        expect[scr] = {int(r) - 1 for r in rows.split(',')}
+        if args[0] == '--session':
+            with_session = True
+            args = args[1:]
+            continue
+        if args[0] not in ('--expect', '--new-defs') or len(args) < 2:
+            raise SystemExit('usage: tui_compare.py OLD NEW [--expect screen:row,row ...] [--new-defs "-D..."] [--session]')
+        if args[0] == '--new-defs':
+            new_defs += args[1].split()
+        else:
+            scr, rows = args[1].split(':')
+            expect[scr] = {int(r) - 1 for r in rows.split(',')}
         args = args[2:]
     tmp = tempfile.mkdtemp(prefix='ataboy-tui-')
+    print(f'new tree built with: {" ".join(new_defs) or "(no defines)"}')
     old = build_and_capture(old_src, os.path.join(tmp, 'old'))
-    new = build_and_capture(new_src, os.path.join(tmp, 'new'))
+    new = build_and_capture(new_src, os.path.join(tmp, 'new'), new_defs)
     assert old and set(old) <= set(new), 'screens missing from the new build, or none at all'
     bad = 0
     print(f'{"screen":18} {"bytes old":>9} {"new":>6} {"blank->filled":>13} {"invisible":>9} {"expected":>8} {"other diffs":>11}  {"default-bg cells, bce off":>26}')
@@ -124,6 +156,19 @@ def main():
         nb = sum(c.bg == 'default' for row in cells(render(new[name], NoBceScreen)) for c in row)
         print(f'{name:18} {"NEW":>9} {len(new[name]):6} {"":13} {"":9} {"":8} {"":11}  {"new " + str(nb):>26}')
         if nb:
+            bad += 1
+    if with_session:
+        (so, no), raw_o = session(old_src, os.path.join(tmp, 'sold'))
+        (sn, nn), raw_n = session(new_src, os.path.join(tmp, 'snew'), new_defs)
+        same = so == sn
+        print(f'session through core1_entry: old {len(raw_o)} bytes, new {len(raw_n)} bytes, banners taken out '
+              f'{no} and {nn}; the rest {"IDENTICAL" if same else "DIFFERS"}')
+        if not same:
+            i = next((i for i in range(min(len(so), len(sn))) if so[i] != sn[i]), min(len(so), len(sn)))
+            print(f'    first difference at byte {i}: old {so[i:i + 40]!r} new {sn[i:i + 40]!r}')
+            bad += 1
+        if no == 0 or no != nn:
+            print('    the banner count differs, or no banner was found')
             bad += 1
     print('OK' if not bad else f'{bad} problem(s)')
     return 1 if bad else 0

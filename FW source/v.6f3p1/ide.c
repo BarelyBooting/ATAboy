@@ -702,6 +702,9 @@ void ide_reset_drive(void) {
 }
 
 uint8_t ide_probe_devices(void) {
+#if ATABOY_CTL
+    ide_idcache_clear(IDE_IDC_WHY_PROBE);   // a new detection: the old IDENTIFY is not this drive's
+#endif
 #if ATABOY_SAT
     id_words.valid = false;     // a new detection: nothing is known until IDENTIFY answers
 #endif
@@ -981,6 +984,9 @@ int ide_id_words_verify(void) {
     if (!ide_wait_until_ready(1000) || (ide_read_reg(7) & 0x08)) return -1;
     uint16_t buf[256];
     int got = identify_run(buf);
+#if ATABOY_CTL
+    if (got > 0) ide_idcache_put(buf, IDE_IDC_SAT_CHECK);
+#endif
     if (got < 0) {
         record_failure(IDE_FAIL_TIMEOUT, 0xEC, ide_read_reg(7), 0, 0, 1);
         soft_reset_restore();
@@ -1486,6 +1492,9 @@ static int manual_chs_run(uint8_t heads, uint8_t spt, bool native, uint8_t *stat
     native_declared = false;
     sentinel_new_mount();           // review C round 3, C3-1
     mchs_no_identify = true;        // from here on this drive gets no IDENTIFY (M-1)
+#if ATABOY_CTL
+    ide_idcache_clear(IDE_IDC_WHY_CTRLG);   // review C, C-12: cleared, not kept
+#endif
 #if ATABOY_SAT
     id_words.valid = false;         // this drive is never asked who it is
 #endif
@@ -2738,5 +2747,63 @@ static int sat_nondata_run(const sat_taskfile_t *tf, ide_sat_regs_t *regs) {
         }
         busy_wait_us_32(10);
     }
+}
+#endif
+
+#if ATABOY_CTL
+// ---------------------------------------------------------------------------
+//  identify.cached and the refusal counters (ide.h), for the Control API
+// ---------------------------------------------------------------------------
+static ide_idcache_t idc;
+static volatile uint32_t idc_seq;       // odd while a writer is in the middle
+
+static void idc_write_begin(void) {
+    __atomic_fetch_add(&idc_seq, 1, __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+static void idc_write_end(void) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&idc_seq, 1, __ATOMIC_SEQ_CST);
+}
+
+void ide_idcache_put(const uint16_t *words, uint8_t origin) {
+    idc_write_begin();
+    memcpy(idc.words, words, sizeof idc.words);
+    idc.present = true;
+    idc.stale = false;
+    idc.origin = origin;
+    idc.dev_base = dev_base;
+    idc.at_ms = to_ms_since_boot(get_absolute_time());
+    idc_write_end();
+}
+
+void ide_idcache_clear(uint8_t why) {
+    idc_write_begin();
+    idc.present = false;
+    idc.stale = false;
+    idc.why = why;
+    idc_write_end();
+}
+
+// One byte, toward the safe reading: no sequence count needed.
+void ide_idcache_stale(void) { idc.stale = true; }
+
+bool ide_idcache_get(ide_idcache_t *out) {
+    for (int tries = 0; tries < 3; tries++) {
+        uint32_t s1 = __atomic_load_n(&idc_seq, __ATOMIC_SEQ_CST);
+        if (s1 & 1) continue;
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        memcpy(out, (const void *)&idc, sizeof *out);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&idc_seq, __ATOMIC_SEQ_CST) == s1) return true;
+    }
+    return false;
+}
+
+void ide_refused_counts(uint32_t out[4]) {
+    out[0] = refused.identify_call;
+    out[1] = refused.identify_run;
+    out[2] = refused.idp_native;
+    out[3] = refused.idp_zero;
 }
 #endif

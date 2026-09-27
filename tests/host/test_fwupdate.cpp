@@ -30,6 +30,8 @@ static inline bool time_reached(absolute_time_t t) { return get_absolute_time() 
 
 #include "obs.c"
 #include "menus.c"
+#define CTL_STUB_IDCACHE
+#include "ctl_stubs.h"              // ATABOY_CTL: the API's hooks in menus.c
 
 uint64_t mock_now_ns = 0;
 int mock_usb_boot_requests = 0;
@@ -428,7 +430,17 @@ static void test_debug_errors_row() {
 static void test_banner() {
     tty.clear();
     draw_bios_frame();
-#if ATABOY_SAT && ATABOY_SAT_SMART_SAVES
+#if ATABOY_CTL && ATABOY_SAT && ATABOY_SAT_SMART_SAVES
+    // The ATAboy Control API build is 0.6f4 (owner Q5), SMART opt-in or not.
+    CHECK(tty.find("\033[1;3H\033[37;1mATAboy Setup Utility v0.6f4 (fork+api+smartsaves) - (C) 2026 obsoletetech.us") != std::string::npos,
+          "API build with the SMART opt-in: banner is not v0.6f4 (fork+api+smartsaves)");
+    CHECK(tty.find("0.6f3p10") == std::string::npos, "API build banner says 0.6f3p10");
+#elif ATABOY_CTL
+    CHECK(tty.find("\033[1;10H\033[37;1mATAboy Setup Utility v0.6f4 (fork+api) - (C) 2026 obsoletetech.us") != std::string::npos,
+          "API build: banner is not v0.6f4 (fork+api)");
+    CHECK(tty.find("0.6f3p10") == std::string::npos && tty.find("smartsaves") == std::string::npos,
+          "API build banner says 0.6f3p10 or SMART saves");
+#elif ATABOY_SAT && ATABOY_SAT_SMART_SAVES
     CHECK(tty.find("\033[1;4H\033[37;1mATAboy Setup Utility v0.6f3p10 (fork+smartsaves) - (C) 2026 obsoletetech.us") != std::string::npos,
           "SMART opt-in build: banner does not say so");
 #else

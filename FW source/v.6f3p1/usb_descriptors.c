@@ -17,7 +17,13 @@ tusb_desc_device_t const desc_device = {
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_VID,
     .idProduct          = USB_PID,
+#if ATABOY_CTL
+    // palimpsest api/SPEC-v1.md 2.1: the Control function changes the
+    // layout, so a host must not reuse one it cached for the one-CDC device.
+    .bcdDevice          = 0x0101,
+#else
     .bcdDevice          = 0x0100,
+#endif
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,
@@ -29,25 +35,47 @@ uint8_t const *tud_descriptor_device_cb(void) {
 }
 
 // --- Configuration Descriptor ---
+// With ATABOY_CTL (palimpsest api/SPEC-v1.md 2.1) the ATAboy Control
+// function, a second CDC-ACM with its own IAD, is appended after MSC as
+// interfaces 3 and 4, so the TUI keeps MI_00 and the disk MI_02, which every
+// existing tool binds to. A host finds the Control port by the USB serial
+// and interface 3 (MI_03), never by COM number. TinyUSB numbers CDC
+// instances in descriptor order: the TUI stays instance 0, Control is 1.
 enum {
     ITF_NUM_CDC = 0,
     ITF_NUM_CDC_DATA,
     ITF_NUM_MSC,
+#if ATABOY_CTL
+    ITF_NUM_CTL,
+    ITF_NUM_CTL_DATA,
+#endif
     ITF_NUM_TOTAL
 };
 
+#if ATABOY_CTL
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN + TUD_CDC_DESC_LEN)
+#else
 #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN)
+#endif
 
 #define EPNUM_CDC_NOTIF   0x81
 #define EPNUM_CDC_OUT     0x02
 #define EPNUM_CDC_IN      0x82
 #define EPNUM_MSC_OUT     0x03
 #define EPNUM_MSC_IN      0x83
+#if ATABOY_CTL
+#define EPNUM_CTL_NOTIF   0x84
+#define EPNUM_CTL_OUT     0x05
+#define EPNUM_CTL_IN      0x85
+#endif
 
 uint8_t const desc_configuration[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 4, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
     TUD_MSC_DESCRIPTOR(ITF_NUM_MSC, 5, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64),
+#if ATABOY_CTL
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CTL, 6, EPNUM_CTL_NOTIF, 8, EPNUM_CTL_OUT, EPNUM_CTL_IN, 64),
+#endif
 };
 
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
@@ -63,6 +91,9 @@ char const *string_desc_arr[] = {
     "",                            // 3: Serial, this unit's own (usb_serial below)
     "ATAboy CDC",                  // 4: CDC Interface
     "ATAboy Storage",              // 5: MSC Interface
+#if ATABOY_CTL
+    "ATAboy Control",              // 6: the Control API's interface (SPEC-v1 2.1)
+#endif
 };
 
 static uint16_t _desc_str[32];

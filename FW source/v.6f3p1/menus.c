@@ -17,6 +17,10 @@
 #include "manualchs.h"
 #include "fault.h"
 #include "pico/util/queue.h"
+#if ATABOY_CTL
+#include "ctl.h"
+#include "ctl_build.h"
+#endif
 
 // ---------------------------------------------------------------------------
 //  CDC queue I/O (queues owned by ATAboy.c)
@@ -260,7 +264,14 @@ static void print_help(const char *text) {
 // (ATABOY_SAT_SMART_SAVES, sat_policy.h) says so, so it cannot be mistaken on
 // the unit for the shipping build (review L-2). That line is 11 characters
 // longer, so it starts further left to stay inside 80 columns.
-#if ATABOY_SAT && ATABOY_SAT_SMART_SAVES
+// The ATAboy Control API build is 0.6f4 (owner Q5), with its own banner so
+// it cannot be taken for the CP3044's 0.6f3p10 either (ctl_build.h, made
+// by CMakeLists.txt, which also sets the program version).
+#if ATABOY_CTL && ATABOY_SAT && ATABOY_SAT_SMART_SAVES
+#define BANNER "\033[1;3H" FG_WHITE "ATAboy Setup Utility " CTL_FW_BANNER " - (C) 2026 obsoletetech.us"
+#elif ATABOY_CTL
+#define BANNER "\033[1;10H" FG_WHITE "ATAboy Setup Utility " CTL_FW_BANNER " - (C) 2026 obsoletetech.us"
+#elif ATABOY_SAT && ATABOY_SAT_SMART_SAVES
 #define BANNER "\033[1;4H" FG_WHITE "ATAboy Setup Utility v0.6f3p10 (fork+smartsaves) - (C) 2026 obsoletetech.us"
 #else
 #define BANNER "\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p10 (fork) - (C) 2026 obsoletetech.us"
@@ -734,6 +745,9 @@ static void run_debug_identify(void) {
         debug_print(2, FG_WHITE, "Check cabling, Master/Slave jumper, or power.");
         return;
     }
+#if ATABOY_CTL
+    ide_idcache_put(id, IDE_IDC_DEBUG_I);           // identify.cached (SPEC-v1 4.4)
+#endif
 
     char model[41], serial[21], fw[9];
     decode_ata_string(id, 27, 20, model);
@@ -867,6 +881,9 @@ static void run_seek_test(void) {
 
     uint16_t id[256];
     if (!ide_identify(id)) { debug_print(1, FG_RED, "ERROR: Drive not ready."); sleep_ms(1500); return; }
+#if ATABOY_CTL
+    ide_idcache_put(id, IDE_IDC_DEBUG_S);
+#endif
 
     bool lba = (id[49] & 0x0200);
     uint32_t max_range = lba ? (id[60]|((uint32_t)id[61]<<16)) : id[1];
@@ -1004,6 +1021,13 @@ static void log_mount(uint8_t kind, uint8_t value) {
                  : ide_manual_chs_native_active() ? OBS_MODE_MCHS_NATIVE
                  : ide_manual_chs_active() ? OBS_MODE_MCHS_91 : OBS_MODE_CHS;
     obs_marker(kind, value, mode, config.spt, config.heads, config.cyls, config.dev_base);
+#if ATABOY_CTL
+    // Every mount path writes its MOUNT marker here (TUI confirm-3,
+    // auto-mount): status.mount_seq counts them (SPEC-v1 4.3, I-28). At an
+    // unmount the drive may be swapped, so identify.cached turns stale.
+    if (kind == OBS_EV_MOUNT) ctl_mount_noted(obs_last_marker_seq());
+    else ide_idcache_stale();
+#endif
 }
 
 static void try_auto_mount(void) {
@@ -1031,6 +1055,9 @@ static void try_auto_mount(void) {
 
     uint16_t id_buf[256];
     if (!ide_identify(id_buf)) return;
+#if ATABOY_CTL
+    ide_idcache_put(id_buf, IDE_IDC_AUTO_MOUNT);
+#endif
     id_w49 = id_buf[49]; id_w49_known = true;   // IORDY advisory
 
     // Fill model string for display
@@ -1166,6 +1193,9 @@ static bool run_auto_detect(void) {
         ide_select_device(found);
         config.dev_base = found;
         if (ide_identify(id_buf)) detected = true;
+#if ATABOY_CTL
+        if (detected) ide_idcache_put(id_buf, IDE_IDC_AUTO_DETECT);
+#endif
     }
     if (detected) { id_w49 = id_buf[49]; id_w49_known = true; }
     if (!detected) ide_select_device(config.dev_base);
@@ -1570,6 +1600,16 @@ void core1_entry(void) {
         if (!core1_stack_intact()) fault_stop(IDE_FAULT_CANARY);
         // Q7: core 0 tripped (a USB command): show it and stay (ide.h).
         if (ide_tripped()) trip_screen_forever();
+#if ATABOY_CTL
+        // The ATAboy Control API's idle point (ctl_job.c): here, and only
+        // here, core 1 may run a job, and only on a plain screen. Before the
+        // "no terminal" skip below, so jobs run with interface 0 closed.
+        ctl_core1_idle(show_detect_result ? CTL_TUI_ERROR_BOX :
+                       current_screen == SCREEN_MAIN ? CTL_TUI_MAIN :
+                       current_screen == SCREEN_FEATURES ? CTL_TUI_FEATURES :
+                       current_screen == SCREEN_DEBUG ? CTL_TUI_DEBUG :
+                       current_screen == SCREEN_MOUNTED ? CTL_TUI_MOUNTED : CTL_TUI_CONFIRM);
+#endif
         bool connected = cdc_connected;
         if (connected && !last_cdc_connected) { sleep_ms(200); needs_full_redraw = true; }
         last_cdc_connected = connected;
@@ -1618,6 +1658,9 @@ void core1_entry(void) {
         cdc_puts("\033[24;79H"); cdc_flush();
         int k = get_input();
         if (k == -1) { tight_loop_contents(); continue; }
+#if ATABOY_CTL
+        ctl_tui_busy();         // handling a key: MODAL until the loop is back at the top
+#endif
 
         // Ctrl+L: redraw the whole screen, e.g. after a terminal resize (issue #9)
         if (k == 12) { needs_full_redraw = true; continue; }

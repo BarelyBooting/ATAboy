@@ -1,0 +1,2 @@
+# git archive writes the commit into it (CMakeLists.txt, the ATAboy Control API)
+ctl_build_id.txt export-subst

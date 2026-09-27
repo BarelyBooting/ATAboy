@@ -2,7 +2,14 @@
 #define _TUSB_CONFIG_H_
 
 #define CFG_TUSB_RHPORT0_MODE    OPT_MODE_DEVICE
+#if ATABOY_CTL
+// The ATAboy Control API (palimpsest api/SPEC-v1.md 2.1): a second CDC
+// function, instance 1, after MSC. Instance 0 stays the TUI. The buffer
+// sizes below are per instance.
+#define CFG_TUD_CDC              2
+#else
 #define CFG_TUD_CDC              1
+#endif
 #define CFG_TUD_MSC              1
 // F1 stage 2 (2026-09-26): 16 KB, from 4 KB. TinyUSB 0.18 casts a
 // transfer's length to 16 bits (usbd_edpt_xfer in msc_device.c), so 64 KB

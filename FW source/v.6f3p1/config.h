@@ -83,5 +83,12 @@ extern config_t config;
 void config_load(void);
 void config_save(void);
 void config_defaults(void);
+#if ATABOY_CTL
+// config.get (palimpsest api/SPEC-v1.md 4.5): whether config_load() found a
+// valid sector, and a copy of the sector as it is now, read through XIP.
+// Reading it never writes anything; a save pauses core 0 (config_save).
+bool config_loaded_from_flash(void);
+void config_flash_copy(config_t *out);
+#endif
 
 #endif

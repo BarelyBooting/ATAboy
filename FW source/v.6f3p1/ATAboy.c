@@ -12,6 +12,9 @@
 #include "config.h"
 #include "fault.h"
 #include <setjmp.h>
+#if ATABOY_CTL
+#include "ctl.h"
+#endif
 
 // Holistic review (the guide's L1): nothing may drive a board LED, UART,
 // I2C, SPI or power-sense pin: on this board those pin numbers are the IDE
@@ -135,6 +138,9 @@ int main(void) {
 
     // Init TinyUSB
     tusb_init();
+#if ATABOY_CTL
+    ctl_init();             // the ATAboy Control API (ctl.h)
+#endif
 
     // Allow core 1 to be paused for flash writes (config_save)
     multicore_lockout_victim_init();
@@ -152,5 +158,8 @@ int main(void) {
         tud_task();
         usb_read_ahead_task();  // F1 stage 2: Pipelined Reads, between USB callbacks
         cdc_task();
+#if ATABOY_CTL
+        ctl_task();         // the Control port, CDC instance 1; never waits
+#endif
     }
 }

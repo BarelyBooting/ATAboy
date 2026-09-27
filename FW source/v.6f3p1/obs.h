@@ -146,4 +146,22 @@ bool     obs_hash_engine_ok(void);
 uint32_t obs_log_page(uint32_t cursor, uint8_t *out, uint32_t cap);
 uint32_t obs_hash_page(uint32_t cursor, uint8_t *out, uint32_t cap);
 
+#if ATABOY_CTL
+// The ATAboy Control API's own entries (palimpsest api/SPEC-v1.md 5.4): kind
+// 7, value = the op (ctl_policy.h, CTL_OP_*), tf[0..3] = the request id,
+// little-endian, outcome = what the job did. Core 1 writes one when it picks
+// a job up (API_BEGIN) and one when the job ends (API_END), so every bus
+// event of a job lies between the two. They are not bus events: they never
+// become the current command. A reader built before this kind existed must
+// reject a page holding one rather than skip it.
+#define OBS_EV_API          7
+#define OBS_API_BEGIN       0x00
+#define OBS_API_DONE        0x01
+#define OBS_API_FAILED      0x80
+#define OBS_API_UNKNOWN     0xFF
+uint32_t obs_api(uint8_t op, uint32_t id, uint8_t outcome);     // returns the entry's seq
+// The seq of the last mount or unmount marker (status.mount_log_seq).
+uint32_t obs_last_marker_seq(void);
+#endif
+
 #endif

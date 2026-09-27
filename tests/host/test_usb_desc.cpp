@@ -102,7 +102,15 @@ int main() {
     CHECK(string_desc(5, &ok) == "ATAboy Storage" && ok, "MSC interface");
     const uint16_t *lang = tud_descriptor_string_cb(0, 0);
     CHECK(lang && lang[0] == ((TUSB_DESC_STRING << 8) | 4) && lang[1] == 0x0409, "language %04X", lang ? lang[1] : 0);
+#if ATABOY_CTL
+    // The ATAboy Control API's interface string (SPEC-v1 2.1), and nothing after it.
+    CHECK(string_desc(6, &ok) == "ATAboy Control" && ok, "Control interface");
+    CHECK(tud_descriptor_string_cb(7, 0x0409) == nullptr, "string 7 exists");
+    CHECK(desc_device.bcdDevice == 0x0101, "bcdDevice %04X, not 0101 (SPEC-v1 2.1)", desc_device.bcdDevice);
+#else
     CHECK(tud_descriptor_string_cb(6, 0x0409) == nullptr, "string 6 exists");
+    CHECK(desc_device.bcdDevice == 0x0100, "bcdDevice %04X, not 0100", desc_device.bcdDevice);
+#endif
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;
 }

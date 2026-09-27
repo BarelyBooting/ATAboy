@@ -217,6 +217,9 @@ uint32_t obs_current_cmd(void) {
     return (cur && cur->seq == cur_seq && cur->kind == OBS_EV_CMD) ? cur_seq : 0;
 }
 
+#if ATABOY_CTL
+static volatile uint32_t marker_seq;             // obs_last_marker_seq()
+#endif
 void obs_marker(uint8_t kind, uint8_t value, uint8_t mode, uint8_t spt,
                 uint8_t heads, uint16_t cyls, uint8_t dev) {
     uint32_t seq;
@@ -228,7 +231,28 @@ void obs_marker(uint8_t kind, uint8_t value, uint8_t mode, uint8_t spt,
     e->tf[4] = (uint8_t)(cyls >> 8);
     e->tf[5] = dev;
     log_publish(e, seq);                            // never the current bus event
+#if ATABOY_CTL
+    marker_seq = seq;
+#endif
 }
+
+#if ATABOY_CTL
+// palimpsest api/SPEC-v1 5.4 (obs.h). Like a marker: claimed and published
+// in one go, never the current bus event, from whichever core calls it.
+uint32_t obs_api(uint8_t op, uint32_t id, uint8_t outcome) {
+    uint32_t seq;
+    obs_log_entry_t *e = log_claim(&seq, OBS_EV_API, op);
+    e->outcome = outcome;
+    e->tf[0] = (uint8_t)id;
+    e->tf[1] = (uint8_t)(id >> 8);
+    e->tf[2] = (uint8_t)(id >> 16);
+    e->tf[3] = (uint8_t)(id >> 24);
+    log_publish(e, seq);
+    return seq;
+}
+
+uint32_t obs_last_marker_seq(void) { return marker_seq; }
+#endif
 
 // ---------------------------------------------------------------------------
 //  The hash engine

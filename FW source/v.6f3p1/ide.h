@@ -368,6 +368,46 @@ void    ide_read_taskfile(uint8_t tf[8]);
 // Returns the status register value after the operation.
 uint8_t ide_seek_read_one(uint32_t target, bool lba);
 
+#if ATABOY_CTL
+// ---------------------------------------------------------------------------
+//  For the ATAboy Control API (palimpsest api/SPEC-v1.md)
+// ---------------------------------------------------------------------------
+// identify.cached (SPEC-v1 4.4): the 512 bytes of the firmware's own last
+// IDENTIFY that ended cleanly, with where it came from, when and for which
+// device. No API op sends IDENTIFY in v1 (owner Q2); this only keeps what the
+// TUI's Auto Detect, auto-mount, Debug I and S, and the SAT identity check got.
+// A host's own pass-through IDENTIFY never fills it. Cleared when a Ctrl+G
+// starts sending and when Auto Detect's probe starts; marked stale at unmount
+// (the drive may be swapped). Written by whichever core ran the IDENTIFY and
+// read by core 0 under a sequence count, so a torn copy is never used.
+#define IDE_IDC_AUTO_DETECT 1
+#define IDE_IDC_AUTO_MOUNT  2
+#define IDE_IDC_DEBUG_I     3
+#define IDE_IDC_DEBUG_S     4
+#define IDE_IDC_SAT_CHECK   5
+#define IDE_IDC_WHY_NEVER   0       // why nothing is held
+#define IDE_IDC_WHY_CTRLG   1
+#define IDE_IDC_WHY_PROBE   2
+#define IDE_IDC_WHY_DETACH  3
+typedef struct {
+    bool     present;
+    bool     stale;
+    uint8_t  origin;        // IDE_IDC_* (present)
+    uint8_t  why;           // IDE_IDC_WHY_* (not present)
+    uint8_t  dev_base;      // A0h or B0h
+    uint32_t at_ms;
+    uint16_t words[256];
+} ide_idcache_t;
+void    ide_idcache_put(const uint16_t *words, uint8_t origin);
+void    ide_idcache_stale(void);
+void    ide_idcache_clear(uint8_t why);
+// False when a writer kept it moving through three copies (E_BUSY_STATE).
+bool    ide_idcache_get(ide_idcache_t *out);
+// debug.e (SPEC-v1 4.8): the four guard-layer refusal counters above
+// (identify_call, identify_run, idp_native, idp_zero).
+void    ide_refused_counts(uint32_t out[4]);
+#endif
+
 #if ATABOY_SAT
 #include "sat_policy.h"
 

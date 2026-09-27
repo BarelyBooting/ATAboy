@@ -16,6 +16,9 @@ if [ "${SAT:-1}" = 0 ]; then defs=$(echo "$defs" | sed 's/-DATABOY_SAT=1//'); fi
 # ATABOY_SAT_SMART_SAVES is an OFF-by-default option; the scan above would
 # pick up its define whatever the option says. This script sets it itself.
 defs=$(echo "$defs" | sed 's/-DATABOY_SAT_SMART_SAVES=1//')
+# ATABOY_CTL (the ATAboy Control API) is OFF by default in CMake, but this
+# branch is its build, so the suite runs with it ON unless CTL=0 is set.
+if [ "${CTL:-1}" = 0 ]; then defs=$(echo "$defs" | sed 's/-DATABOY_CTL=1//'); fi
 echo "firmware defines: $defs"
 # test_read runs twice with SAT on. The full suite is built with SMART READ
 # DATA and RETURN STATUS opted in (ATABOY_SAT_SMART_SAVES=1), because the
@@ -79,3 +82,31 @@ ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function $defs \
 # divider (holistic review 2026-09-26, M-2 and L-6; see test_pio_timing.cpp).
 ${CXX:-g++} -std=c++17 -O1 -g -Wall -I "$src" -o "$out/test_pio_timing" "$here/test_pio_timing.cpp"
 "$out/test_pio_timing" "$src/ataboy.pio"
+# The configuration descriptor's layout against TinyUSB's real headers
+# (palimpsest api/SPEC-v1.md 11.1, finding F-3), with the Control API off
+# (today's bytes) and on (interfaces 3 and 4). Without the headers this
+# could not run, which is not a pass.
+tinyusb=${TINYUSB:-${PICO_SDK_PATH:-D:/Development/pico/pico-sdk}/lib/tinyusb/src}
+if [ ! -f "$tinyusb/device/usbd.h" ]; then echo "COULD NOT RUN: no TinyUSB headers at $tinyusb"; exit 98; fi
+for ctl in 0 1; do
+    ${CXX:-g++} -std=c++17 -O1 -g -Wall -DATABOY_CTL=$ctl -I "$here/layout" -I "$tinyusb" -I "$src" \
+        -o "$out/test_usb_layout$ctl" "$here/test_usb_layout.cpp"
+    "$out/test_usb_layout$ctl"
+done
+# The ATAboy Control API (palimpsest api/SPEC-v1.md, stage 1): its tests,
+# core 1's real loop taking a job (and not in a confirm box), the parser
+# fuzzer (fixed seed and count; UndefinedBehaviorSanitizer in trap mode and
+# the stack protector, since this g++ has no AddressSanitizer), and the
+# real host client end to end. Only in a build with the API.
+if echo "$defs" | grep -q -- '-DATABOY_CTL=1'; then
+    ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation $defs \
+        -I "$here/mock" -I "$here" -I "$src" -o "$out/test_ctl" "$here/test_ctl.cpp"
+    "$out/test_ctl"
+    "$out/test_ctl" core1
+    "$out/test_ctl" core1-confirm
+    ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation $defs \
+        -fsanitize=undefined -fsanitize-undefined-trap-on-error -fstack-protector-all -D_GLIBCXX_ASSERTIONS \
+        -I "$here/mock" -I "$here" -I "$src" -o "$out/ctl_fuzz" "$here/ctl_fuzz.cpp"
+    "$out/ctl_fuzz" "$here/ctl_corpus" 100000 1
+    ${PYTHON:-python} "$here/ctl_e2e.py" "$out/test_ctl"
+fi

@@ -8,6 +8,11 @@
 static const uint8_t *flash_target = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET);
 
 config_t config;
+#if ATABOY_CTL
+static bool loaded_from_flash = false;
+bool config_loaded_from_flash(void) { return loaded_from_flash; }
+void config_flash_copy(config_t *out) { memcpy(out, flash_target, sizeof *out); }
+#endif
 
 void config_defaults(void) {
     config.main_selected = 0;
@@ -30,6 +35,9 @@ void config_load(void) {
     memcpy(&tmp, flash_target, sizeof(config_t));
     if (config_valid(&tmp)) {           // holistic review L-2: CRC and ranges, not the magic alone
         config = tmp;
+#if ATABOY_CTL
+        loaded_from_flash = true;
+#endif
     } else {
         config_defaults();
     }

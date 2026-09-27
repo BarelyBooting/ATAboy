@@ -178,7 +178,15 @@ void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
     rw_cmd.open = false;
     read_ahead_forget();
 }
+#if ATABOY_CTL
+#include "ctl.h"
+// SET_CONFIGURATION after a USB reset also ends the Control port's session
+// (palimpsest api/SPEC-v1.md 2.4). ctl.c cannot define tud_mount_cb itself:
+// there is one, here.
+void tud_mount_cb(void) { rw_cmd.open = false; read_ahead_forget(); ctl_on_usb_mount(); }
+#else
 void tud_mount_cb(void) { rw_cmd.open = false; read_ahead_forget(); }
+#endif
 
 // ---------------------------------------------------------------------------
 //  MSC Required Callbacks

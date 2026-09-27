@@ -102,8 +102,63 @@ endif()
 # on ATA-3 drives (sat_policy.h), so they are refused unless this is ON.
 # Never ON in a build used on archaeology specimens.
 option(ATABOY_SAT_SMART_SAVES "Also allow SMART READ DATA and RETURN STATUS through SAT" OFF)
+# palimpsest fork: the ATAboy Control API (palimpsest api/SPEC-v1.md), a
+# second CDC port (interfaces 3 and 4) speaking one JSON object per line.
+# Stage 1: the port, the framing and parser, ids and the replay table, and
+# the read-only ops. OFF by default, and an OFF build is byte for byte the
+# image of the sources without it.
+option(ATABOY_CTL "ATAboy Control API: a second CDC port, JSON lines" OFF)
+if(ATABOY_CTL)
+    target_sources(ATAboy PRIVATE ctl.c ctl_job.c ctl_json.c ctl_policy.c ctl_sha256.c)
+    target_compile_definitions(ATAboy PRIVATE ATABOY_CTL=1)
+    target_link_libraries(ATAboy pico_rand)     # dev.boot, a random id per boot (SPEC-v1 3.3)
+endif()
 if(ATABOY_SAT AND ATABOY_SAT_SMART_SAVES)
     target_compile_definitions(ATAboy PRIVATE ATABOY_SAT_SMART_SAVES=1)
+endif()
+if(ATABOY_CTL)
+    # Owner decision Q5: the API build is 0.6f4, so neither picotool info nor
+    # the setup screen can pass it off as the CP3044's 0.6f3p10.
+    if(ATABOY_SAT AND ATABOY_SAT_SMART_SAVES)
+        set(ATABOY_VERSION "0.6f4-palimpsest-smartsaves")
+        set(ATABOY_BANNER "v0.6f4 (fork+api+smartsaves)")
+    else()
+        set(ATABOY_VERSION "0.6f4-palimpsest")
+        set(ATABOY_BANNER "v0.6f4 (fork+api)")
+    endif()
+    pico_set_program_version(ATAboy "${ATABOY_VERSION}")
+    # hello's build identity (SPEC-v1 4.2), one generated header that the
+    # banner reads too. The commit comes from git archive, which writes it
+    # into ctl_build_id.txt (export-subst, .gitattributes), or from git in a
+    # checkout, with dirty set when the source folder differs from it.
+    file(STRINGS ${CMAKE_CURRENT_LIST_DIR}/ctl_build_id.txt ATABOY_GIT LIMIT_COUNT 1)
+    string(STRIP "${ATABOY_GIT}" ATABOY_GIT)             # a CRLF copy leaves a carriage return
+    set(ATABOY_DIRTY 0)
+    if(NOT ATABOY_GIT MATCHES "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$")
+        set(ATABOY_GIT "0000000000000000000000000000000000000000")
+        set(ATABOY_DIRTY 1)
+        find_package(Git QUIET)
+        if(GIT_FOUND)
+            execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+                            OUTPUT_VARIABLE head OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE rc ERROR_QUIET)
+            execute_process(COMMAND ${GIT_EXECUTABLE} status --porcelain -- . WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+                            OUTPUT_VARIABLE changes RESULT_VARIABLE rc2 ERROR_QUIET)
+            if(rc EQUAL 0 AND rc2 EQUAL 0 AND head MATCHES "^[0-9a-f]+$")
+                set(ATABOY_GIT ${head})
+                if(changes STREQUAL "")
+                    set(ATABOY_DIRTY 0)
+                endif()
+            endif()
+        endif()
+    endif()
+    file(SHA256 ${CMAKE_CURRENT_LIST_DIR}/sat_policy.c ATABOY_SAT_POLICY_SHA256)
+    file(SHA256 ${CMAKE_CURRENT_LIST_DIR}/ctl_policy.c ATABOY_CTL_POLICY_SHA256)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 ${CMAKE_CURRENT_LIST_DIR}/sat_policy.c ${CMAKE_CURRENT_LIST_DIR}/ctl_policy.c
+                 ${CMAKE_CURRENT_LIST_DIR}/ctl_build_id.txt)
+    configure_file(${CMAKE_CURRENT_LIST_DIR}/ctl_build.h.in ${CMAKE_CURRENT_BINARY_DIR}/generated/ctl_build.h @ONLY)
+    target_include_directories(ATAboy PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+elseif(ATABOY_SAT AND ATABOY_SAT_SMART_SAVES)
     # The opt-in build names itself, so picotool info tells it apart (review
     # L-2); the setup screen banner says so too (menus.c).
     pico_set_program_version(ATAboy "0.6f3p10-palimpsest-smartsaves")

@@ -22,6 +22,7 @@
 #include "obs.c"
 #include "ide.c"
 #include "usb.c"
+#include "ctl_stubs.h"              // ATABOY_CTL: usb.c tells the API of a USB reset
 #if ATABOY_SAT
 #include "sat_policy.c"
 #include "sat.c"
@@ -4929,6 +4930,15 @@ int main() {
     test_sat_failed_ctrl_g_refused();
 #else
     test_no_sat();
+#endif
+#if ATABOY_CTL
+    // The ATAboy Control API (palimpsest api/SPEC-v1.md 2.4): SET_CONFIGURATION
+    // after a USB reset reaches it through usb.c's tud_mount_cb, since ctl.c
+    // cannot define one of its own (R-API-1 finding 16).
+    current = "USB reset reaches the Control API";
+    int usb_mounts_before = stub_ctl_usb_mounts;
+    tud_mount_cb();
+    CHECK(stub_ctl_usb_mounts == usb_mounts_before + 1, "tud_mount_cb did not tell the API (%d)", stub_ctl_usb_mounts);
 #endif
     // Worst time core 0 spent in one callback, and in one host command, per
     // failure scenario (the report quotes these).

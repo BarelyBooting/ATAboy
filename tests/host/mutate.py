@@ -1363,6 +1363,175 @@ MUTANTS = [
      '        if (ide_tripped()) trip_screen_forever();\n', ''),
     ('Q7: the screen is drawn once only', 'menus.c',
      '        while (queue_try_remove(&cdc_rx_queue, &c)) shown = false;', '        while (queue_try_remove(&cdc_rx_queue, &c)) (void)0;'),
+    # --- the ATAboy Control API, stage 1 (palimpsest api/SPEC-v1.md 11.2; test_ctl,
+    # ctl_fuzz, ctl_e2e.py, test_usb_layout, test_fwupdate). Every name starts
+    # "API", so mutate.py API runs exactly these. X numbers are the spec's.
+    # --- the parser (ctl_json.c; SPEC-v1 3.2, 11.2 X30-X34) ---
+    ('API X30: duplicate key accepted', 'ctl_json.c',
+     'if (d->node[a].parent == d->node[b].parent && same_key(d, a, b)) return CTLJ_E_DUP;',
+     'if (0 && d->node[a].parent == d->node[b].parent && same_key(d, a, b)) return CTLJ_E_DUP;'),
+    ('API X30: trailing garbage accepted', 'ctl_json.c',
+     '    if (i != len) return CTLJ_E_PARSE;              // trailing garbage',
+     '    if (0) return CTLJ_E_PARSE;'),
+    ('API X33: depth 4 accepted', 'ctl_json.c',
+     'if (depth >= CTLJ_MAX_DEPTH || ++objs > CTLJ_MAX_OBJS) return CTLJ_E_PARSE;',
+     'if (depth > CTLJ_MAX_DEPTH || ++objs > CTLJ_MAX_OBJS) return CTLJ_E_PARSE;'),
+    ('API X34: integer above 2^53 - 1 accepted', 'ctl_json.c',
+     '                if (v > CTLJ_MAX_INT) return CTLJ_E_PARSE;\n', ''),
+    ('API: 33 keys accepted', 'ctl_json.c',
+     'if (++keys > CTLJ_MAX_KEYS) return CTLJ_E_PARSE;', 'if (++keys > CTLJ_MAX_KEYS + 1) return CTLJ_E_PARSE;'),
+    ('API: a 65-character string accepted', 'ctl_json.c',
+     'if (!tok_char(p[j]) || j - start >= max) return false;', 'if (!tok_char(p[j]) || j - start > max) return false;'),
+    ('API: an escape (backslash) accepted in a string', 'ctl_json.c',
+     "c == '_' || c == '.' || c == ':' || c == '-';", "c == '_' || c == '.' || c == ':' || c == '-' || c == 92;"),
+    ('API: a leading zero accepted', 'ctl_json.c',
+     "                if (p[start] == '0' && i - start > 1) return CTLJ_E_PARSE;     // leading zero\n", ''),
+    # --- the line layer (ctl.c; SPEC-v1 3.1, X29, X31, X32, X35, X56) ---
+    ('API X32: a byte outside 0x20-0x7E passes the line layer', 'ctl.c',
+     'if (line[i] < 0x20 || line[i] > 0x7E) {', 'if (0) {'),
+    ('API X31: a 1,025-byte line accepted (limit off by one)', 'ctl.c',
+     'if (c.len >= CTL_MAX_REQUEST - 1) {', 'if (c.len >= CTL_MAX_REQUEST) {'),
+    ('API X31: a 1,024-byte line refused (limit off by one)', 'ctl.c',
+     'if (c.len >= CTL_MAX_REQUEST - 1) {', 'if (c.len >= CTL_MAX_REQUEST - 2) {'),
+    ('API X29: a partial line (no \\n) executed', 'ctl.c',
+     '    if (c.len == 0 && !c.overflow) { c.quiet_ms = 0; return; }',
+     '    if (c.len && !c.overflow && !c.resp_busy) { uint32_t n = c.len; c.len = 0; handle_line(n); return; }\n'
+     '    if (c.len == 0 && !c.overflow) { c.quiet_ms = 0; return; }'),
+    ('API: a long USB callback counts as the host\'s silence', 'ctl.c',
+     '    if (since_last > CTL_GAP_MS) { c.quiet_ms = 0; return; }\n', ''),
+    ('API: an empty line answered', 'ctl.c',
+     '    if (len == 0) return;                         // an empty line: no answer (a host resyncs with \\n)\n', ''),
+    ('API: \\r\\n not taken as the end of a line', 'ctl.c',
+     "    if (len && line[len - 1] == '\\r') len--;      // one optional \\r before the \\n\n", ''),
+    ('API X56: requests read and answered while DTR is low', 'ctl.c', '    if (!dtr) {\n', '    if (0) {\n'),
+    ('API: a DTR drop does not end the line', 'ctl.c',
+     'if (dtr_dropped || usb_mounted || (c.dtr && !dtr)) {', 'if (usb_mounted) {'),
+    ('API X26: a USB reset does not end the line', 'ctl.c',
+     'void ctl_on_usb_mount(void) { usb_mounted = true; }', 'void ctl_on_usb_mount(void) { }'),
+    ('API X26: usb.c does not tell the API of a USB reset', 'usb.c',
+     'void tud_mount_cb(void) { rw_cmd.open = false; read_ahead_forget(); ctl_on_usb_mount(); }',
+     'void tud_mount_cb(void) { rw_cmd.open = false; read_ahead_forget(); }'),
+    ('API X35: the writer waits for the host', 'ctl.c',
+     '    if (c.resp_sent >= c.resp_len) c.resp_busy = false;\n',
+     '    while (c.resp_sent < c.resp_len) c.resp_sent += tud_cdc_n_write(CTL_ITF, c.resp + c.resp_sent, c.resp_len - c.resp_sent);\n'
+     '    if (c.resp_sent >= c.resp_len) c.resp_busy = false;\n'),
+    ('API: a response the host never reads is never abandoned', 'ctl.c',
+     '    else if (now - c.resp_at_ms >= CTL_TX_ABANDON_MS) { c.resp_busy = false; c.tx_abandoned++; }\n', ''),
+    # --- the envelope and the op table (ctl_policy.c, ctl.c; SPEC-v1 3.3, 3.4, 4.0, I-14) ---
+    ('API: v not checked', 'ctl_policy.c',
+     'if (v < 0 || d->node[v].type != CTLJ_INT || d->node[v].num != CTL_PROTO_VERSION) {',
+     'if (v < 0 || d->node[v].type != CTLJ_INT) {'),
+    ('API X30: an unknown envelope field accepted', 'ctl_policy.c',
+     'if (i != v && i != id && i != op && i != args && i != token) { r->field = "request"; return CTL_E_SCHEMA; }',
+     'if (0) { r->field = "request"; return CTL_E_SCHEMA; }'),
+    ('API X30: an unknown argument accepted', 'ctl_policy.c',
+     'if (!known) { *field = "args"; return CTL_E_SCHEMA; }', 'if (0) { *field = "args"; return CTL_E_SCHEMA; }'),
+    ('API: argument ranges not checked', 'ctl_policy.c',
+     'if (s->type == CTLJ_INT && (v->num < s->lo || v->num > s->hi)) return CTL_E_RANGE;', ''),
+    ('API: a token accepted where none belongs', 'ctl_policy.c',
+     'if (ctl_op_needs_token(r->op) != (token > 0)) {', 'if (ctl_op_needs_token(r->op) && token < 0) {'),
+    ('API: a duplicate key let through after the v check', 'ctl.c',
+     'if (e != CTL_E_PROTO_VERSION && pr == CTLJ_E_DUP) {', 'if (0 && pr == CTLJ_E_DUP) {'),
+    ('API X1: wp.off in the op table', 'ctl_policy.c',
+     '{ "wp.on",             CTL_TIER_S,       false,     5, false },',
+     '{ "wp.off",            CTL_TIER_S,       false,     5, false },'),
+    ('API X19: setup.geometry in the op table', 'ctl_policy.c',
+     '{ "mount",             CTL_TIER_M,       true,   1000, false },',
+     '{ "setup.geometry",    CTL_TIER_M,       true,   1000, false },'),
+    ('API: a Tier S op marked built in stage 1', 'ctl_policy.c',
+     '{ "wp.on",             CTL_TIER_S,       false,     5, false },',
+     '{ "wp.on",             CTL_TIER_S,       false,     5, true  },'),
+    ('API X40: hello offers an op this build does not carry', 'ctl_policy.c',
+     '*state = CTL_CAP_ABSENT; *why = "NOT_BUILT";', '*state = CTL_CAP_OPERATIONAL;'),
+    ('API: hello offers a human-only op', 'ctl.c',
+     'ctlw_str(w, "state", "ABSENT"); ctlw_str(w, "why", "HUMAN_ONLY");',
+     'ctlw_str(w, "state", "LOCKED"); ctlw_str(w, "why", "HUMAN_ONLY");'),
+    ('API: hello does not list setup.detect and setup.geometry', 'ctl.c',
+     '    for (int i = 0; i < CTL_NOT_IN_V1_COUNT; i++) {', '    for (int i = 0; i < 0; i++) {'),
+    ('API: hello without max_mutating_id', 'ctl.c',
+     '    ctlw_uint(w, "max_mutating_id", c.replay.max_id);\n', ''),
+    ('API: hello reports the wrong version', 'ctl.c',
+     '    ctlw_str(w, "version", CTL_FW_VERSION);', '    ctlw_str(w, "version", "0.6f3p10-palimpsest");'),
+    # --- ids and the replay table (ctl_policy.c; SPEC-v1 3.5, X27, X47, I-18) ---
+    ('API X47: replay matched on the id only', 'ctl_policy.c',
+     '        if (memcmp(s->digest, digest, 32) != 0) return CTL_RPV_REUSED;\n', ''),
+    ('API X27: a replayed id executed again', 'ctl_policy.c',
+     '        return CTL_RPV_REPLAY;\n', '        return CTL_RPV_NEW;\n'),
+    ('API: no E_STALE_ID', 'ctl_policy.c', '    if (id <= t->max_id) return CTL_RPV_STALE;\n', ''),
+    ('API: max_mutating_id never rises', 'ctl_policy.c', '    if (id > t->max_id) t->max_id = id;\n', ''),
+    ('API: a pending replay entry evicted', 'ctl_policy.c',
+     '        if (t->slot[i].state == CTL_RP_DONE) pick = i;', '        if (t->slot[i].state != CTL_RP_EMPTY) pick = i;'),
+    ('API: a replay takes a new seq (built afresh)', 'ctl.c',
+     '        case CTL_RPV_REPLAY:\n            send_replay(slot);\n            return;\n',
+     '        case CTL_RPV_REPLAY:\n            break;\n'),
+    # --- the rate window (ctl_policy.c; X41) ---
+    ('API X41: rate limit off by one', 'ctl_policy.c',
+     'if (now_ms - r->at[r->head] >= 1000) {', 'if (now_ms - r->at[r->head] >= 999) {'),
+    # --- the job on core 1 (ctl.c, ctl_job.c, menus.c; SPEC-v1 4.6, 5.3, X22-X25, X36, X55, X59, I-9, I-11) ---
+    ('API X22: a job run while the TUI is in a confirm box', 'ctl_job.c',
+     'return s == CTL_TUI_MAIN || s == CTL_TUI_FEATURES || s == CTL_TUI_DEBUG || s == CTL_TUI_MOUNTED;',
+     'return s == CTL_TUI_MAIN || s == CTL_TUI_FEATURES || s == CTL_TUI_DEBUG || s == CTL_TUI_MOUNTED || s == CTL_TUI_CONFIRM;'),
+    ('API: menus.c has no idle point', 'menus.c',
+     '        ctl_core1_idle(show_detect_result ? CTL_TUI_ERROR_BOX :', '        if (0) ctl_core1_idle(show_detect_result ? CTL_TUI_ERROR_BOX :'),
+    ('API: menus.c calls a confirm box idle', 'menus.c',
+     '                       current_screen == SCREEN_MOUNTED ? CTL_TUI_MOUNTED : CTL_TUI_CONFIRM);',
+     '                       current_screen == SCREEN_MOUNTED ? CTL_TUI_MOUNTED : CTL_TUI_MAIN);'),
+    ('API X23: taskfile.snapshot queued while mounted', 'ctl.c',
+     "    if (is_mounted) { refuse(true, id, CTL_E_STATE, \"mounted: the bus is the host's\", 0); return false; }\n", ''),
+    ('API X23: taskfile.snapshot run while mounted (pickup)', 'ctl_job.c',
+     "    if (is_mounted) { job_refuse(CTL_E_STATE, \"mounted: the bus is the host's\"); return; }\n", ''),
+    ('API X24: taskfile.snapshot reads register 7', 'ctl_job.c',
+     '        j->alt = ide_read_alt_status();', '        j->alt = ide_read_reg(7);'),
+    ('API X25: a job queued while a USB command runs', 'ctl.c',
+     '    if (usb_msc_ide_busy() || ide_recovery_pending()) {\n        refuse(true, id, CTL_E_BUS_BUSY,',
+     '    if (0) {\n        refuse(true, id, CTL_E_BUS_BUSY,'),
+    ('API X25: a job waits for a USB command instead of refusing', 'ctl_job.c',
+     '    if (usb_msc_ide_busy() || ide_recovery_pending()) { job_refuse(',
+     '    while (usb_msc_ide_busy() || ide_recovery_pending()) busy_wait_us_32(1000);\n    if (0) { job_refuse('),
+    ('API X36: no API_BEGIN marker', 'ctl_job.c',
+     '    j->log_begin = obs_api(j->op, j->id, OBS_API_BEGIN);', '    j->log_begin = 0;'),
+    ('API X36: no API_END marker', 'ctl_job.c',
+     '    j->log_end = obs_api(j->op, j->id, j->outcome == CTL_OUT_DONE ? OBS_API_DONE : OBS_API_UNKNOWN);',
+     '    j->log_end = 0;'),
+    ('API X59: a bus step after the deadline', 'ctl_job.c',
+     '        if (job_now_ms() > deadline) break;\n', ''),
+    ('API X55: a queued job kept when the port closes', 'ctl.c',
+     'if (ctl_job.state == CTL_JOB_QUEUED && ctl_job_cas(CTL_JOB_QUEUED, CTL_JOB_EMPTY) && c.job_slot >= 0) {',
+     'if (0) {'),
+    ('API: a queued job never withdrawn (no 30 s)', 'ctl.c',
+     'now - ctl_job.queued_ms >= CTL_TUI_WAIT_MS', 'now - ctl_job.queued_ms >= 100 * CTL_TUI_WAIT_MS'),
+    ('API: two jobs in flight', 'ctl.c',
+     '    if (ctl_job.state != CTL_JOB_EMPTY) { refuse(true, id, CTL_E_INFLIGHT, "another job is in flight", 0); return false; }\n', ''),
+    ('API: a job refused at pickup kept as job.last', 'ctl.c', '    if (j->ran) {\n', '    if (1) {\n'),
+    # --- status, epoch, mount_seq, identify.cached (ctl.c, menus.c, ide.c; SPEC-v1 4.3, 4.4, I-28) ---
+    ('API: epoch does not move', 'ctl.c', '        c.epoch++;\n', ''),
+    ('API: status hides write protect forced by a Ctrl+G', 'ctl.c',
+     '    if (noid) ctlw_str(w, 0, "CTRLG");', '    (void)noid;'),
+    ('API X69: mount_seq not counted at a TUI mount', 'menus.c',
+     '    if (kind == OBS_EV_MOUNT) ctl_mount_noted(obs_last_marker_seq());\n    else ide_idcache_stale();',
+     '    if (kind != OBS_EV_MOUNT) ide_idcache_stale();'),
+    ('API X69: mount_seq also counted at unmount', 'menus.c',
+     '    if (kind == OBS_EV_MOUNT) ctl_mount_noted(obs_last_marker_seq());\n    else ide_idcache_stale();',
+     '    ctl_mount_noted(obs_last_marker_seq());\n    if (kind != OBS_EV_MOUNT) ide_idcache_stale();'),
+    ('API: identify.cached kept after a Ctrl+G', 'ide.c', '    ide_idcache_clear(IDE_IDC_WHY_CTRLG);', '    (void)0;'),
+    ('API: identify.cached kept after a probe', 'ide.c', '    ide_idcache_clear(IDE_IDC_WHY_PROBE);', '    (void)0;'),
+    ('API: identify.cached not stale after an unmount', 'ide.c',
+     'void ide_idcache_stale(void) { idc.stale = true; }', 'void ide_idcache_stale(void) { }'),
+    ('API: Auto Detect\'s IDENTIFY not kept', 'menus.c',
+     '        if (detected) ide_idcache_put(id_buf, IDE_IDC_AUTO_DETECT);', '        (void)0;'),
+    # --- the descriptor (usb_descriptors.c, tusb_config.h; SPEC-v1 2.1, F-3) ---
+    ('API: Control data endpoint collides with MSC', 'usb_descriptors.c',
+     '#define EPNUM_CTL_OUT     0x05', '#define EPNUM_CTL_OUT     0x03'),
+    ('API: bcdDevice not bumped', 'usb_descriptors.c', '    .bcdDevice          = 0x0101,', '    .bcdDevice          = 0x0100,'),
+    ('API: no interface string for Control', 'usb_descriptors.c',
+     'TUD_CDC_DESCRIPTOR(ITF_NUM_CTL, 6, EPNUM_CTL_NOTIF', 'TUD_CDC_DESCRIPTOR(ITF_NUM_CTL, 0, EPNUM_CTL_NOTIF'),
+    ('API: one CDC instance with the Control function', 'tusb_config.h',
+     '#define CFG_TUD_CDC              2', '#define CFG_TUD_CDC              1'),
+    ('API: the ATABOY_CTL=0 descriptor changed', 'usb_descriptors.c',
+     '#else\n    .bcdDevice          = 0x0100,\n#endif', '#else\n    .bcdDevice          = 0x0101,\n#endif'),
+    # --- the banner (menus.c; owner Q5) ---
+    ('API: the API build shows the p10 banner', 'menus.c',
+     '#elif ATABOY_CTL\n#define BANNER', '#elif 0\n#define BANNER'),
 ]
 
 
@@ -1372,8 +1541,12 @@ MUTANTS = [
 # while run.sh ran three from 0a6cb06 on; a surviving mutant would then have
 # been reported as "not run" instead of SURVIVED (fixed in 0.6f3p7).
 # test_manual_chs twice: its own run, then "q7-core1" (Q7, core 1's loop).
+# Then the descriptor layout twice (the Control API off and on), and, in a
+# build with the API (run.sh's default), test_ctl three times (its tests,
+# "core1", "core1-confirm"), ctl_fuzz, and ctl_e2e.py, which runs test_ctl.
 PROGRAMS = ['test_read', 'test_read_pipelined', 'transcripts', 'test_read_shipping', 'test_fwupdate', 'test_fwupdate_smart', 'test_manual_chs',
-            'test_manual_chs', 'test_usb_desc', 'test_pio_timing']
+            'test_manual_chs', 'test_usb_desc', 'test_pio_timing', 'test_usb_layout0', 'test_usb_layout1',
+            'test_ctl', 'test_ctl', 'test_ctl', 'ctl_fuzz', 'test_ctl']
 
 
 def run_tests(srcdir, outdir):
@@ -1394,9 +1567,15 @@ def main():
     print(f'unmutated: rc={base.returncode}  {last}')
     if base.returncode != 0:
         print('the unmutated sources must pass first'); return 2
-    bad_setup, survived, killed = [], [], []
+    bad_setup, survived, killed, crashed = [], [], [], []
     words = sys.argv[1:]
+    shard = None
+    if len(words) >= 2 and words[0] == '--shard':       # --shard i/n: every n-th chosen mutant from i
+        shard = tuple(int(x) for x in words[1].split('/'))
+        words = words[2:]
     chosen = [m for m in MUTANTS if not words or any(w in m[0] for w in words)]
+    if shard:
+        chosen = chosen[shard[0]::shard[1]]
     for name, fname, old, new in chosen:
         tmp = tempfile.mkdtemp(prefix='ataboy-mut-')
         src = os.path.join(tmp, 'src')
@@ -1411,6 +1590,7 @@ def main():
         if p is None:
             # A test that never finishes did not pass: the mutant is caught.
             killed.append(name)
+            crashed.append(name)
             print(f'KILLED       {name}\n             timed out after 900 s')
             shutil.rmtree(tmp, ignore_errors=True); continue
         out = p.stdout.strip().splitlines()
@@ -1426,7 +1606,9 @@ def main():
             built = nxt and any(os.path.exists(os.path.join(tmp, 'out', nxt + x)) for x in ('', '.exe'))
             if built:
                 killed.append(name)
-                print(f'KILLED       {name}\n             {nxt} crashed: {(p.stderr.strip().splitlines() or ["?"])[-1][:150]}')
+                crashed.append(name)
+                last = (p.stdout.strip().splitlines() or ['?'])[-1][:150]
+                print(f'KILLED       {name}\n             {nxt} crashed: {(p.stderr.strip().splitlines() or ["?"])[-1][:150]} (last output: {last})')
             else:
                 bad_setup.append((name, 'did not build: ' + (p.stderr.strip().splitlines() or ['?'])[-1]))
                 print(f'NO RESULT    {name}')
@@ -1443,7 +1625,13 @@ def main():
             print(f'SURVIVED     {name}  ({summary})')
         shutil.rmtree(tmp, ignore_errors=True)
     print(f'\n{len(killed)} killed, {len(survived)} survived, {len(bad_setup)} not run, of {len(chosen)}'
-          + (f' (filtered from {len(MUTANTS)})' if words else ''))
+          + (f' (filtered from {len(MUTANTS)})' if words or shard else '')
+          + (f', shard {shard[0]}/{shard[1]}' if shard else ''))
+    # A kill by a crash or a timeout (no summary line) is a kill, but not by a
+    # failed check: listed apart, so each can be looked at.
+    print(f'{len(killed) - len(crashed)} killed by a failed check, {len(crashed)} crash-only')
+    for n in crashed:
+        print(f'  crash-only: {n}')
     for n, why in bad_setup:
         print(f'  not run: {n}: {why}')
     return 0 if not survived and not bad_setup else 1

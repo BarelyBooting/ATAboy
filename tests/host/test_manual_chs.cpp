@@ -55,6 +55,7 @@ static inline absolute_time_t make_timeout_time_us(uint64_t us) { return get_abs
 static inline bool time_reached(absolute_time_t t) { return get_absolute_time() >= t; }
 
 #include "menus.c"
+#include "ctl_stubs.h"              // ATABOY_CTL: the API's hooks in menus.c
 
 // Holistic review: core 1's stack canary lives in ATAboy.c and the fault
 // stop in fault.c, neither built here (fault.c is Arm assembly).

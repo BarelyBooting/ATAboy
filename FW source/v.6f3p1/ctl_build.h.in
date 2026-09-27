@@ -1,0 +1,12 @@
+// ATAboy Control API: the build's identity, for hello (palimpsest
+// api/SPEC-v1.md 4.2) and the setup screen's banner (menus.c). CMakeLists.txt
+// makes ctl_build.h from this file in the build folder; do not edit that copy.
+#ifndef CTL_BUILD_H
+#define CTL_BUILD_H
+#define CTL_FW_VERSION          "@ATABOY_VERSION@"
+#define CTL_FW_BANNER           "@ATABOY_BANNER@"
+#define CTL_GIT                 "@ATABOY_GIT@"
+#define CTL_DIRTY               @ATABOY_DIRTY@
+#define CTL_SAT_POLICY_SHA256   "@ATABOY_SAT_POLICY_SHA256@"
+#define CTL_CTL_POLICY_SHA256   "@ATABOY_CTL_POLICY_SHA256@"
+#endif
