@@ -1619,6 +1619,16 @@ static void jp2_fit(bool f) { mock_jumper_fitted[1] = f; }
 static void hold2(bool f, uint32_t ms) { jp2_fit(f); pump(ms); }
 static void away(uint32_t ms) { mock_now_ns += (uint64_t)ms * 1000000ull; }
 static uint32_t t_ms() { return to_ms_since_boot(get_absolute_time()); }
+// Pump to the moment `to` on the millisecond clock, when it is ahead by less
+// than 10 minutes; otherwise fail and pump nothing (a moment already passed,
+// under a mutant, would otherwise wrap to a 49-day pump and hang the run).
+static bool pump_to(uint32_t to) {
+    uint32_t d = to - t_ms();
+    CHECK(d < 600000u, "pump_to: %u ms ahead (a moment already passed?)", (unsigned)d);
+    if (d >= 600000u) return false;
+    pump(d);
+    return true;
+}
 static J status_now(uint32_t id) { return ask1(req(id, "status"), nullptr, 10); }
 static std::string jstate(const J &s, const char *which) { return s["result"]["jumpers"][which].s; }
 
@@ -2947,8 +2957,9 @@ static void test_presence_120s() {
         hold2(false, 400);
         send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()), 1);
         CHECK(c.pres.waiting, "not waiting");
+        if (!c.pres.waiting) continue;
         uint32_t A = c.pres.arrival_ms;
-        pump(A + 119798 + k - t_ms());                  // fitted here: the edge 1 ms on, the event 201 ms on
+        if (!pump_to(A + 119798 + k)) continue;         // fitted here: the edge 1 ms on, the event 201 ms on
         jp2_fit(true);
         pump(210);
         J r = one_answer();
@@ -3028,7 +3039,7 @@ static void test_presence_wrap() {
     power_drive();
     open_lease(1);
     hold2(false, 400);
-    pump((uint32_t)(0u - 100u) - t_ms());                // to 100 ms before the wrap
+    if (!pump_to(0u - 100u)) return;                    // to 100 ms before the wrap
     jp2_fit(true);
     pump(150);                                           // 50 ms past it
     CHECK(t_ms() < 1000, "not past the wrap (%u)", (unsigned)t_ms());
@@ -3044,7 +3055,7 @@ static void test_presence_wrap() {
     power_drive();
     open_lease(1);
     hold2(false, 400);
-    pump((uint32_t)(0u - 60u) - t_ms());                 // to 60 ms before the wrap
+    if (!pump_to(0u - 60u)) return;                     // to 60 ms before the wrap
     send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()), 10);
     CHECK(c.pres.waiting && c.pres.arrival_ms > 0xFFFF0000u, "no request just before the wrap (%u)", (unsigned)c.pres.arrival_ms);
     hold2(false, 150);                                   // 100 ms past the wrap
