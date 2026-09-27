@@ -2869,6 +2869,43 @@ static void test_sat_manual_chs_refused() {
     SatResult a = sat_cmd(rows[0].cdb, 512, true);
     CHECK(a.r == 512 && sim.id_commands() == ids + 1, "IDENTIFY after detection: r %d", a.r);
 }
+
+// Owner decision 2026-09-26 (API Q1-Q7), F-1: the same refusal after a
+// Ctrl+G that FAILED once it had started sending (the no-IDENTIFY rule,
+// mchs_no_identify), not only after one that succeeded (manual_chs_active).
+// No mount path follows a failed Ctrl+G today (menus.c clears the geometry
+// and Auto Detect is refused), so the test mounts by hand, as an API mount
+// would. Before the fix IDENTIFY went through to the drive.
+static void test_sat_failed_ctrl_g_refused() {
+    for (int native = 0; native < 2; native++) {
+        // (LBA for the native one: setup sends 91h in CHS, after which a
+        // native Ctrl+G is refused before it sends anything, review H-1.)
+        setup(native ? "F-1: SAT after a native Ctrl+G that failed (RECALIBRATE aborted)" : "F-1: SAT after a Ctrl+G whose 91h was refused",
+              native ? LBA : CHS);
+        is_mounted = false;
+        uint8_t st = 0;
+        int r;
+        if (native) { sim.abort_recal = true; r = ide_manual_chs_native(10, 17, &st); }
+        else        { sim.reject_idp = true;     r = ide_manual_chs(10, 17, &st); }
+        CHECK(r == (native ? IDE_MCHS_NOT_READY : IDE_MCHS_REFUSED) && !ide_manual_chs_active() && ide_mchs_no_identify(),
+              "Ctrl+G: r %d st %02X active %d", r, st, ide_manual_chs_active());
+        sim.abort_recal = false; sim.reject_idp = false;
+        is_mounted = true;
+        int cmds = sim.commands, ids = sim.id_commands();
+        struct { const char *name; std::vector<uint8_t> cdb; uint32_t xfer; } rows[] = {
+            { "IDENTIFY (12)", pt12(4, 0x0E, 0, 1, 0, 0xA0, 0xEC), 512 },
+            { "IDENTIFY (16)", pt16(4, false, 0x0E, 0, 1, 0, 0x00, 0xEC), 512 },
+        };
+        for (auto &e : rows) {
+            SatResult s = sat_cmd(e.cdb, e.xfer, true);
+            CHECK(!s.ok() && sense_is(s.sense, 0x05, 0x24, 0x00), "%s: r %d, sense %X/%02X/%02X", e.name, s.r,
+                  s.sense.size() > 13 ? s.sense[2] & 0x0F : 0xFF, s.sense.size() > 13 ? s.sense[12] : 0xFF,
+                  s.sense.size() > 13 ? s.sense[13] : 0xFF);
+        }
+        CHECK(sim.commands == cmds && sim.id_commands() == ids, "reached the drive: %d commands, %d IDENTIFY",
+              sim.commands - cmds, sim.id_commands() - ids);
+    }
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -4794,6 +4831,7 @@ int main() {
     test_sat_fast_command();
     test_sat_device_fault();
     test_sat_manual_chs_refused();
+    test_sat_failed_ctrl_g_refused();
 #else
     test_no_sat();
 #endif

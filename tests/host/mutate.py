@@ -904,7 +904,10 @@ MUTANTS = [
      '    long_words.valid = false;   // likewise word 22 (READ LONG)\n', ''),
     # L-2: nothing through SAT to a drive set up by Ctrl+G.
     ('L-2: SAT not told about Ctrl+G', 'sat.c',
-     '    in.manual_chs = ide_manual_chs_active();', '    in.manual_chs = false;'),
+     '    in.manual_chs = ide_manual_chs_active() || ide_mchs_no_identify();', '    in.manual_chs = false;'),
+    # Owner decision 2026-09-26, F-1: and after a Ctrl+G that failed.
+    ('F-1: SAT not told about a Ctrl+G that failed (the old code)', 'sat.c',
+     '    in.manual_chs = ide_manual_chs_active() || ide_mchs_no_identify();', '    in.manual_chs = ide_manual_chs_active();'),
     ('L-2: an accepted Ctrl+G does not set the flag', 'ide.c',
      '    manual_chs_active = true;       // no pass-through to this drive (sat_policy.h)\n', ''),
     ('L-2: an IDENTIFY that answers does not clear the flag', 'ide.c',
