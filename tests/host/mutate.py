@@ -1684,9 +1684,9 @@ MUTANTS = [
      '                    if (config.drive_write_protected != wp_before) ctl_wp_last = CTL_WP_TUI;\n'),
     ('API S2: Load Defaults leaves last_change', 'menus.c',
      '                    if (config.drive_write_protected != wp_before) ctl_wp_last = CTL_WP_TUI;\n', ''),
-    ('API S2: the error box dismissed does not move the epoch', 'menus.c',
-     '    sync_to_config(); needs_full_redraw = true;\n#if ATABOY_CTL\n    CTL_EPOCH_BUMP();\n',
-     '    sync_to_config(); needs_full_redraw = true;\n#if ATABOY_CTL\n'),
+    # (No mutant for the error box's dismissal: the mutation run of 243e0ac
+    # found its own bump redundant, since it always changes the geometry
+    # through sync_to_config, which counts it; the bump was taken out.)
     ('API S2: Mount with nothing to mount does not move the epoch', 'menus.c',
      '    show_detect_result = true; needs_full_redraw = true;\n#if ATABOY_CTL\n    CTL_EPOCH_BUMP();\n',
      '    show_detect_result = true; needs_full_redraw = true;\n#if ATABOY_CTL\n'),

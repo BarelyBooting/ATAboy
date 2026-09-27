@@ -1553,9 +1553,8 @@ static void detect_result_dismiss(void) {
     cur_cyls = 0; cur_heads = 0; cur_spt = 0;
     total_lba_sectors = 0; use_lba_mode = false; is_mounted = false;
     media_changed_waiting = true;   // as every other unmount path does
-    sync_to_config(); needs_full_redraw = true;
+    sync_to_config(); needs_full_redraw = true;   // the epoch moves there (the geometry, and is_mounted with it)
 #if ATABOY_CTL
-    CTL_EPOCH_BUMP();
     ctl_setup_noted(CTL_SRC_NONE);
 #endif
 }

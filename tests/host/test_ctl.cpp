@@ -1095,8 +1095,15 @@ static void test_identify_forbid() {
     int reg0 = sim.reg_writes;
     CHECK(!ide_identify(buf) && sim.cmd_count[0xEC] == 1 && refused.identify_call == call0 + 1 && sim.reg_writes == reg0,
           "ide_identify sent after identify.forbid");
-    // identify_send, the last layer before the strobe, refuses on its own.
-    CHECK(identify_run(buf) == 0 && refused.identify_run == run0 + 1 && sim.cmd_count[0xEC] == 1, "identify_run sent");
+    // identify_send, the last layer before the strobe, refuses on its own
+    // (without it the tripwire below would stop the firmware: a failed check
+    // here, not a stop, so the mutation run sees which layer went).
+    int got = -1;
+    trip_expected = true;
+    if (!setjmp(trip_jb)) got = identify_run(buf);
+    trip_expected = false;
+    CHECK(got == 0 && !trip.tripped && refused.identify_run == run0 + 1 && sim.cmd_count[0xEC] == 1,
+          "identify_run sent or reached the tripwire (returned %d, tripped %d)", got, trip.tripped);
     // Auto Detect's probe clears Ctrl+G's rule, never this one.
     (void)ide_probe_devices();
     CHECK(ide_identify_forbidden() && !ide_identify(buf) && sim.cmd_count[0xEC] == 1, "the probe cleared identify.forbid");
