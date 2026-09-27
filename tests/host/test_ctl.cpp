@@ -235,6 +235,14 @@ static void test_op_table() {
         for (int i = 0; i < CTL_OP_COUNT; i++) in_table |= !strcmp(ctl_ops[i].name, h);
         CHECK(listed && !in_table && CTL_NOT_IN_V1_COUNT == 2, "%s: listed %d, in the op table %d", h, listed, in_table);
     }
+    // An op number outside the table is never offered (X40): every v1 op is
+    // built from stage 4 on, so hello's walk over the table no longer meets it.
+    for (int op : { -1, (int)CTL_OP_COUNT, (int)CTL_OP_COUNT + 7 }) {
+        uint8_t st = 0xFF;
+        const char *why = nullptr;
+        ctl_op_cap(op, &st, &why);
+        CHECK(st == CTL_CAP_ABSENT && why && !strcmp(why, "NOT_BUILT"), "ctl_op_cap(%d): state %u why %s", op, st, why ? why : "-");
+    }
     // Mutating: Tier S, the session ops and Tier M; tokens: Tier M and session.close.
     for (int i = 0; i < CTL_OP_COUNT; i++) {
         CHECK(ctl_op_mutating(i) == (i >= CTL_OP_WP_ON), "%s mutating %d", ctl_ops[i].name, ctl_op_mutating(i));
@@ -2187,6 +2195,10 @@ static void test_presence() {
     char t[CTL_PRESENCE_TEXT];
     CHECK(ctl_presence_text(t, sizeof t) && !strncmp(t, "JP2? setup.ctrlg #2 ", 20) && !strncmp(t + 20, sha_hex(line).c_str(), 8) &&
           strlen(t) == 28, "the presence row: %s", t);
+    pump(60000);                                        // ms_left counts down (60 s later)
+    J s60 = status4(5);
+    CHECK(s60["result"]["presence"]["ms_left"].n > 59000 && s60["result"]["presence"]["ms_left"].n <= 60000,
+          "ms_left 60 s after the arrival: %llu", (unsigned long long)s60["result"]["presence"]["ms_left"].n);
     CHECK(sim.cmd_count[0x91] == n91 && sim.hw_resets == nhw, "something sent while it waits");
     uint32_t lg = log_next;
     hold2(true, 250);                                   // the act
@@ -2314,6 +2326,8 @@ static void test_withdrawal() {
             w = x; found = true;
             if (k.by && !strcmp(k.by, "CLOSED")) order = i + 1 < got.size();     // before the close's own DONE
         }
+        CHECK(found && w["retry"].is(!strcmp(k.code, "E_STALE") ? "AFTER_STATUS" : "SAFE"), "%s: retry %s", k.name,
+              w["retry"].s.c_str());
         CHECK(found && is_refusal(w, k.code) && (!k.by || w["err"]["by"].is(k.by)) && order && !c.pres.waiting &&
               sim.cmd_count[0x91] == 0 && sim.hw_resets == 0, "%s: %s %s (%zu lines)", k.name, w["err"]["code"].s.c_str(),
               w["err"]["by"].s.c_str(), got.size());
@@ -2394,6 +2408,23 @@ static void test_tier_m_arrival() {
           [] { use_lba_mode = false; cur_cyls = 980; cur_heads = 10; cur_spt = 17; sync_to_config();
                ctl_setup_noted(CTL_SRC_API_CTRLG_NATIVE); } },
         { "mount, no such source", reqt(29, "mount", tk, mount_args("NONE")), "E_SCHEMA", nullptr },
+        { "mount naming a device that is not one", reqt(37, "mount", tk, "{\"expect\":{\"source\":\"TUI_DETECT_NORMAL\",\"mode\":\"CHS\",\"device\":\"BOTH\",\"cyls\":980,\"heads\":10,\"spt\":17}}"), "E_SCHEMA",
+          [] { tui_setup_chs(980, 10, 17); } },
+        { "mount expecting other spt", reqt(33, "mount", tk, mount_args("TUI_DETECT_NORMAL", 980, 10, 18)), "E_STALE",
+          [] { tui_setup_chs(980, 10, 17); } },
+        { "mount expecting other heads", reqt(34, "mount", tk, mount_args("TUI_DETECT_NORMAL", 980, 9, 17)), "E_STALE",
+          [] { tui_setup_chs(980, 10, 17); } },
+        { "mount expecting the slave", reqt(35, "mount", tk, "{\"expect\":{\"source\":\"TUI_DETECT_NORMAL\",\"mode\":\"CHS\",\"device\":\"SLAVE\",\"cyls\":980,\"heads\":10,\"spt\":17}}"), "E_STALE",
+          [] { tui_setup_chs(980, 10, 17); } },
+        { "mount expecting other LBA sectors", reqt(36, "mount", tk, "{\"expect\":{\"source\":\"TUI_DETECT_LBA\",\"mode\":\"LBA\",\"device\":\"MASTER\",\"lba_sectors\":166601}}"),
+          "E_STALE", [] { use_lba_mode = true; cur_cyls = 980; cur_heads = 10; cur_spt = 17; total_lba_sectors = 166600; strcpy(hdd_model_raw, "SIM DRIVE"); sync_to_config(); ctl_setup_noted(CTL_SRC_TUI_DETECT_LBA); } },
+        { "a reset left pending by a USB command", reqt(31, "setup.ctrlg", tk, ctrlg_args()), "E_BUS_BUSY", [] { rec.stage = REC_SRST; } },
+        { "mount of a set-up whose geometry is gone", reqt(32, "mount", tk, mount_args("TUI_DETECT_NORMAL")), "E_PRECONDITION",
+          [] { use_lba_mode = false; cur_cyls = 0; cur_heads = 0; cur_spt = 0; total_lba_sectors = 0; sync_to_config();
+               ctl_setup_noted(CTL_SRC_TUI_DETECT_NORMAL); } },
+        { "mount expecting CHS of an LBA set-up with the same numbers", reqt(30, "mount", tk, mount_args("TUI_DETECT_LBA")), "E_STALE",
+          [] { use_lba_mode = true; cur_cyls = 980; cur_heads = 10; cur_spt = 17; total_lba_sectors = 980u * 10 * 17;
+               strcpy(hdd_model_raw, "SIM DRIVE"); sync_to_config(); ctl_setup_noted(CTL_SRC_TUI_DETECT_LBA); } },
     };
     for (auto &k : cases) {
         fresh("stage 4: arrival refusals");
@@ -2406,7 +2437,14 @@ static void test_tier_m_arrival() {
         std::string d0 = state2();
         uint32_t e0 = ctl_epoch;
         int n91 = sim.cmd_count[0x91], nhw = sim.hw_resets;
-        J r = ask1(line);
+        host_send(line);
+        pump(1);                                        // the pass that reads it: refused there, never in the slot
+        bool entered = c.pres.waiting;
+        pump(59);
+        std::vector<std::string> got = host_lines();
+        J r;
+        if (got.size() == 1) parse_response(got[0], r);
+        CHECK(got.size() == 1 && !entered, "%s: %zu answers, entered the slot %d", k.name, got.size(), (int)entered);
         CHECK(is_refusal(r, k.code) && !c.pres.waiting && ctl_epoch == e0 && state2() == d0 && sim.cmd_count[0x91] == n91 &&
               sim.hw_resets == nhw, "%s: %s (%s %s)", k.name, r["err"]["code"].s.c_str(), r["err"]["why"].s.c_str(),
               r["err"]["field"].s.c_str());
@@ -2496,6 +2534,61 @@ static void test_pair() {
         CHECK(!is_mounted && c.pres.waiting && c.pres.op == CTL_OP_MOUNT, "%s: a mount without an act (mounted %d)", k.name,
               (int)is_mounted);
     }
+    // The credit's 60 s counted to the pickup (Q3): queued at 59 s, picked up
+    // after 60 s, refused (E_PRESENCE_REQUIRED).
+    fresh("stage 4: the credit lapses between the queueing and the pickup");
+    open_lease(1);
+    pair_setup(2);
+    (void)one_answer();
+    pump(59000);
+    core1_runs = false;
+    host_send(reqt(3, "mount", lease_token, mount_args()));
+    pump(5);
+    CHECK(ctl_job.state == CTL_JOB_QUEUED && ctl_job.via_credit, "not queued on the credit");
+    pump(2000);
+    core1_runs = true;
+    pump(20);
+    {
+        J r = one_answer();
+        CHECK(is_refusal(r, "E_PRESENCE_REQUIRED") && !is_mounted, "a credit past 60 s at pickup: %s", r["err"]["code"].s.c_str());
+    }
+    // A change after the mount was queued on the credit, before its pickup,
+    // ends the credit there too (Q3): refused, not mounted.
+    fresh("stage 4: a change between the credit mount's queueing and its pickup");
+    open_lease(1);
+    pair_setup(2);
+    (void)one_answer();
+    core1_runs = false;
+    host_send(reqt(3, "mount", lease_token, mount_args()));
+    pump(5);
+    CHECK(ctl_job.state == CTL_JOB_QUEUED && ctl_job.via_credit, "not queued on the credit");
+    human_wp(false);
+    pump(3);
+    core1_runs = true;
+    pump(20);
+    {
+        J r = one_answer();
+        CHECK(is_refusal(r, "E_PRESENCE_REQUIRED") && !is_mounted, "a change before the pickup: %s", r["err"]["code"].s.c_str());
+    }
+    // One credit, one mount, even one that never ran: a mount queued on it and
+    // withdrawn unpicked (E_TUI_BUSY at 30 s, no state change) spent it.
+    fresh("stage 4: the credit spent by a mount that never ran");
+    open_lease(1);
+    pair_setup(2);
+    (void)one_answer();
+    core1_runs = false;
+    host_send(reqt(3, "mount", lease_token, mount_args()));
+    pump(5);
+    CHECK(ctl_job.state == CTL_JOB_QUEUED && ctl_job.via_credit, "not queued on the credit");
+    pump(30500);
+    {
+        J r = one_answer();
+        CHECK(is_refusal(r, "E_TUI_BUSY"), "the unpicked mount: %s", r["err"]["code"].s.c_str());
+    }
+    core1_runs = true;
+    send_only(reqt(4, "mount", lease_token, mount_args()), 20);
+    CHECK(c.pres.waiting && c.pres.id == 4 && !is_mounted, "a second mount on one credit (mounted %d, waiting %d)", (int)is_mounted,
+          (int)c.pres.waiting);
     // A mount expecting another geometry never uses the credit (E_STALE at arrival).
     fresh("stage 4: the credit and another geometry");
     open_lease(1);
@@ -2503,6 +2596,11 @@ static void test_pair() {
     (void)one_answer();
     J other = ask1(reqt(3, "mount", lease_token, mount_args("API_CTRLG_IDP", 979)));
     CHECK(is_refusal(other, "E_STALE") && !is_mounted && credit_live(now_ms()), "another geometry: %s", other["err"]["code"].s.c_str());
+    // An unmount or detach naming another mount changes nothing (I-27): the credit stays (X68).
+    J u1 = ask1(req(4, "unmount", named(ctl_mount_seq + 1).c_str()));
+    J d1 = ask1(req(5, "detach", named(ctl_mount_seq + 2).c_str()));
+    CHECK(is_refusal(u1, "E_STALE") && is_refusal(d1, "E_STALE") && credit_live(now_ms()), "a mount-name mismatch: %s %s, credit %d",
+          u1["err"]["code"].s.c_str(), d1["err"]["code"].s.c_str(), (int)credit_live(now_ms()));
 }
 
 // At pickup (5.3, 4.14; findings 9 and 14): the act was spent, the request
@@ -2531,6 +2629,29 @@ static void test_pickup() {
         CHECK(is_refusal(r, k.code) && sim.cmd_count[0x91] == 0 && sim.hw_resets == 0 && !c.jl_present,
               "%s: %s", k.name, r["err"]["code"].s.c_str());
         jp1_fit(false); busy_until_ns = 0;
+    }
+    // expect_epoch compared again at pickup: a change while the approved job
+    // waits for core 1 refuses it (E_STALE), nothing sent.
+    fresh("stage 4: at pickup, expect_epoch");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    {
+        std::string ep = ",\"expect_epoch\":" + std::to_string(ctl_epoch);
+        send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args(980, 10, 17, "idp", "master", ep.c_str())));
+    }
+    core1_runs = false;
+    hold2(true, 250);
+    CHECK(ctl_job.state == CTL_JOB_QUEUED, "expect_epoch: not queued");
+    human_wp(false);                                    // the TUI changes something meanwhile
+    pump(3);
+    core1_runs = true;
+    pump(20);
+    {
+        J r;
+        for (auto &l : host_lines()) { J x; if (parse_response(l, x) && x["id"].n == 2) r = x; }
+        CHECK(is_refusal(r, "E_STALE") && r["err"]["field"].is("expect_epoch") && sim.cmd_count[0x91] == 0 && sim.hw_resets == 0,
+              "expect_epoch at pickup: %s %s", r["err"]["code"].s.c_str(), r["err"]["field"].s.c_str());
     }
     // The lease closed while the approved job waits for core 1: withdrawn
     // (finding 9), answered before the close's own DONE.
@@ -2620,6 +2741,141 @@ static void test_tier_m_no_terminal() {
     cdc_connected = false;
 }
 
+// The lease ends while its set-up runs (Q3, X51): the set-up still ends
+// (a running job is not cancelled, 6.1), and earns no credit.
+static void test_credit_lease_ends_during_setup() {
+    fresh("stage 4: the lease ends during the set-up");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args(980, 10, 17, "idp", "master", ",\"then_mount\":true")));
+    // core 0 reads a session.close while core 1 is in the RESET- pulse
+    sim_reset_hook = [](bool high) { if (!high) { host_send(reqt(3, "session.close", lease_token, "{}")); one_task(); one_task(); } };
+    hold2(true, 250);
+    sim_reset_hook = nullptr;
+    pump(20);
+    J a, cl;
+    for (auto &l : host_lines()) { J x; if (parse_response(l, x)) { if (x["id"].n == 2) a = x; if (x["id"].n == 3) cl = x; } }
+    CHECK(a["outcome"].is("DONE") && !a["result"]["mount_credit"].b && cl["outcome"].is("DONE") && !c.credit.live,
+          "the lease ended during the set-up: %s, mount_credit %d, close %s", a["outcome"].s.c_str(), (int)a["result"]["mount_credit"].b,
+          cl["outcome"].s.c_str());
+}
+
+// ide.c refusing the job's Ctrl+G by itself, nothing sent (a 91h seen
+// between the pickup checks and the call): NOT_EXECUTED, never FAILED, and
+// the state as it was.
+static void test_ctrlg_refused_by_ide_job() {
+    fresh("stage 4: setup.ctrlg refused by ide.c after its pickup");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args(980, 10, 17, "native")));
+    ctl_test_before_ctrlg = [] { idp_written = true; CTL_EPOCH_BUMP(); };
+    hold2(true, 250);
+    ctl_test_before_ctrlg = nullptr;
+    J r = one_answer();
+    CHECK(is_refusal(r, "E_PRECONDITION") && r["err"]["why"].is("IDP_SENT_SINCE_BOOT") && sim.hw_resets == 0 && sim.commands == 0 &&
+          ctl_setup_src == CTL_SRC_NONE, "ide.c's own refusal: %s %s %s", r["outcome"].s.c_str(), r["err"]["code"].s.c_str(),
+          r["err"]["why"].s.c_str());
+}
+
+// menus_api_ctrlg when ide.c refuses before sending anything (bad heads;
+// the power-up default mode after a 91h): the state is left as it was. The
+// job's own checks never let either through; this is the layer under them.
+static void test_api_ctrlg_refused_by_ide() {
+    fresh("stage 4: menus_api_ctrlg refused by ide.c");
+    power_drive();
+    tui_setup_chs(980, 10, 17);
+    for (int k = 0; k < 2; k++) {
+        if (k) idp_written = true;
+        std::string st0 = state2();
+        uint8_t src0 = ctl_setup_src, st = 0;
+        int n = sim.commands, hw = sim.hw_resets;
+        int r = menus_api_ctrlg(980, k ? 10 : 17, 17, k == 1, &st);
+        CHECK(r == (k ? IDE_MCHS_IDP_SENT : IDE_MCHS_BAD_ARGS) && config.cyls == 980 && config.heads == 10 && ctl_setup_src == src0 &&
+              !strcmp(hdd_model_raw, "SIM DRIVE") && sim.commands == n && sim.hw_resets == hw,
+              "%s: rc %d, geometry %u/%u, source %u", k ? "native after a 91h" : "heads 17", r, config.cyls, config.heads, ctl_setup_src);
+        (void)st0;
+    }
+    idp_written = false;
+    hooked();
+}
+
+// An LBA set-up (the TUI's picker) mounted over the API: its own act, the
+// expect in LBA terms, the whole LBA size.
+static void test_mount_lba() {
+    fresh("stage 4: an LBA mount");
+    power_drive();
+    open_lease(1);
+    ([] { use_lba_mode = true; cur_cyls = 980; cur_heads = 10; cur_spt = 17; total_lba_sectors = 166600; strcpy(hdd_model_raw, "SIM DRIVE"); sync_to_config(); ctl_setup_noted(CTL_SRC_TUI_DETECT_LBA); })();
+    media_changed_waiting = false;
+    hold2(false, 400);
+    send_only(reqt(2, "mount", lease_token, "{\"expect\":{\"source\":\"TUI_DETECT_LBA\",\"mode\":\"LBA\",\"device\":\"MASTER\",\"lba_sectors\":166600}}"));
+    CHECK(c.pres.waiting && c.pres.op == CTL_OP_MOUNT, "the LBA mount does not wait for its act");
+    hold2(true, 250);
+    J r = one_answer();
+    CHECK(media_changed_waiting, "the API mount did not flag the media change for the host");
+    CHECK(r["outcome"].is("DONE") && r["result"]["total_sectors"].n == 166600 && !r["result"]["used_credit"].b && is_mounted &&
+          current_screen == SCREEN_MOUNTED, "the LBA mount: %s, %llu sectors", r["outcome"].s.c_str(),
+          (unsigned long long)r["result"]["total_sectors"].n);
+    // Its API_BEGIN and API_END around the MOUNT marker (5.4, X36).
+    CHECK(api_entries(CTL_OP_MOUNT, 2, OBS_API_BEGIN) == 1 && api_entries(CTL_OP_MOUNT, 2, OBS_API_DONE) == 1,
+          "the mount's API entries: begin %d, end %d", api_entries(CTL_OP_MOUNT, 2, OBS_API_BEGIN), api_entries(CTL_OP_MOUNT, 2, OBS_API_DONE));
+    // A mount approved and then refused at its pickup (JP1 fitted meanwhile):
+    // not mounted, no marker.
+    fresh("stage 4: a mount refused at its pickup");
+    power_drive();
+    open_lease(1);
+    tui_setup_chs(980, 10, 17);
+    hold2(false, 400);
+    send_only(reqt(2, "mount", lease_token, mount_args("TUI_DETECT_NORMAL")));
+    core1_runs = false;
+    hold2(true, 250);
+    CHECK(ctl_job.state == CTL_JOB_QUEUED, "the mount not queued");
+    uint32_t ms0 = ctl_mount_seq;
+    jp1_fit(true);
+    pump(3);
+    core1_runs = true;
+    pump(20);
+    J p2 = one_answer();
+    CHECK(is_refusal(p2, "E_LOCKED") && !is_mounted && ctl_mount_seq == ms0 && api_entries(CTL_OP_MOUNT, 2, OBS_API_BEGIN) == 0,
+          "a mount at its pickup with JP1 fitted: %s, mounted %d", p2["err"]["code"].s.c_str(), (int)is_mounted);
+    jp1_fit(false);
+}
+
+// A mount-name mismatch leaves a waiting request waiting (I-27, X68).
+static void test_name_mismatch_leaves_waiting() {
+    fresh("stage 4: a mount-name mismatch and a waiting request");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    J u = ask1(req(3, "unmount", named(ctl_mount_seq + 1).c_str()));
+    J d = ask1(req(4, "detach", named(ctl_mount_seq + 1).c_str()));
+    CHECK(is_refusal(u, "E_STALE") && is_refusal(d, "E_STALE") && c.pres.waiting && c.pres.id == 2,
+          "a mismatch touched the waiting request: %s %s, waiting %d", u["err"]["code"].s.c_str(), d["err"]["code"].s.c_str(),
+          (int)c.pres.waiting);
+}
+
+// A set-up that ends past its 75 s (SPEC-v1 5.3, 6.3: an overrun is a
+// firmware defect): UNKNOWN, never DONE, and no credit even with then_mount.
+// ide.c's own waits end it within about 58 s, so the clock is moved 80 s
+// when RESET- is released.
+static void test_ctrlg_deadline() {
+    fresh("stage 4: setup.ctrlg past its max time");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args(980, 10, 17, "idp", "master", ",\"then_mount\":true")));
+    sim_reset_hook = [](bool high) { if (high) mock_now_ns += 80000000000ull; };
+    hold2(true, 250);
+    sim_reset_hook = nullptr;
+    J r = one_answer();
+    CHECK(r["outcome"].is("UNKNOWN") && r["retry"].is("AFTER_STATUS") && !credit_live(now_ms()) && c.jl_present &&
+          c.jl_ended - c.jl_started > 75000, "past 75 s: %s, credit %d, %llu ms", r["outcome"].s.c_str(), (int)credit_live(now_ms()),
+          (unsigned long long)(c.jl_ended - c.jl_started));
+}
+
 // After an API mount (R-API-1 finding 2, I-24): the screen is MOUNTED, and
 // the TUI's bus keys refuse while mounted, nothing sent.
 static void test_mounted_keys() {
@@ -2630,6 +2886,9 @@ static void test_mounted_keys() {
     J m = ask1(reqt(3, "mount", lease_token, mount_args()), nullptr, 20);
     CHECK(m["outcome"].is("DONE") && current_screen == SCREEN_MOUNTED, "screen %d",
           current_screen);
+    // 3. With no mount the keys below are not the test's (Debug S would wait
+    //    for a key for ever): stop here, the check above has failed.
+    if (!is_mounted) return;
     int cmds = sim.commands, hw = sim.hw_resets, writes = sim.reg_writes;
     for (int k : { 'R', 'I', 'T', 'E', 'S' }) {
         current_screen = SCREEN_DEBUG;
@@ -2664,6 +2923,98 @@ static void test_banked_act() {
     hold2(false, 250); hold2(true, 250);
     J r = one_answer();
     CHECK(r["outcome"].is("DONE"), "the act after the arrival: %s", r["outcome"].s.c_str());
+    // The edge sampled in the pass that reads the request: the same
+    // millisecond, not after it (X60).
+    fresh("stage 4: an edge in the arrival's own millisecond");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    jp2_fit(true);
+    host_send(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    pump(300);
+    CHECK(bj.edge == c.pres.arrival_ms && c.pres.waiting && sim.cmd_count[0x91] == 0 && host_lines().empty(),
+          "an edge in the arrival's millisecond approved it (edge %u, arrival %u, waiting %d)", (unsigned)bj.edge,
+          (unsigned)c.pres.arrival_ms, (int)c.pres.waiting);
+}
+
+// The 120 s from both sides (survivor: withdrawn a millisecond late): an
+// event 119 999 ms after the arrival runs, one at 120 000 ms is too late.
+static void test_presence_120s() {
+    for (uint32_t k = 0; k < 2; k++) {
+        fresh(k ? "stage 4: an event 120 000 ms after the arrival" : "stage 4: an event 119 999 ms after the arrival");
+        power_drive();
+        open_lease(1);
+        hold2(false, 400);
+        send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()), 1);
+        CHECK(c.pres.waiting, "not waiting");
+        uint32_t A = c.pres.arrival_ms;
+        pump(A + 119798 + k - t_ms());                  // fitted here: the edge 1 ms on, the event 201 ms on
+        jp2_fit(true);
+        pump(210);
+        J r = one_answer();
+        CHECK(k ? is_refusal(r, "E_PRESENCE_REQUIRED") && sim.cmd_count[0x91] == 0 : r["outcome"].is("DONE") && sim.cmd_count[0x91] == 1,
+              "an event %u ms after the arrival: %s %s (edge %u)", 119999 + k, r["outcome"].s.c_str(), r["err"]["code"].s.c_str(),
+              (unsigned)(bj.edge - A));
+    }
+}
+
+// The idle timer is paused only by the lease's own request or job (6.1):
+// another's job in the mailbox does not keep it alive.
+static void test_idle_other_job() {
+    fresh("stage 4: the idle timer and a job of no lease");
+    power_drive();
+    open_lease(1, 30);
+    pump(5000);
+    core1_runs = false;
+    host_send(req(2, "taskfile.snapshot"));
+    pump(5);
+    CHECK(ctl_job.state == CTL_JOB_QUEUED, "not queued");
+    pump(26000);                                        // 31 s since the lease was last used
+    CHECK(!c.lease.held, "another's job paused the lease's idle timer");
+    core1_runs = true;
+    pump(20);
+    host_lines();
+}
+
+// The answers owed come before any new line's (4.13): a session.close and
+// a status sent back to back while a request waits.
+static void test_owed_order() {
+    fresh("stage 4: the answers owed before a new line's");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    host_send(reqt(3, "session.close", lease_token, "{}") + req(4, "status"));
+    pump(30);
+    std::vector<uint64_t> ids;
+    for (auto &l : host_lines()) { J x; if (parse_response(l, x)) ids.push_back(x["id"].n); }
+    CHECK(ids.size() == 3 && ids[0] == 2 && ids[1] == 3 && ids[2] == 4, "%zu answers, in the order %llu %llu %llu", ids.size(),
+          ids.size() > 0 ? (unsigned long long)ids[0] : 0ull, ids.size() > 1 ? (unsigned long long)ids[1] : 0ull,
+          ids.size() > 2 ? (unsigned long long)ids[2] : 0ull);
+}
+
+// Core 0 ends the lease between core 1's pickup and its checks (R-API-1
+// finding 9, X55): the lease check at pickup refuses it, nothing is sent.
+static void test_lease_end_at_pickup() {
+    fresh("stage 4: the lease ends between the pickup and its checks");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    core1_runs = false;
+    hold2(true, 250);                                   // approved, queued; core 1 away
+    CHECK(ctl_job.state == CTL_JOB_QUEUED, "not queued");
+    host_send(reqt(3, "session.close", lease_token, "{}"));
+    ctl_test_after_cas = [] { one_task(); one_task(); };   // core 0 takes the close meanwhile
+    ctl_core1_idle(core1_screen);
+    ctl_test_after_cas = nullptr;
+    core1_runs = true;
+    pump(20);
+    J w, cl;
+    for (auto &l : host_lines()) { J x; if (parse_response(l, x)) { if (x["id"].n == 2) w = x; if (x["id"].n == 3) cl = x; } }
+    CHECK(is_refusal(w, "E_LEASE_REVOKED") && w["err"]["by"].is("CLOSED") && cl["outcome"].is("DONE") &&
+          sim.cmd_count[0x91] == 0 && sim.hw_resets == 0, "a lease ended at the pickup: %s by %s, close %s, 91h %d",
+          w["err"]["code"].s.c_str(), w["err"]["by"].s.c_str(), cl["outcome"].s.c_str(), sim.cmd_count[0x91]);
 }
 
 // The same two rules where the millisecond clock wraps (every 2^32 ms, 49.7
@@ -2963,6 +3314,13 @@ static void test_core1_tui() {
         snprintf(want, sizeof want, "\033[13;43H" FG_YELLOW "JP2? setup.ctrlg #71 %.8s", c.pres.waiting ? hex(c.pres.digest, 4).c_str() : "none");
         CHECK(c.pres.waiting && tty.find(want, (size_t)mark_91) != std::string::npos, "presence row not drawn");
         mark_91 = (int)tty.size();
+    });
+    key_at(B(33.2), "\x0c");                        // Ctrl+L: a full frame blanks row 13, the row comes back
+    at(B(33.5), [] {
+        char want[64];
+        snprintf(want, sizeof want, "\033[13;43H" FG_YELLOW "JP2? setup.ctrlg #71 %.8s", c.pres.waiting ? hex(c.pres.digest, 4).c_str() : "none");
+        CHECK(c.pres.waiting && tty.find(want, (size_t)mark_91) != std::string::npos, "presence row not drawn again after Ctrl+L");
+        mark_91 = (int)tty.size();
         host_send(reqt(72, "session.close", lease_token, "{}"));
     });
     at(B(34.0), [] {
@@ -3120,8 +3478,18 @@ int main(int argc, char **argv) {
     test_pair();
     test_pickup();
     test_tier_m_no_terminal();
+    test_ctrlg_deadline();
+    test_credit_lease_ends_during_setup();
+    test_name_mismatch_leaves_waiting();
+    test_mount_lba();
+    test_api_ctrlg_refused_by_ide();
+    test_ctrlg_refused_by_ide_job();
     test_mounted_keys();
     test_banked_act();
+    test_presence_120s();
+    test_idle_other_job();
+    test_owed_order();
+    test_lease_end_at_pickup();
     test_presence_wrap();
     test_credit_mount_only();
     test_ctrlg_layers();

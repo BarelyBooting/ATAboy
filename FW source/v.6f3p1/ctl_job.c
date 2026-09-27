@@ -258,11 +258,20 @@ static const char *const mchs_why[] = {
 // setup.ctrlg: Ctrl+G after its Y (menus_api_ctrlg), within its 75 s: every
 // wait inside it is ide.c's own and bounded (45 s ready, 10 s RECALIBRATE,
 // 1 s 91h). Past the 75 s it reports UNKNOWN (6.3: a firmware defect).
+#if ATABOY_HOST_TEST
+// test_ctl only (never in the firmware): run between the pickup checks and
+// Ctrl+G's call, to drive the refusals ide.c makes itself (nothing sent),
+// which the pickup checks otherwise always make first.
+void (*ctl_test_before_ctrlg)(void);
+#endif
 static void __attribute__((noinline)) run_setup_ctrlg(ctl_job_t *j) {
     if (!tier_m_pickup(j)) return;
     job_began(j);
     uint32_t deadline = j->started_ms + ctl_ops[j->op].max_ms;
     uint8_t st = 0;
+#if ATABOY_HOST_TEST
+    if (ctl_test_before_ctrlg) ctl_test_before_ctrlg();
+#endif
     int r = menus_api_ctrlg(j->m.cyls, j->m.heads, j->m.spt, j->m.native, &st);
     j->mchs_rc = (int8_t)r;
     j->status = st;
@@ -302,10 +311,19 @@ static bool idle_screen(uint8_t s) {
     return s == CTL_TUI_MAIN || s == CTL_TUI_FEATURES || s == CTL_TUI_DEBUG || s == CTL_TUI_MOUNTED;
 }
 
+#if ATABOY_HOST_TEST
+// test_ctl only (never in the firmware): core 0 run in the window between
+// this core's pickup and its checks, where tier_m_pickup's lease check
+// (R-API-1 finding 9) is what refuses a job whose lease core 0 just ended.
+void (*ctl_test_after_cas)(void);
+#endif
 void ctl_core1_idle(uint8_t tui_state) {
     ctl_tui_state = tui_state;
     if (!idle_screen(tui_state) || ctl_job.state != CTL_JOB_QUEUED) return;
     if (!ctl_job_cas(CTL_JOB_QUEUED, CTL_JOB_RUNNING)) return;     // core 0 withdrew it first
+#if ATABOY_HOST_TEST
+    if (ctl_test_after_cas) ctl_test_after_cas();
+#endif
     ctl_job_t *j = &ctl_job;
     j->ran = false;
     j->regs_read = 0;
