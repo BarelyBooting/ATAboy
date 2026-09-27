@@ -1406,6 +1406,8 @@ MUTANTS = [
     ('API X56: requests read and answered while DTR is low', 'ctl.c', '    if (!dtr) {\n', '    if (0) {\n'),
     ('API: a DTR drop does not end the line', 'ctl.c',
      'if (dtr_dropped || usb_mounted || (c.dtr && !dtr)) {', 'if (usb_mounted) {'),
+    ('API: a DTR drop on the TUI port ends the Control port line', 'ctl.c',
+     'if (itf == CTL_ITF && !dtr) dtr_dropped = true;', 'if (!dtr) dtr_dropped = true;'),
     ('API X26: a USB reset does not end the line', 'ctl.c',
      'void ctl_on_usb_mount(void) { usb_mounted = true; }', 'void ctl_on_usb_mount(void) { }'),
     ('API X26: usb.c does not tell the API of a USB reset', 'usb.c',

@@ -286,6 +286,10 @@ static void test_envelope() {
     CHECK(is_refusal(r, "E_SCHEMA"), "include_data not a boolean");
     r = ask1("{\"v\":1,\"id\":18,\"id\":19,\"op\":\"hello\",\"args\":{}}\n");
     CHECK(is_refusal(r, "E_SCHEMA"), "duplicate id key");
+    // A repeated argument: every name in it is known, so only the parser's
+    // duplicate check can refuse it.
+    r = ask1(req(26, "log.read", "{\"cursor\":0,\"cursor\":1,\"max_entries\":1}"));
+    CHECK(is_refusal(r, "E_SCHEMA") && r["id"].n == 26, "duplicate argument accepted");
     r = ask1("{\"v\":2,\"v\":1,\"id\":18,\"op\":\"hello\",\"args\":{}}\n");
     CHECK(is_refusal(r, "E_PROTO_VERSION"), "duplicate v, the first 2: v is checked first");
     r = ask1(req(20, "hello", "{\"a\":{\"b\":1}}"));
@@ -392,6 +396,14 @@ static void test_lines() {
     r = ask(",\"args\":{}}\n" + req(17, "chip.info"), 40);
     CHECK(r.size() == 2 && parse_response(r[0], k) && is_refusal(k, "E_PARSE") && parse_response(r[1], k) && k["id"].n == 17,
           "a line cut by a DTR drop: %zu answers", r.size());
+    // DTR dropped on the TUI's port (interface 0) is not this port's: the
+    // line goes on.
+    host_send("{\"v\":1,\"id\":19,\"op\":\"chip.info\"");
+    pump(2);
+    tud_cdc_line_state_cb(0, false, false);
+    r = ask(",\"args\":{}}\n", 20);
+    CHECK(r.size() == 1 && parse_response(r[0], k) && k["outcome"].is("DONE") && k["id"].n == 19,
+          "a DTR drop on interface 0 cut the Control port's line");
     // USB reset (SET_CONFIGURATION): the same.
     host_send("{\"v\":1,\"id\":18,\"op\":\"chip.info\"");
     pump(2);
@@ -602,10 +614,6 @@ static void test_status() {
     CHECK(m["result"]["wp"]["effective"].b && m["result"]["wp"]["forced_by"].arr.size() == 1 &&
           m["result"]["wp"]["forced_by"].arr[0]->is("CTRLG") && m["result"]["rules"]["no_identify_ctrlg"].b &&
           m["result"]["rules"]["identify_barred"].b, "Ctrl+G forcing WP not shown");
-    // A consistent snapshot: state moving under every copy is E_BUSY_STATE.
-    sim_on_read = nullptr;
-    struct Mover { static void tick() {} };
-    (void)Mover::tick;
 }
 
 static void test_config_get() {
@@ -832,10 +840,10 @@ static void test_taskfile() {
           log_next == log0 && ctl_job.state == CTL_JOB_EMPTY, "a queued job survived the port closing");
     // Past its deadline (a bus held up): it stops reading and ends UNKNOWN.
     fresh("taskfile.snapshot: deadline");
-    sim_reg_cost_ns = 30000000;                     // 30 ms a register read
+    sim_reg_cost_ns = 30000000;                     // 30 ms a register read: 4 fit in the 100 ms, no 5th
     r = ask1(req(54, "taskfile.snapshot"), nullptr, 400);
     sim_reg_cost_ns = 0;
-    CHECK(r["outcome"].is("UNKNOWN") && r["retry"].is("AFTER_STATUS") && ctl_job.regs_read < 7,
+    CHECK(r["outcome"].is("UNKNOWN") && r["retry"].is("AFTER_STATUS") && ctl_job.regs_read <= 4,
           "past the deadline: %s after %u reads", r["outcome"].s.c_str(), ctl_job.regs_read);
 }
 

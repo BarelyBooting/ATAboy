@@ -754,6 +754,7 @@ static void answer_job(void) {
 static void job_poll(uint32_t now) {
     if (c.resp_busy) return;                      // one answer at a time
     uint32_t st = ctl_job.state;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);      // the state before core 1's result
     if (st == CTL_JOB_ENDED) { answer_job(); return; }
     if (st == CTL_JOB_QUEUED && now - ctl_job.queued_ms >= CTL_TUI_WAIT_MS && ctl_job_cas(CTL_JOB_QUEUED, CTL_JOB_EMPTY)) {
         // Withdrawn: nothing of it ran (the CAS decided it against a pickup).
