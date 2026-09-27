@@ -140,7 +140,15 @@ Added in 0.6f3p10 (built and host-tested, not yet run on hardware):
 
     Also, the code that moves words over the IDE bus now runs from one of the RP2350's two small RAM banks next to core 0 instead of from flash. The bus timing comes from the PIO programs and doesn't change.
 
-The fork's build calls itself `0.6f3p10-palimpsest` and shows `v0.6f3p10 (fork)` in the setup screen (0.6f3p1 before items 6 to 15, 0.6f3p6 before 16 to 21, 0.6f3p7 before 22, 0.6f3p8 before 23 to 26, 0.6f3p9 before 27 to 31), so it can't be mistaken for a stock v0.6f3.
+32. **Three more guards for a Ctrl+G drive, and a tripwire under them (2026-09-26).** Built and host-tested, not yet run on hardware.
+
+    **No pass-through IDENTIFY after a Ctrl+G that failed.** ATA PASS-THROUGH refused everything to a drive set up by a Ctrl+G that worked (item 23), but not after one that started sending and then failed (91h refused, RECALIBRATE aborted, the drive not ready). Nothing can mount a drive after a failed Ctrl+G today, so this couldn't happen yet; now it can't happen at all. Pass-through follows the same rule IDENTIFY does: any Ctrl+G since the ATAboy started.
+
+    **Write protect is checked where the sectors are written, too.** Only WRITE(10) checked it before. The sector write routine now refuses by itself, before anything is sent, when write protect is on or a Ctrl+G has run since the ATAboy started, the same rule WRITE(10) uses. With write protect turned off in Features and no Ctrl+G, writes work as before.
+
+    **The tripwire.** The one routine that writes the command register now refuses to send ECh (IDENTIFY) while the no-IDENTIFY rule is set, and 91h while a drive is mounted in Ctrl+G's power-up default mode. Everything above it already refuses both, so it only fires if one of those guards has failed. It costs one compare per command. When it fires, the command is not sent and nothing else is: the bus is released (as for a fault, item 29), USB refuses every read, write and pass-through command from then on (READ BUFFER still answers), the refused command goes into the log (item 30) as a refused entry, never as a command, and the console shows what was refused, which rule refused it and its log entry, and stays on that screen. A fault stop would have stopped USB as well, and then nothing could be read before unplugging, which loses it. If it fires inside a USB command, that command never ends and the host resets the device after its timeout; the console keeps working. Unplug the ATAboy to recover. After a reset with power kept, Debug E shows it as a fault with CFSR `00EC91EC` or `00EC9191`.
+
+The fork's build calls itself `0.6f3p10-palimpsest` and shows `v0.6f3p10 (fork)` in the setup screen (0.6f3p1 before items 6 to 15, 0.6f3p6 before 16 to 21, 0.6f3p7 before 22, 0.6f3p8 before 23 to 26, 0.6f3p9 before 27 to 32), so it can't be mistaken for a stock v0.6f3.
 
 ## Builds
 
