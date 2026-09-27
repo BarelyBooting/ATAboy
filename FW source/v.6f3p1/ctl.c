@@ -302,14 +302,10 @@ static int op_hello(ctlw_t *w, const ctlj_doc_t *d, int args) {
     ctlw_obj(w, "caps");
     for (int op = 0; op < CTL_OP_COUNT; op++) {
         uint8_t st; const char *why;
-#if ATABOY_BOARD_JUMPERS
-        bool built = ctl_ops[op].built;
-#if ATABOY_HOST_TEST
-        built = built || ctl_test_op[op];       // the host tests' stand-ins for stage 4's ops
-#endif
-        ctl_op_cap_jp(op, built, bj_jp1(), false, &st, &why);    // stage 4: the lease
-#else
         ctl_op_cap(op, &st, &why);
+#if ATABOY_BOARD_JUMPERS
+        if (st == CTL_CAP_LOCKED && ctl_ops[op].tier == CTL_TIER_M)
+            ctl_tier_m_cap(bj_jp1(), false, &st, &why);         // stage 4: the lease
 #endif
         ctlw_obj(w, ctl_ops[op].name);
         ctlw_str(w, "state", st == CTL_CAP_OPERATIONAL ? "OPERATIONAL" : st == CTL_CAP_LOCKED ? "LOCKED" : "ABSENT");

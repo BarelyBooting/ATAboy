@@ -1948,6 +1948,34 @@ static void test_jp1_between_passes() {
     CHECK(bj_jp1() == BJ_FITTED && jp1_locked(), "released 5 samples after a live-only lock");
     pump(25);
     CHECK(bj_jp1() == BJ_OPEN && !jp1_locked(), "not released after 30 samples");
+
+    // A gap (core 0 away) inside the OPEN run: the samples before it do not
+    // count toward the release (the shunt may have been back meanwhile).
+    fresh("stage 3: JP1 released across a gap");
+    pump(30);
+    jp1_fit(true); pump(1); jp1_fit(false);
+    pump(15);
+    away(60);
+    pump(5);
+    CHECK(bj_jp1() == BJ_FITTED && jp1_locked(), "released on samples from before a gap");
+    pump(20);
+    CHECK(bj_jp1() == BJ_OPEN, "not released 25 samples after the gap");
+
+    // A pad set up wrong between the read-back and the read of the level:
+    // the read-back after the read catches it (finding 13).
+    fresh("stage 3: a pad set up wrong during the read");
+    human_wp(false);
+    pump(2);
+    struct Race { static void at_read() {
+        mock_pads.io[31] = MOCK_PAD_RESET; mock_io.io[31].ctrl = MOCK_CTRL_RESET; mock_on_gpio_in = nullptr;
+    } };
+    mock_on_gpio_in = Race::at_read;
+    bool locked2 = jp1_locked();
+    mock_on_gpio_in = nullptr;
+    CHECK(locked2 && bj_jp1() == BJ_UNREADABLE && config.drive_write_protected,
+          "a pad changed during the read: locked %d, jp1 %u", locked2, bj_jp1());
+    gpio_pull_up(31); gpio_init(31);
+    pump(30);
 }
 
 // An event with no lease (stage 3 has none): counted, and nothing else
@@ -1974,45 +2002,38 @@ static void test_jp2_changes_nothing() {
 
 // Tier M's capability (3.4) from the jumpers: the function, and hello with
 // stand-ins for stage 4's two Tier M ops.
-static int stand_in(ctlw_t *, const ctlj_doc_t *, int) { return CTL_E_NONE; }
+// Tier M's capability (3.4) from the jumpers: the function stage 4's built
+// Tier M ops will take their state from, and hello as stage 3 builds it
+// (Tier M not built: ABSENT whatever the jumpers; Tier R and S OPERATIONAL
+// whatever the jumpers). hello with a built Tier M op is stage 4's test.
 static void test_tier_m_caps() {
     fresh("stage 3: Tier M's capability");
     struct { uint8_t jp1; bool lease; uint8_t st; const char *why; } t[] = {
         { CTL_JP1_OPEN, false, CTL_CAP_LOCKED, "NO_LEASE" }, { CTL_JP1_OPEN, true, CTL_CAP_OPERATIONAL, nullptr },
         { CTL_JP1_FITTED, false, CTL_CAP_LOCKED, "JP1_FITTED" }, { CTL_JP1_FITTED, true, CTL_CAP_LOCKED, "JP1_FITTED" },
         { CTL_JP1_UNREADABLE, true, CTL_CAP_LOCKED, "JUMPERS_UNREADABLE" }, { CTL_JP1_UNKNOWN, true, CTL_CAP_LOCKED, "JUMPERS_UNREADABLE" },
+        { CTL_JP1_UNREADABLE, false, CTL_CAP_LOCKED, "JUMPERS_UNREADABLE" }, { CTL_JP1_UNKNOWN, false, CTL_CAP_LOCKED, "JUMPERS_UNREADABLE" },
     };
-    for (auto &x : t)
-        for (int op : { CTL_OP_SETUP_CTRLG, CTL_OP_MOUNT }) {
-            uint8_t st; const char *why;
-            ctl_op_cap_jp(op, true, x.jp1, x.lease, &st, &why);
-            CHECK(st == x.st && ((!why && !x.why) || (why && x.why && !strcmp(why, x.why))), "%s jp1 %u lease %d: %u %s",
-                  ctl_ops[op].name, x.jp1, x.lease, st, why ? why : "-");
-            ctl_op_cap_jp(op, false, x.jp1, x.lease, &st, &why);
-            CHECK(st == CTL_CAP_ABSENT && why && !strcmp(why, "NOT_BUILT"), "%s not built", ctl_ops[op].name);
-        }
-    for (int op = 0; op < CTL_OP_COUNT; op++) {
-        if (ctl_ops[op].tier == CTL_TIER_M) continue;
-        for (uint8_t j : { CTL_JP1_FITTED, CTL_JP1_UNREADABLE, CTL_JP1_UNKNOWN }) {
-            uint8_t st; const char *why;
-            ctl_op_cap_jp(op, true, j, false, &st, &why);
-            CHECK(st == CTL_CAP_OPERATIONAL && !why, "%s under jp1 %u: %u", ctl_ops[op].name, j, st);
+    for (auto &x : t) {
+        uint8_t st = 0xFF; const char *why = "x";
+        ctl_tier_m_cap(x.jp1, x.lease, &st, &why);
+        CHECK(st == x.st && ((!why && !x.why) || (why && x.why && !strcmp(why, x.why))), "jp1 %u lease %d: %u %s",
+              x.jp1, x.lease, st, why ? why : "-");
+    }
+    // hello, JP1 open, fitted, and a pad wrong: the same caps each time.
+    for (int k = 0; k < 3; k++) {
+        if (k == 1) { jp1_fit(true); pump(1); }
+        if (k == 2) { jp1_fit(false); pump(30); mock_pads.io[30] &= ~0x40u; pump(1); }
+        J h = ask1(req(1 + k, "hello"), nullptr, 20);
+        const J &caps = h["result"]["caps"];
+        for (int op = 0; op < CTL_OP_COUNT; op++) {
+            bool rs = ctl_ops[op].tier == CTL_TIER_R || ctl_ops[op].tier == CTL_TIER_S;
+            CHECK(rs ? caps[ctl_ops[op].name]["state"].is("OPERATIONAL") && !caps[ctl_ops[op].name].get("why")
+                     : caps[ctl_ops[op].name]["state"].is("ABSENT") && caps[ctl_ops[op].name]["why"].is("NOT_BUILT"),
+                  "hello (jumpers %d): %s %s %s", k, ctl_ops[op].name, caps[ctl_ops[op].name]["state"].s.c_str(),
+                  caps[ctl_ops[op].name]["why"].s.c_str());
         }
     }
-    ctl_test_op[CTL_OP_SETUP_CTRLG] = stand_in;
-    ctl_test_op[CTL_OP_MOUNT] = stand_in;
-    J h = ask1(req(1, "hello"));
-    CHECK(h["result"]["caps"]["setup.ctrlg"]["why"].is("NO_LEASE") && h["result"]["caps"]["mount"]["why"].is("NO_LEASE") &&
-          h["result"]["caps"]["mount"]["state"].is("LOCKED"), "hello, JP1 open: %s", h["result"]["caps"]["mount"]["why"].s.c_str());
-    jp1_fit(true); pump(1);
-    h = ask1(req(2, "hello"));
-    CHECK(h["result"]["caps"]["setup.ctrlg"]["why"].is("JP1_FITTED") && h["result"]["caps"]["mount"]["state"].is("LOCKED"),
-          "hello, JP1 fitted: %s", h["result"]["caps"]["setup.ctrlg"]["why"].s.c_str());
-    jp1_fit(false); pump(30);
-    mock_pads.io[30] &= ~0x40u;
-    h = ask1(req(3, "hello"));
-    CHECK(h["result"]["caps"]["mount"]["why"].is("JUMPERS_UNREADABLE"), "hello, pads wrong: %s", h["result"]["caps"]["mount"]["why"].s.c_str());
-    memset(ctl_test_op, 0, sizeof ctl_test_op);
 }
 #endif
 

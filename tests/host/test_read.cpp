@@ -530,8 +530,15 @@ static void test_jp1_writes() {
     transcript = nullptr;
     setup("JP1 LOCK: WRITE(10) and ide_write_sectors refused", LBA);
     jp1_passes(30);
-    config.drive_write_protected = false;
     std::vector<uint8_t> w(512, 0x5A);
+    // Before board_jumpers_init nothing has been read: locked, and nothing
+    // forced, so ide_write_protected's own use of the answer is what refuses.
+    bj.inited = false;
+    config.drive_write_protected = false;
+    CHECK(ide_write_protected() && !config.drive_write_protected && ide_write_sectors(698, 1, w.data()) < 0 &&
+          sim.written.empty(), "before the pads are set up: a write went out");
+    bj.inited = true;
+    config.drive_write_protected = false;
     int32_t r = host_write10(700, w.data(), 1);
     CHECK(r == 512 && tud_msc_is_writable_cb(0), "JP1 open, WP Disabled: WRITE(10) %d", r);
     size_t written = sim.written.size();

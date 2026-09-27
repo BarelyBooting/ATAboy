@@ -111,7 +111,11 @@ static inline bool mock_pin_level(unsigned pin) {
     else level = mock_floating_high;
     return inover == 3 ? true : inover == 2 ? false : (level != (inover == 1));
 }
+// Called as SIO's input register is read (a test changes a pad there, as
+// another core or a fault could between the read-back and the read).
+inline void (*mock_on_gpio_in)(void) = nullptr;
 struct MockSioIn { operator uint32_t() const {
+    if (mock_on_gpio_in) mock_on_gpio_in();
     uint32_t v = 0;
     for (unsigned p = 30; p < 32; p++) if (mock_pin_level(p)) v |= 1u << p;
     return v;

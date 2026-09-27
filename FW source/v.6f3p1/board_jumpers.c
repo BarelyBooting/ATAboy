@@ -210,8 +210,10 @@ bool bj_task(uint32_t now, bj_event_t *ev) {
         bj.jp2 = s2;
     }
     if (bj.cand) {
-        if (bj.r2.level != BJ_FITTED || bj.r2.first != bj.edge) {
-            bj.cand = false;                // an OPEN sample inside the 200 ms: no event, refit
+        if (bj.r2.level != BJ_FITTED) {
+            // An OPEN sample inside the 200 ms: no event, refit. (A gap or an
+            // unreadable pad has already forgotten the candidate.)
+            bj.cand = false;
         } else if (now - bj.edge >= BJ_FITTED_MS) {
             bj.cand = false;                // one event per fit
             bj.events++;
