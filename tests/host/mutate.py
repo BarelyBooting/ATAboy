@@ -42,6 +42,21 @@ MUTANTS = [
     ('no 400 ns wait after the READ command', 'ide.c',
      '    ide_write_reg(7, cmd);                                 // READ SECTORS EXT / READ SECTORS\n    wait_after_command();',
      '    ide_write_reg(7, cmd);                                 // READ SECTORS EXT / READ SECTORS'),
+    # The same rule on the other paths test_read drives. Each is caught by the
+    # simulator's count of Status reads inside 400 ns of a command (sim.hpp,
+    # early_status), checked over the whole run at the end of test_read.
+    ('no 400 ns wait after the WRITE command', 'ide.c',
+     '    uint32_t w_unwit = 0;\n    wait_after_command();\n',
+     '    uint32_t w_unwit = 0;\n'),
+    ('no 400 ns wait after READ LONG', 'ide.c',
+     '    rl_obs.seq = obs_current_cmd();\n    wait_after_command();\n',
+     '    rl_obs.seq = obs_current_cmd();\n'),
+    ('no 400 ns wait after IDENTIFY', 'ide.c',
+     '    id_obs.seq = obs_current_cmd();\n    busy_wait_us_32(1);             // give drive time to assert BSY\n',
+     '    id_obs.seq = obs_current_cmd();\n'),
+    ('no 400 ns wait after INITIALIZE DEVICE PARAMETERS', 'ide.c',
+     '    ide_write_reg(7, 0x91);\n    uint32_t lseq = obs_current_cmd();\n    wait_after_command();\n',
+     '    ide_write_reg(7, 0x91);\n    uint32_t lseq = obs_current_cmd();\n'),
     # The next four target the READ SECTORS path; READ LONG (0.6f3p9) has
     # its own copies of some of these lines, with mutants of their own below.
     ('registers captured after the reset instead of before', 'ide.c',

@@ -242,7 +242,21 @@ static bool contains_flawed(const HostRead &h) {
 
 // ---- setup -----------------------------------------------------------------
 enum Mode { LBA, CHS };
+// The 400 ns rule over the whole run (sim.hpp, early_status): the first test
+// whose drive saw a Status read inside 400 ns of a command, kept before the
+// next test replaces the drive, and checked once at the end of main.
+static std::string early_first;
+static void note_early_status() {
+    if (sim.early_status == 0 || !early_first.empty()) return;
+    char b[200];
+    std::snprintf(b, sizeof b, "%d in [%s], the first %llu ns after command %02Xh (%s)", sim.early_status,
+                  current.c_str(), (unsigned long long)sim.early_ns, sim.early_cmd,
+                  sim.early_alt ? "Alternate Status" : "Status");
+    early_first = b;
+}
+
 static void setup(const char *name, Mode m, uint32_t medium_sectors = 0) {
+    note_early_status();
     current = name;
     sim = SimDrive();
     mock_now_ns = 0;
@@ -411,12 +425,26 @@ static void test_garbage_while_busy() {
 
 // A failed command leaves ERR in status. With no reset afterwards, the next
 // command must not read that stale status in the first 400 ns.
-static void test_stale_status_after_error() {
-    setup("next read right after an ERR", LBA);
+// ATA: after writing the command register the host waits at least 400 ns
+// before it reads Status; until then the drive may not have raised BSY, and
+// Status still shows the last command's ending (here ERR, 51h). The
+// simulator counts every Status or Alternate Status read inside that window
+// (sim.hpp, early_status), so the rule is checked directly, not only by what
+// a read taken too early goes on to do. Both addressing modes.
+static void test_stale_status_after_error(Mode m) {
+    setup(m == LBA ? "next read right after an ERR, LBA" : "next read right after an ERR, CHS", m);
     sim.bad[300] = {BAD_ERR, 0};
     HostRead h = host_read10(300, 1);
     CHECK(!h.ok, "bad sector fails");
+    CHECK(sim.status == 0x51, "the drive's status after the failure is %02X, not 51h: the check below proves less",
+          sim.status);
+    int cmds = sim.commands;
     HostRead g = host_read10(301, 8);
+    CHECK(sim.commands > cmds, "the good read sent no command");
+    CHECK(sim.early_status == 0,
+          "400 ns rule: %d Status reads inside 400 ns of a command, the first %llu ns after command %02Xh (%s)",
+          sim.early_status, (unsigned long long)sim.early_ns, sim.early_cmd,
+          sim.early_alt ? "Alternate Status" : "Status");
     CHECK(g.ok && matches_medium(g, 301), "good read straight after a failure");
 }
 
@@ -673,15 +701,33 @@ static void test_host_offsets() {
     setup("malformed CBW offsets and lengths", LBA);
     config.drive_write_protected = false;
     static uint8_t b[CFG_TUD_MSC_EP_BUFSIZE];
+    // In rising order, and the first one let through ends the loop, read and
+    // write each. Past the offset check, usb.c copies 512 - offset bytes from
+    // offset in a 512-byte buffer on its stack: for an offset over 512 that
+    // count wraps round, and the copy runs off the stack. Tried anyway, the
+    // "READ(10) accepts a non-zero offset" mutant crashed test_read at 4096
+    // instead of failing the check at 1 (every full mutation run from 83b8cfb
+    // to 6bb7da4). A missing check is shown by the first offset; the larger
+    // ones are only tried while it holds.
     const uint32_t offs[] = {1, 256, 511, 512, 4096};
+    const uint32_t last_off = offs[sizeof offs / sizeof offs[0] - 1];
     for (uint32_t off : offs) {
         memset(b, 0xA5, sizeof b);
         int cmds = sim.commands;
         int32_t r = tud_msc_read10_cb(0, 1000, off, b, 4096);
         bool untouched = true; for (uint8_t x : b) if (x != 0xA5) untouched = false;
-        CHECK(r < 0 && untouched && sim.commands == cmds, "read offset %u: r %d untouched %d", off, r, untouched);
-        r = tud_msc_write10_cb(0, 1000, off, b, 4096);
-        CHECK(r < 0 && sim.written.empty() && sim.commands == cmds, "write offset %u: r %d", off, r);
+        bool refused = r < 0 && untouched && sim.commands == cmds;
+        CHECK(refused, "read offset %u: r %d untouched %d commands %d%s", off, r, untouched, sim.commands - cmds,
+              off != last_off ? "; the larger offsets are not tried" : "");
+        if (!refused) break;
+    }
+    for (uint32_t off : offs) {
+        memset(b, 0xA5, sizeof b);
+        int cmds = sim.commands;
+        int32_t r = tud_msc_write10_cb(0, 1000, off, b, 4096);
+        bool refused = r < 0 && sim.written.empty() && sim.commands == cmds;
+        CHECK(refused, "write offset %u: r %d%s", off, r, off != last_off ? "; the larger offsets are not tried" : "");
+        if (!refused) break;
     }
     const uint32_t lens[] = {1, 500, 1000, 4095};
     for (uint32_t len : lens) {
@@ -3015,8 +3061,16 @@ static void test_salvage_capture(Mode m) {
           "not as without the data: key %02X/%02X asc %02X/%02X calls %d/%d", h.key, plain.key, h.asc, plain.asc,
           h.calls, plain.calls);
     CHECK(h.key == SCSI_SENSE_MEDIUM_ERROR && h.asc == 0x11, "sense %X/%02X", h.key, h.asc);
+    // sim.offered is empty until the drive has offered a block with an ERR.
+    // The comparisons below used to run on it regardless, and read 512 bytes
+    // from an empty vector: a firmware that failed the read before the drive
+    // got that far (the "no 400 ns wait" mutant: a stale ERR read as this
+    // command's) crashed test_read here instead of failing a check.
+    bool offered = sim.offered.size() == 512;
+    CHECK(offered, "the drive never offered its flawed block (%zu bytes kept); the comparisons with it are skipped",
+          sim.offered.size());
     bool leaked = false;
-    for (size_t o = 0; o + 512 <= h.data.size(); o += 2)
+    for (size_t o = 0; offered && o + 512 <= h.data.size(); o += 2)
         if (memcmp(h.data.data() + o, sim.offered.data(), 512) == 0) leaked = true;
     CHECK(!leaked, "the offered bytes are in the READ(10) data");
     ide_salvage_get(&sv);
@@ -3026,7 +3080,7 @@ static void test_salvage_capture(Mode m) {
           "lba %u st %02X err %02X cmd %02X", sv.lba, sv.status, sv.error, sv.command);
     CHECK(sv.ms >= t0 / 1000000 && sv.ms <= t1 / 1000000, "ms %u not in %llu..%llu", sv.ms,
           (unsigned long long)(t0 / 1000000), (unsigned long long)(t1 / 1000000));
-    CHECK(memcmp(sv.data, sim.offered.data(), 512) == 0, "captured bytes are not the ones offered");
+    CHECK(offered && memcmp(sv.data, sim.offered.data(), 512) == 0, "captured bytes are not the ones offered");
     CHECK(f.kind == IDE_FAIL_ERR && f.drained && f.salvaged && f.lba == 5003, "record kind %u drained %d salvaged %d",
           f.kind, f.drained, f.salvaged);
     CHECK(sim.srst == 0 && sim.violations == 0, "srst %d violations %d", sim.srst, sim.violations);
@@ -3056,7 +3110,8 @@ static void test_salvage_capture(Mode m) {
     sim.bad[6001] = {BAD_ERR_DRQ, 0};
     host_read10(6001, 1);
     ide_salvage_get(&sv2);
-    CHECK(sv2.valid && sv2.seq == sv.seq + 1 && sv2.lba == 6001 && memcmp(sv2.data, sim.offered.data(), 512) == 0,
+    CHECK(sv2.valid && sv2.seq == sv.seq + 1 && sv2.lba == 6001 && sim.offered.size() == 512 &&
+          memcmp(sv2.data, sim.offered.data(), 512) == 0,
           "new capture: seq %u lba %u", sv2.seq, sv2.lba);
     b = read_buffer_cmd(rbuf_cdb());
     CHECK(salvage_answer_is(b, sv2), "READ BUFFER after the new capture");
@@ -4750,6 +4805,9 @@ static void test_pipe_clamp(Mode m) {
 }
 
 int main() {
+    // Unbuffered: a FAIL printed before a crash is kept (with stdout to a
+    // pipe or a file, a crash used to lose every line still in the buffer).
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (const char *tp = getenv("ATABOY_TRANSCRIPT")) transcript = fopen(tp, "w");
     std::printf("Pipelined Reads %s\n", test_pipelined ? "On" : "Off");
     // The budget is a design number, not only what the helpers measure
@@ -4776,7 +4834,8 @@ int main() {
     test_hang(CHS);
     test_err_drq_stuck();
     test_garbage_while_busy();
-    test_stale_status_after_error();
+    test_stale_status_after_error(LBA);
+    test_stale_status_after_error(CHS);
     test_media_bounds();
     test_failure_record(LBA);
     test_failure_record(CHS);
@@ -4930,6 +4989,12 @@ int main() {
 #else
     test_no_sat();
 #endif
+    // The 400 ns rule over every test above (note_early_status): no Status
+    // read inside 400 ns of any command, whatever the command or the path.
+    note_early_status();
+    current = "400 ns rule, whole run";
+    CHECK(sim_early_status_total == 0, "%d Status reads inside 400 ns of a command; %s", sim_early_status_total,
+          early_first.c_str());
     // Worst time core 0 spent in one callback, and in one host command, per
     // failure scenario (the report quotes these).
     for (auto &tm : timings)

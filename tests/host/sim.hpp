@@ -70,6 +70,10 @@ enum BadMode {
 };
 struct Bad { BadMode mode; int fails; };
 
+// Status reads inside 400 ns of a command, over every SimDrive of a run (each
+// test starts a new one): see SimDrive::early_status.
+inline int sim_early_status_total = 0;
+
 struct SimDrive {
     // geometry of the medium
     uint32_t nsect = 980u * 10 * 17;
@@ -256,6 +260,17 @@ struct SimDrive {
 
     // bookkeeping for the tests
     int srst = 0, init_params = 0, violations = 0, commands = 0;
+    // ATA: the host waits at least 400 ns after writing the command register
+    // before it reads Status or Alternate Status (the drive need not have set
+    // BSY yet, so what it reads is the status before the command, or worse,
+    // the last command's). Every read inside that window is counted here,
+    // with the first one kept (early_cmd, early_ns after the command, and
+    // early_alt), so a test can say so by a check. Before this the only
+    // evidence was indirect: a stale ERR read as the new command's.
+    int      early_status = 0;
+    uint8_t  early_cmd = 0;
+    uint64_t early_ns = 0;
+    bool     early_alt = false;
     int data_reads = 0;                     // data register reads, any phase
     int id_data_reads = 0;                  // ...of which during IDENTIFY (0xEC)
     // Commands and data reads other than IDENTIFY: the firmware re-IDENTIFYs
@@ -446,6 +461,10 @@ struct SimDrive {
 
     // alt: Alternate Status (control block), which does not release INTRQ.
     uint8_t read_status(uint64_t now, bool alt = false) {
+        if (commands > 0 && now < cmd_at + 400) {  // the host's side of the 400 ns rule
+            if (early_status++ == 0) { early_cmd = cmd_log.empty() ? 0 : cmd_log.back(); early_ns = now - cmd_at; early_alt = alt; }
+            sim_early_status_total++;
+        }
         if (dead) return 0xFF;                     // review C: nothing drives the bus
         if (now < float_until) return 0xFF;        // C-8: not driving the bus yet
         if (!selected()) {
