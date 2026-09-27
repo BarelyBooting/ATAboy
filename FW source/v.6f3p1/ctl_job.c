@@ -26,7 +26,12 @@
 #include "ctl_state.h"
 #include "ide.h"
 #include "obs.h"
+#include "config.h"
+#include "manualchs.h"
 #include "pico/stdlib.h"
+#if ATABOY_BOARD_JUMPERS
+#include "board_jumpers.h"
+#endif
 
 extern volatile bool is_mounted;
 extern bool usb_msc_ide_busy(void);     // usb.c
@@ -40,6 +45,8 @@ volatile uint8_t  ctl_wp_last = CTL_WP_BOOT;
 volatile uint8_t  ctl_setup_src = CTL_SRC_NONE;
 volatile uint32_t ctl_setup_at_ms;
 volatile uint32_t ctl_mount_seq, ctl_mount_log_seq;
+volatile uint32_t ctl_lease_gen;
+volatile uint8_t  ctl_lease_by;
 
 // detach's wait for a USB read started before it (SPEC-v1 4.12, R-API-1
 // finding 8): the TUI's own unmount waits IDE_BUS_WAIT_MS (menus.c), the
@@ -166,6 +173,131 @@ static void __attribute__((noinline)) run_detach(ctl_job_t *j) {
     j->log_end = obs_api(j->op, j->id, OBS_API_DONE);
 }
 
+// ---------------------------------------------------------------------------
+//  Tier M (stage 4; SPEC-v1 4.14)
+// ---------------------------------------------------------------------------
+
+int ctl_mreq_check(uint8_t op, const ctl_mreq_t *m, const char **field, const char **why) {
+    *field = 0;
+    *why = 0;
+    if (is_mounted) return CTL_E_STATE;                     // the bus is the host's
+    if (op == CTL_OP_SETUP_CTRLG) {
+        // What Ctrl+G's dialog waits for or refuses (menus.c bus_free_wait,
+        // mchs_pending_refused), refused here, never waited for.
+        if (usb_msc_ide_busy() || ide_recovery_pending()) return CTL_E_BUS_BUSY;
+        if (m->dev_base != config.dev_base) { *field = "device"; *why = "NOT_THE_DEVICE"; return CTL_E_PRECONDITION; }
+        int bad = manual_chs_bad_field(m->cyls, m->heads, m->spt);
+        if (bad >= 0) { *field = bad == 0 ? "cyls" : bad == 1 ? "heads" : "spt"; return CTL_E_RANGE; }
+        // The power-up default mode, never after a 91h this boot (the
+        // dialog's rule, menus.c; ide.c's too).
+        if (m->native && ide_idp_sent_since_boot()) { *field = "mode"; *why = "IDP_SENT_SINCE_BOOT"; return CTL_E_PRECONDITION; }
+        return CTL_E_NONE;
+    }
+    // mount
+    uint8_t src = ctl_setup_src;
+    if (src == CTL_SRC_NONE) { *why = "NO_SETUP"; return CTL_E_PRECONDITION; }     // settings-only geometry (X21)
+    bool geo = config.use_lba_mode ? config.lba_sectors > 0 : (config.cyls > 0 && config.heads > 0 && config.spt > 0);
+    if (!geo) { *why = "NO_GEOMETRY"; return CTL_E_PRECONDITION; }
+    if ((src == CTL_SRC_TUI_CTRLG_NATIVE || src == CTL_SRC_API_CTRLG_NATIVE) && !ide_manual_chs_native_active()) {
+        *why = "MCHS_NEEDED"; return CTL_E_PRECONDITION;                            // the TUI's MCHS_NEEDED
+    }
+    // The expect, compared and set (4.14): any difference is stale.
+    *field = "expect";
+    if (m->src != src || m->lba != config.use_lba_mode || m->dev_base != config.dev_base) return CTL_E_STALE;
+    if (m->lba ? m->lba_sectors != config.lba_sectors
+               : (m->cyls != config.cyls || m->heads != config.heads || m->spt != config.spt)) return CTL_E_STALE;
+    *field = 0;
+    return CTL_E_NONE;
+}
+
+// At pickup (5.3, 4.14): the lease it came under still held, JP1 open and
+// readable, the credit a mount was queued on still live, its expect_epoch,
+// and every precondition again. A refusal here spends the act: the request
+// ends NOT_EXECUTED, nothing of it ran.
+static bool tier_m_pickup(ctl_job_t *j) {
+    if (j->lease_gen == 0 || j->lease_gen != ctl_lease_gen) {
+        job_refuse(CTL_E_LEASE_REVOKED, "the lease ended before pickup");
+        j->by = ctl_lease_by;
+        return false;
+    }
+#if ATABOY_BOARD_JUMPERS
+    if (!bj_tier_m_open()) {
+        job_refuse(CTL_E_LOCKED, "JP1 fitted, or the jumpers unreadable");
+        j->why = bj_jp1() == BJ_FITTED ? "JP1_FITTED" : "JUMPERS_UNREADABLE";
+        return false;
+    }
+#else
+    job_refuse(CTL_E_LOCKED, "no jumpers in this build");
+    j->why = "JUMPERS_UNSUPPORTED";
+    return false;
+#endif
+    if (j->m.has_epoch && j->m.expect_epoch != ctl_epoch) {
+        job_refuse(CTL_E_STALE, "the state changed since expect_epoch");
+        j->field = "expect_epoch";
+        return false;
+    }
+    if (j->via_credit && (job_now_ms() - j->credit_end_ms > CTL_MOUNT_CREDIT_S * 1000u || ctl_epoch != j->credit_epoch)) {
+        job_refuse(CTL_E_PRESENCE_REQUIRED, "the mount credit lapsed before pickup");
+        return false;
+    }
+    const char *field, *why;
+    int e = ctl_mreq_check(j->op, &j->m, &field, &why);
+    if (e != CTL_E_NONE) {
+        job_refuse((uint8_t)e, "a precondition failed at pickup");
+        j->field = field;
+        j->why = why;
+        return false;
+    }
+    return true;
+}
+
+static const char *const mchs_why[] = {
+    "", "NO_DEVICE", "BUSY", "RECALIBRATE", "REFUSED", "BAD_ARGS", "NOT_READY", "IDP_SENT_SINCE_BOOT",
+};
+
+// setup.ctrlg: Ctrl+G after its Y (menus_api_ctrlg), within its 75 s: every
+// wait inside it is ide.c's own and bounded (45 s ready, 10 s RECALIBRATE,
+// 1 s 91h). Past the 75 s it reports UNKNOWN (6.3: a firmware defect).
+static void __attribute__((noinline)) run_setup_ctrlg(ctl_job_t *j) {
+    if (!tier_m_pickup(j)) return;
+    job_began(j);
+    uint32_t deadline = j->started_ms + ctl_ops[j->op].max_ms;
+    uint8_t st = 0;
+    int r = menus_api_ctrlg(j->m.cyls, j->m.heads, j->m.spt, j->m.native, &st);
+    j->mchs_rc = (int8_t)r;
+    j->status = st;
+    uint8_t mark;
+    if (job_now_ms() > deadline) {
+        j->outcome = CTL_OUT_UNKNOWN; j->err = CTL_E_DRIVE; j->msg = "past its max time"; mark = OBS_API_UNKNOWN;
+    } else if (r == IDE_MCHS_OK) {
+        j->outcome = CTL_OUT_DONE; mark = OBS_API_DONE;
+    } else if (r == IDE_MCHS_BAD_ARGS || r == IDE_MCHS_IDP_SENT) {
+        // Nothing was sent (4.14): NOT_EXECUTED.
+        j->outcome = CTL_OUT_NOT_EXECUTED; j->err = CTL_E_PRECONDITION; j->msg = "refused by ide.c, nothing sent";
+        j->why = mchs_why[r]; mark = OBS_API_FAILED;
+    } else {
+        j->outcome = CTL_OUT_FAILED; j->err = CTL_E_DRIVE; j->msg = "the drive did not take the geometry";
+        j->why = r > 0 && r < (int)(sizeof mchs_why / sizeof mchs_why[0]) ? mchs_why[r] : "UNKNOWN";
+        mark = OBS_API_FAILED;
+    }
+    j->log_end = obs_api(j->op, j->id, mark);
+    j->end_epoch = ctl_epoch;
+}
+
+// mount: TUI confirm-3 (menus_api_mount), no bus.
+static void __attribute__((noinline)) run_mount(ctl_job_t *j) {
+    if (!tier_m_pickup(j)) return;
+    job_began(j);
+    menus_api_mount();
+    j->mount_seq = ctl_mount_seq;
+    j->mount_log_seq = ctl_mount_log_seq;
+    j->total_sectors = config.use_lba_mode ? config.lba_sectors
+                                           : (uint64_t)config.cyls * config.heads * config.spt;
+    j->outcome = CTL_OUT_DONE;
+    j->log_end = obs_api(j->op, j->id, OBS_API_DONE);
+    j->end_epoch = ctl_epoch;
+}
+
 static bool idle_screen(uint8_t s) {
     return s == CTL_TUI_MAIN || s == CTL_TUI_FEATURES || s == CTL_TUI_DEBUG || s == CTL_TUI_MOUNTED;
 }
@@ -180,6 +312,10 @@ void ctl_core1_idle(uint8_t tui_state) {
     j->err = CTL_E_NONE;
     j->msg = "";
     j->field = 0;
+    j->why = 0;
+    j->by = CTL_BY_NONE;
+    j->mchs_rc = -1;
+    j->status = 0;
     j->changed = false;
     j->native_ended = false;
     j->started_ms = job_now_ms();
@@ -187,6 +323,8 @@ void ctl_core1_idle(uint8_t tui_state) {
     if (j->op == CTL_OP_TASKFILE_SNAPSHOT) run_taskfile_snapshot(j);
     else if (j->op == CTL_OP_UNMOUNT) run_unmount(j);
     else if (j->op == CTL_OP_DETACH) run_detach(j);
+    else if (j->op == CTL_OP_SETUP_CTRLG) run_setup_ctrlg(j);
+    else if (j->op == CTL_OP_MOUNT) run_mount(j);
     else job_refuse(CTL_E_UNKNOWN_OP, "no such job");
     j->ended_ms = job_now_ms();
     __atomic_thread_fence(__ATOMIC_SEQ_CST);      // the result before the state

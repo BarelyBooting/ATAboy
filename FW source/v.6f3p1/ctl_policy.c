@@ -26,11 +26,16 @@ const ctl_op_t ctl_ops[CTL_OP_COUNT] = {
     { "identify.forbid",   CTL_TIER_S,       false,     5, true  },
     { "unmount",           CTL_TIER_S,       true,  30000, true  },
     { "detach",            CTL_TIER_S,       true,  30000, true  },
-    // Stage 4 (session, Tier M): in v1, not built yet.
-    { "session.open",      CTL_TIER_SESSION, false,     5, false },
-    { "session.close",     CTL_TIER_SESSION, false,     5, false },
-    { "setup.ctrlg",       CTL_TIER_M,       true,  75000, false },
-    { "mount",             CTL_TIER_M,       true,   1000, false },
+    // Stage 4: the lease and Tier M.
+    { "session.open",      CTL_TIER_SESSION, false,     5, true  },
+    { "session.close",     CTL_TIER_SESSION, false,     5, true  },
+    { "setup.ctrlg",       CTL_TIER_M,       true,  75000, true  },
+    { "mount",             CTL_TIER_M,       true,   1000, true  },
+};
+
+const char *const ctl_src_name[CTL_SRC_COUNT] = {
+    "NONE", "TUI_DETECT_NORMAL", "TUI_DETECT_LARGE", "TUI_DETECT_LBA", "TUI_MANUAL", "TUI_FORCE",
+    "TUI_CTRLG_IDP", "TUI_CTRLG_NATIVE", "API_CTRLG_IDP", "API_CTRLG_NATIVE", "AUTO_MOUNT",
 };
 
 // SPEC-v1 3.4 (client ambiguity A11): never offered to automation.
@@ -130,6 +135,37 @@ static const ctl_arg_t args_session_open[] = {
     { "tui_lock", CTLJ_BOOL, true, 0, 1 },
     { "idle_s", CTLJ_INT, true, 30, CTL_LEASE_IDLE_MAX },
     { 0, 0, false, 0, 0 } };
+// setup.ctrlg (4.14): the ranges are manual_chs_bad_field's (manualchs.h);
+// mode, device and drive_power_cycled are checked for their values below.
+static const ctl_arg_t args_setup_ctrlg[] = {
+    { "cyls", CTLJ_INT, true, 1, 65535 },
+    { "heads", CTLJ_INT, true, 1, 16 },
+    { "spt", CTLJ_INT, true, 1, 255 },
+    { "mode", CTLJ_STR, true, 1, 64 },
+    { "device", CTLJ_STR, true, 1, 64 },
+    { "drive_power_cycled", CTLJ_BOOL, true, 0, 1 },
+    { "then_mount", CTLJ_BOOL, false, 0, 1 },
+    { "expect_epoch", CTLJ_INT, false, 0, 0xFFFFFFFFu },
+    { 0, 0, false, 0, 0 } };
+static const ctl_arg_t args_mount[] = {
+    { "expect", CTLJ_OBJ, true, 0, 0 },
+    { "expect_epoch", CTLJ_INT, false, 0, 0xFFFFFFFFu },
+    { 0, 0, false, 0, 0 } };
+// mount's expect: CHS (cyls, heads, spt) or LBA (lba_sectors), never both.
+static const ctl_arg_t args_expect_chs[] = {
+    { "source", CTLJ_STR, true, 1, 64 },
+    { "mode", CTLJ_STR, true, 1, 64 },
+    { "device", CTLJ_STR, true, 1, 64 },
+    { "cyls", CTLJ_INT, true, 1, 65535 },
+    { "heads", CTLJ_INT, true, 1, 16 },
+    { "spt", CTLJ_INT, true, 1, 255 },
+    { 0, 0, false, 0, 0 } };
+static const ctl_arg_t args_expect_lba[] = {
+    { "source", CTLJ_STR, true, 1, 64 },
+    { "mode", CTLJ_STR, true, 1, 64 },
+    { "device", CTLJ_STR, true, 1, 64 },
+    { "lba_sectors", CTLJ_INT, true, 1, 281474976710655ull },   // 2^48 - 1
+    { 0, 0, false, 0, 0 } };
 
 static const ctl_arg_t *op_args(int op) {
     switch (op) {
@@ -141,15 +177,13 @@ static const ctl_arg_t *op_args(int op) {
     case CTL_OP_UNMOUNT: case CTL_OP_DETACH:
                                 return args_named_mount;
     case CTL_OP_SESSION_OPEN:   return args_session_open;
-    case CTL_OP_SETUP_CTRLG: case CTL_OP_MOUNT:
-                                return 0;       // stage 4: nested schemas not written yet
+    case CTL_OP_SETUP_CTRLG:    return args_setup_ctrlg;
+    case CTL_OP_MOUNT:          return args_mount;
     default:                    return args_none;
     }
 }
 
-static int check_args(const ctlj_doc_t *d, int op, int args, const char **field) {
-    const ctl_arg_t *a = op_args(op);
-    if (!a) return CTL_E_UNKNOWN_OP;                // never built without its schema
+static int check_members(const ctlj_doc_t *d, const ctl_arg_t *a, int args, const char **field) {
     for (int i = 1; i < d->n; i++) {                // every member must be known
         if (d->node[i].parent != args) continue;
         bool known = false;
@@ -167,6 +201,66 @@ static int check_args(const ctlj_doc_t *d, int op, int args, const char **field)
     }
     *field = 0;
     return CTL_E_NONE;
+}
+
+// A string member that must be one of a list: its index, or -1.
+static int one_of(const ctlj_doc_t *d, int obj, const char *key, const char *const *names, int n) {
+    int v = ctlj_find(d, obj, key);
+    if (v < 0) return -1;
+    for (int i = 0; i < n; i++) if (ctlj_str_is(d, v, names[i])) return i;
+    return -1;
+}
+
+static const char *const mode_names[] = { "idp", "native" };
+static const char *const dev_names[] = { "master", "slave" };
+static const char *const dev_names_up[] = { "MASTER", "SLAVE" };
+static const char *const geo_names[] = { "CHS", "LBA" };
+
+static int check_args(const ctlj_doc_t *d, int op, int args, const char **field) {
+    const ctl_arg_t *a = op_args(op);
+    int e = check_members(d, a, args, field);
+    if (e != CTL_E_NONE) return e;
+    if (op == CTL_OP_SETUP_CTRLG) {
+        // Values the schema's types cannot say (4.14). drive_power_cycled is
+        // the operator's declaration: false is not a request.
+        if (one_of(d, args, "mode", mode_names, 2) < 0) { *field = "mode"; return CTL_E_SCHEMA; }
+        if (one_of(d, args, "device", dev_names, 2) < 0) { *field = "device"; return CTL_E_SCHEMA; }
+        if (!d->node[ctlj_find(d, args, "drive_power_cycled")].num) { *field = "drive_power_cycled"; return CTL_E_SCHEMA; }
+    } else if (op == CTL_OP_MOUNT) {
+        int x = ctlj_find(d, args, "expect");
+        int g = one_of(d, x, "mode", geo_names, 2);
+        if (g < 0) { *field = "mode"; return CTL_E_SCHEMA; }
+        e = check_members(d, g ? args_expect_lba : args_expect_chs, x, field);
+        if (e != CTL_E_NONE) return e;
+        int s = one_of(d, x, "source", ctl_src_name, CTL_SRC_COUNT);
+        if (s <= CTL_SRC_NONE) { *field = "source"; return CTL_E_SCHEMA; }
+        if (one_of(d, x, "device", dev_names_up, 2) < 0) { *field = "device"; return CTL_E_SCHEMA; }
+    }
+    *field = 0;
+    return CTL_E_NONE;
+}
+
+void ctl_mreq_read(const ctlj_doc_t *d, int op, int args, ctl_mreq_t *m) {
+    memset(m, 0, sizeof *m);
+    int n = ctlj_find(d, args, "expect_epoch");
+    m->has_epoch = n > 0;
+    m->expect_epoch = n > 0 ? (uint32_t)d->node[n].num : 0;
+    int x = args;
+    if (op == CTL_OP_SETUP_CTRLG) {
+        m->native = one_of(d, args, "mode", mode_names, 2) == 1;
+        m->dev_base = one_of(d, args, "device", dev_names, 2) == 1 ? 0xB0 : 0xA0;
+        n = ctlj_find(d, args, "then_mount");
+        m->then_mount = n > 0 && d->node[n].num;
+    } else {
+        x = ctlj_find(d, args, "expect");
+        m->lba = one_of(d, x, "mode", geo_names, 2) == 1;
+        m->dev_base = one_of(d, x, "device", dev_names_up, 2) == 1 ? 0xB0 : 0xA0;
+        m->src = (uint8_t)one_of(d, x, "source", ctl_src_name, CTL_SRC_COUNT);
+        if (m->lba) { m->lba_sectors = d->node[ctlj_find(d, x, "lba_sectors")].num; return; }
+    }
+    m->cyls = (uint16_t)d->node[ctlj_find(d, x, "cyls")].num;
+    m->heads = (uint8_t)d->node[ctlj_find(d, x, "heads")].num;
+    m->spt = (uint8_t)d->node[ctlj_find(d, x, "spt")].num;
 }
 
 int ctl_check_request(const ctlj_doc_t *d, ctl_req_t *r) {

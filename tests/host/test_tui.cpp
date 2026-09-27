@@ -121,6 +121,11 @@ static void picker_identify(uint16_t w49) {
 
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : ".";
+#if ATABOY_CTL
+    // Stage 4 (presence_rows.py): "presence" draws every screen with a guarded
+    // request waiting, its row at its longest.
+    if (argc > 2 && !strcmp(argv[2], "presence")) stub_presence = "JP2? setup.ctrlg #2147483647 0123abcd";
+#endif
 
     reset_state();
     draw_bios_frame(); update_main_menu();

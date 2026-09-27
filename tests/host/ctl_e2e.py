@@ -87,6 +87,11 @@ class ServePort:
     def flush(self):
         pass
 
+    def act(self):
+        """The human's JP2 act (stage 4): a line serve takes for itself."""
+        self.p.stdin.write(b'#ACT\n')
+        self.p.stdin.flush()
+
     def close(self):
         try:
             self.p.stdin.close()
@@ -160,9 +165,13 @@ def main():
     tier_r = [op for op, v in ctl.OP_TABLE.items() if v[0] == 'R']
     tier_s = [op for op, v in ctl.OP_TABLE.items() if v[0] == 'S']
     check(sorted(tier_s) == ['detach', 'identify.forbid', 'pipelined.off', 'unmount', 'wp.on'], f'Tier S {tier_s}')
+    tier_m = [op for op, v in ctl.OP_TABLE.items() if v[0] == 'M']
     for op in ctl.OP_TABLE:
-        want = 'OPERATIONAL' if op in tier_r or op in tier_s else 'ABSENT'
-        check(r['caps'][op]['state'] == want, f"hello caps {op}: {r['caps'][op]}")
+        if op in tier_m:        # stage 4: no lease yet; without the jumpers, never
+            want = {'state': 'LOCKED', 'why': 'NO_LEASE' if jumpers else 'JUMPERS_UNSUPPORTED'}
+            check(r['caps'][op] == want, f"hello caps {op}: {r['caps'][op]}")
+        else:
+            check(r['caps'][op]['state'] == 'OPERATIONAL', f"hello caps {op}: {r['caps'][op]}")
     for op in ctl.HUMAN_ONLY_OPS | ctl.NOT_IN_V1_OPS:
         check(r['caps'][op]['state'] == 'ABSENT', f'{op} not ABSENT')
 
@@ -254,11 +263,83 @@ def main():
             jt = raw_request(ctl, a.exe, mode, 'selftest.status', {})
             check(jt is not None and jt['outcome'] == 'DONE' and jt['result']['jumpers'] == want[2], f'{mode}: selftest {jt!r}')
             for op in ('setup.ctrlg', 'mount'):
-                check(jres.result['caps'][op] == {'state': 'ABSENT', 'why': 'NOT_BUILT'}, f"{mode}: caps {op} {jres.result['caps'][op]}")
+                wwhy = 'JP1_FITTED' if mode == 'serve-jp1' else 'JUMPERS_UNREADABLE'
+                check(jres.result['caps'][op] == {'state': 'LOCKED', 'why': wwhy}, f"{mode}: caps {op} {jres.result['caps'][op]}")
             jc.close()
             jv, _ = ctl.verify_transcript(os.path.join(tmp, mode + '.jsonl'))
             check(jv.state == 'Pass', f'{mode}: transcript {jv.reason}')
             client_lines += jports[0].lines_out
+
+    # Stage 4: Tier M through the client's own guarded() flow, request first
+    # (spec 4.14, 12.2): the client sends the request, reads status.presence,
+    # and only when it shows this request (id and digest) prompts the human,
+    # whose act (JP2) serve then takes. The declared pair (Q3): one act, the
+    # mount on the credit with no second prompt. And a request withdrawn by
+    # the client (confirm None, and a declined act) runs nothing.
+    if jumpers:
+        m_ports = []
+
+        def m_opener(binding):
+            p = ServePort(a.exe, 'serve-idle')
+            m_ports.append(p)
+            return p
+        mpath = os.path.join(tmp, 'tier-m.jsonl')
+        mc, mres = ctl.connect(serial, mpath, tool='ataboy_manual_chs', records_fn=lambda: records, opener=m_opener)
+        check(mc is not None and mres.state == 'Pass', f'Tier M: hello {mres!r}')
+        if mc is not None:
+            o = mc.open_session()
+            check(o.state == 'Pass' and mc.token is not None, f'Tier M: session.open {o!r}')
+            prompts = []
+
+            def confirm_act(prompt):
+                prompts.append(prompt)
+                m_ports[0].act()
+                return True
+            args = {'cyls': 522, 'heads': 4, 'spt': 40, 'mode': 'idp', 'device': 'master', 'drive_power_cycled': True}
+            r1, r2 = mc.setup_ctrlg_then_mount(args, confirm_act)
+            check(r1.state == 'Pass' and r1.result['mount_credit'] is True and r1.result['source'] == 'API_CTRLG_IDP',
+                  f'Tier M: the pair\'s set-up {r1!r}')
+            check(r2 is not None and r2.state == 'Pass' and r2.result['used_credit'] is True and r2.result['mounted'] is True,
+                  f'Tier M: the pair\'s mount {r2!r}')
+            check(len(prompts) == 1 and prompts[0]['op'] == 'setup.ctrlg' and 'then_mount_expect' in prompts[0] and
+                  len(prompts[0]['request_sha256']) == 64, f'Tier M: one prompt for the pair ({len(prompts)})')
+            st = mc.request('status')
+            check(st.state == 'Pass' and st.result['mounted'] is True and st.result['presence']['waiting'] is False and
+                  st.result['setup']['source'] == 'API_CTRLG_IDP', f'Tier M: status after the pair {st!r}')
+            # A request the flow never prompts for (confirm None): withdrawn
+            # by session.close, nothing runs. (A set-up refused while mounted
+            # first: E_STATE at arrival, no prompt.)
+            ref = mc.guarded('setup.ctrlg', dict(args, cyls=500), confirm_act)
+            check(ref.state == 'CouldNotRun' and ref.response is not None and ref.response['err']['code'] == 'E_STATE' and
+                  len(prompts) == 1, f'Tier M: a set-up while mounted {ref!r}')
+            mc.close()
+        # A fresh unit: a request withdrawn unprompted, and one declined.
+        for label, conf in (('never prompted', None), ('declined', lambda prompt: False)):
+            w_ports = []
+
+            def w_opener(binding, w_ports=w_ports):
+                p = ServePort(a.exe, 'serve-idle')
+                w_ports.append(p)
+                return p
+            wc, wres = ctl.connect(serial, os.path.join(tmp, f'withdrawn-{len(label)}.jsonl'), tool='ataboy_manual_chs',
+                                   records_fn=lambda: records, opener=w_opener)
+            check(wc is not None and wres.state == 'Pass', f'Tier M {label}: hello')
+            if wc is None:
+                continue
+            wc.open_session()
+            wr = wc.guarded('setup.ctrlg', {'cyls': 522, 'heads': 4, 'spt': 40, 'mode': 'idp', 'device': 'master',
+                                            'drive_power_cycled': True}, conf)
+            check(wr.state == 'CouldNotRun' and wr.response is not None and wr.response['err']['code'] == 'E_LEASE_REVOKED' and
+                  wr.response['err'].get('by') == 'CLOSED' and wc.token is None, f'Tier M {label}: {wr!r}')
+            wc.open_session()
+            ws = wc.request('status')
+            check(ws.state == 'Pass' and ws.result['setup']['source'] == 'NONE' and ws.result['presence']['waiting'] is False,
+                  f'Tier M {label}: something ran {ws!r}')
+            wc.close()
+            client_lines += w_ports[0].lines_out
+        mv, _ = ctl.verify_transcript(mpath)
+        check(mv.state == 'Pass', f'Tier M: transcript {mv.reason}')
+        client_lines += m_ports[0].lines_out
 
     # Every line the client's encoder makes, for every op in its tables, sent
     # raw; each answer through the client's own parser and envelope checks.
@@ -305,9 +386,13 @@ def main():
             if op in ctl.RESULT_SCHEMA and resp['outcome'] == 'DONE':
                 check(ctl.check(resp['result'], ctl.RESULT_SCHEMA[op], 'result') is None,
                       f"{op}: {ctl.check(resp['result'], ctl.RESULT_SCHEMA[op], 'result')}")
+        elif op == 'session.open':
+            check(resp['outcome'] == 'DONE' and ctl.check(resp['result'], ctl.RESULT_SCHEMA[op], 'result') is None,
+                  f"{op}: {resp['outcome']} {resp.get('err')}")
         else:
-            check(resp['outcome'] == 'NOT_EXECUTED' and resp['err']['code'] == 'E_UNKNOWN_OP',
-                  f"{op} (not built): {resp['outcome']} {resp.get('err')}")
+            # A lease is held (the line above), and these carry a stand-in token.
+            check(resp['outcome'] == 'NOT_EXECUTED' and resp['err']['code'] == 'E_LEASE_INVALID',
+                  f"{op}: {resp['outcome']} {resp.get('err')}")
     port.close()
 
     if a.write_corpus:

@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "ctl_json.h"
+#include "ctl_state.h"          // CTL_SRC_*: status.setup.source, mount's expect.source
 
 #define CTL_PROTO_VERSION   1
 #define CTL_MAX_ID          2147483647u         // 2^31 - 1
@@ -54,7 +55,7 @@ typedef struct {
     uint8_t     tier;       // CTL_TIER_*
     bool        job;        // runs on core 1 at the TUI's idle point (5.3)
     uint32_t    max_ms;     // SPEC-v1 4.0 "max time"
-    bool        built;      // carried by this build (stage 2: Tier R and Tier S)
+    bool        built;      // carried by this build (stage 4: every op of v1)
 } ctl_op_t;
 
 extern const ctl_op_t ctl_ops[CTL_OP_COUNT];
@@ -66,6 +67,32 @@ extern const char *const ctl_human_only[CTL_HUMAN_ONLY_COUNT];
 extern const char *const ctl_not_in_v1[CTL_NOT_IN_V1_COUNT];
 
 int  ctl_op_find(const ctlj_doc_t *d, int str_node);   // CTL_OP_* or -1 (any op, built or not)
+
+// status.setup.source's names (SPEC-v1 4.3), which mount's expect.source
+// names too (4.14).
+extern const char *const ctl_src_name[CTL_SRC_COUNT];
+
+// A Tier M request's arguments, read and checked here (SPEC-v1 4.14), so
+// core 0 (arrival) and core 1 (pickup) work from the same values.
+//  setup.ctrlg: cyls, heads, spt, native, dev_base (A0h master, B0h slave),
+//               then_mount. drive_power_cycled must be true (E_SCHEMA).
+//  mount:       the expect: src (CTL_SRC_*, never NONE), lba, dev_base, and
+//               cyls, heads, spt (CHS) or lba_sectors (LBA).
+typedef struct {
+    uint16_t cyls;
+    uint8_t  heads, spt;
+    bool     native;
+    uint8_t  dev_base;
+    bool     then_mount;
+    uint8_t  src;
+    bool     lba;
+    uint64_t lba_sectors;
+    bool     has_epoch;
+    uint32_t expect_epoch;
+} ctl_mreq_t;
+// After ctl_check_request passed for setup.ctrlg or mount: the arguments
+// into *m (nothing else checked; the schema already was).
+void ctl_mreq_read(const ctlj_doc_t *d, int op, int args, ctl_mreq_t *m);
 bool ctl_op_mutating(int op);                           // Tier S, Tier M and the session ops
 bool ctl_op_needs_token(int op);                        // Tier M and session.close
 

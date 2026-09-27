@@ -16,6 +16,14 @@ volatile uint8_t ctl_wp_last;
 inline int stub_ctl_setups = 0;
 inline uint8_t stub_ctl_setup_src = 0;
 void ctl_setup_noted(uint8_t s) { stub_ctl_setups++; stub_ctl_setup_src = s; }
+// Stage 4: the presence row (menus.c update_main_menu). A test sets the text
+// to draw the row; nullptr: nothing waits.
+inline const char *stub_presence = nullptr;
+bool ctl_presence_text(char *o, unsigned n) {
+    if (!stub_presence) { o[0] = 0; return false; }
+    snprintf(o, n, "%s", stub_presence);
+    return true;
+}
 #ifdef CTL_STUB_IDCACHE             // menus.c built against stand-ins for ide.c
 inline int stub_idc_puts = 0, stub_idc_stale = 0;
 void ide_idcache_put(const uint16_t *, uint8_t) { stub_idc_puts++; }

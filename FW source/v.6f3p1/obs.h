@@ -48,6 +48,7 @@
 // Mount and unmount markers.
 #define OBS_MNT_AUTO        1   // auto-mount at boot
 #define OBS_MNT_MENU        2   // Mount from the main menu
+#define OBS_MNT_API         3   // the ATAboy Control API's mount (palimpsest api/SPEC-v1.md 4.14)
 #define OBS_UNM_MENU        1   // Unmount from the main menu
 #define OBS_UNM_DISMISS     2   // the detection result box dismissed
 #define OBS_UNM_NOTHING     3   // Mount with nothing to mount

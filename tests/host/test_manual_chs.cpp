@@ -1756,7 +1756,14 @@ static void test_obs_proof() {
     is_mounted = true;
     size_t m = sim.cmd_log.size();
     read_right(1234);
+#if ATABOY_CTL
+    // With the Control API, Debug keys refuse while a drive is mounted (R-API-1
+    // finding 2; test_ctl drives that): the reset is taken with the mount
+    // flag down for that one key, as a TUI with no such guard would.
+    is_mounted = false; debug_reset(); is_mounted = true;
+#else
     debug_reset();
+#endif
     read_right(1234);
     sim.bad[4321] = {BAD_HANG, 0};
     read_right(4321);

@@ -284,7 +284,13 @@ static void print_help(const char *text) {
 #define BANNER "\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3p10 (fork) - (C) 2026 obsoletetech.us"
 #endif
 
+#if ATABOY_CTL
+static char presence_shown[CTL_PRESENCE_TEXT];   // the presence row as last drawn (update_main_menu)
+#endif
 static void draw_bios_frame(void) {
+#if ATABOY_CTL
+    presence_shown[0] = '\0';         // the frame blanks row 13
+#endif
     cdc_printf(BG_BLUE FG_WHITE CLR_SCR HIDE_CUR "\033[H");
     // Paint every cell of the 80x24 screen blue. ESC[2J alone is not enough:
     // whether an erase uses the current background colour depends on the
@@ -388,6 +394,33 @@ static void draw_hdd_status(void) {
 //  Main Menu
 // ---------------------------------------------------------------------------
 
+#if ATABOY_CTL
+// A guarded API request waiting for its JP2 act (SPEC-v1 4.14, 6.4): on the
+// main menu, row 13, from column 43 to the right border (37 columns: the
+// longest line, "JP2? setup.ctrlg #2147483647 0123abcd", fills them), only
+// while one waits and when it changes; blanked once when it ends. Nothing
+// drawn otherwise, so every screen with nothing waiting is as before.
+static void draw_presence_row(void) {
+    char t[CTL_PRESENCE_TEXT];
+    if (!ctl_presence_text(t, sizeof t)) t[0] = '\0';
+    if (!strcmp(t, presence_shown)) return;
+    cdc_printf("\033[13;43H" FG_YELLOW "%-37s" FG_WHITE, t);
+    strcpy(presence_shown, t);
+}
+// A box drawn over the main menu covers only part of row 13: the row is
+// blanked first, so no piece of it shows beside the box, and drawn again by
+// the next main menu. Nothing is sent when the row is not shown, so every
+// screen with nothing waiting is as before.
+static void presence_row_hide(void) {
+    if (!presence_shown[0]) return;
+    cdc_printf("\033[13;43H" BG_BLUE "%37s", "");
+    presence_shown[0] = '\0';
+}
+#define PRESENCE_ROW_HIDE() presence_row_hide()
+#else
+#define PRESENCE_ROW_HIDE() ((void)0)
+#endif
+
 static void update_main_menu(void) {
     const char *items[] = {
         "  Auto Detect & Set Geometry",        // 0 — left,  row 6
@@ -418,6 +451,9 @@ static void update_main_menu(void) {
     draw_iordy_note(2, IORDY_NOTE_ROW);
     // Holistic review (the guide's L2): the chip's stepping, from the chip.
     cdc_printf("\033[14;45H" FG_WHITE "Chip: RP2350 A%u", (unsigned)rp2350_chip_version());
+#if ATABOY_CTL
+    draw_presence_row();
+#endif
     draw_hdd_status();
 }
 
@@ -500,6 +536,7 @@ static int get_input(void) {
 
 static void draw_confirm_box(const char *message) {
     int box_w = 52, start_col = 14, start_row = 10;
+    PRESENCE_ROW_HIDE();
 
     // Shadow
     for (int i = 0; i < 5; i++) cdc_printf("\033[%d;%dH\033[40m%*s", start_row+1+i, start_col+2, box_w, "");
@@ -530,6 +567,7 @@ static void draw_confirm_box(const char *message) {
 
 static void draw_error_box(const char *error_msg, bool show_force) {
     int box_w = 52, start_col = 14, start_row = 9;
+    PRESENCE_ROW_HIDE();
 
     for (int i = 0; i < 7; i++) cdc_printf("\033[%d;%dH\033[40m%*s", start_row+1+i, start_col+2, box_w, "");
     for (int i = 0; i < 7; i++) cdc_printf("\033[%d;%dH\033[41m%*s", start_row+i, start_col, box_w, "");
@@ -569,6 +607,7 @@ static void draw_error_box(const char *error_msg, bool show_force) {
 
 static void draw_selection_menu_ex(uint16_t *id, int selected_idx, bool force_mode) {
     int box_w = 64, start_col = 9, start_row = 5;
+    PRESENCE_ROW_HIDE();
 
     uint16_t n_cyl = id[1];
     uint8_t  n_hd  = (uint8_t)id[3];
@@ -981,11 +1020,29 @@ static void features_toggle_iordy(void) {
 #define API_FORBIDDEN_TEXT  "IDENTIFY forbidden by ATAboy Control. Power-cycle to end."
 #define API_FORBIDDEN_BOX   "IDENTIFY forbidden by ATAboy Control. Press a key"
 #define API_FORBIDDEN_FORCE "\033[91;1mForbidden by ATAboy Control: no Force"
+// R-API-1 finding 2: the TUI's bus keys while a drive is mounted.
+#define API_MOUNTED_TEXT    "Refused: a drive is mounted. Nothing sent."
+#define API_MOUNTED_BOX     "Drive mounted: refused, nothing sent. Press a key"
+static void api_mounted_box(void) {
+    draw_confirm_box(API_MOUNTED_BOX);
+    while (get_input() == -1) tight_loop_contents();
+    needs_full_redraw = true;
+}
 #endif
 static void debug_key(int k) {
     bool known = k == 'i' || k == 'I' || k == 't' || k == 'T' || k == 'e' || k == 'E' ||
                  k == 's' || k == 'S' || k == 'r' || k == 'R';
     if (!known) return;
+#if ATABOY_CTL
+    // R-API-1 finding 2 (SPEC-v1 5.3, I-24): every Debug key drives or reads
+    // the bus, and a mounted drive's bus is the USB host's. An API mount
+    // leaves the screen on MOUNTED, so this is the second layer.
+    if (is_mounted) {
+        debug_cls();
+        debug_print(0, "\033[91;1m", API_MOUNTED_TEXT);
+        return;
+    }
+#endif
     if ((k == 'i' || k == 'I' || k == 's' || k == 'S') && ide_mchs_no_identify()) {
         debug_cls();
         debug_print(0, "\033[91;1m", DEBUG_REFUSED_MCHS);
@@ -1410,6 +1467,7 @@ static void mchs_line(int row, const char *color, const char *text) {
 // none; ask draws it as the Y/N question.
 static void draw_manual_chs_mode(char fields[3][6], int active, const char *msg, bool ask, bool native) {
     int c = MCHS_COL, r = MCHS_ROW;
+    PRESENCE_ROW_HIDE();
     for (int i = 0; i < MCHS_H; i++) cdc_printf("\033[%d;%dH\033[40m%*s", r+1+i, c+2, MCHS_W, "");
     cdc_puts(SEL_RED);
     cdc_printf("\033[%d;%dH", r, c);
@@ -1461,6 +1519,27 @@ static bool mchs_pending_refused(void) {
     while (get_input() == -1) tight_loop_contents();
     return true;
 }
+
+#if ATABOY_CTL
+// What Ctrl+G does after its final Y, the bus call and the state it sets on
+// success, and nothing else (palimpsest api/SPEC-v1.md 4.14, R-API-1 finding
+// 1): no drawing, no key, no wait. The dialog below and the API's
+// setup.ctrlg job (menus_api_ctrlg) both call it, so the two send the same
+// commands and leave the same state. src: the set-up's source (4.3).
+static int mchs_apply(uint32_t c, uint32_t h, uint32_t s, bool native, uint8_t *st, uint8_t src) {
+    id_w49_known = false;           // no IDENTIFY: nothing to say about IORDY
+    int r = native ? ide_manual_chs_native((uint8_t)h, (uint8_t)s, st)
+                   : ide_manual_chs((uint8_t)h, (uint8_t)s, st);
+    if (r == IDE_MCHS_OK) {
+        use_lba_mode = false; total_lba_sectors = 0;
+        cur_cyls = (uint16_t)c; cur_heads = (uint8_t)h; cur_spt = (uint8_t)s;
+        strcpy(hdd_model_raw, native ? MCHS_MODEL_NATIVE : MCHS_MODEL);
+        sync_to_config();
+        ctl_setup_noted(src);
+    }
+    return r;
+}
+#endif
 
 // The entry, from Ctrl+G to the drive's answer. True when the result box
 // should be drawn (core1_entry's trigger_overlay), as run_auto_detect.
@@ -1514,6 +1593,12 @@ static bool run_manual_chs(void) {
     if (!bus_free_wait(false) || mchs_pending_refused()) return false;
     draw_manual_chs_mode(fields, -1, native ? "Resetting the drive, then 10h only (no 91h). Up to a minute."
                                             : "Resetting the drive, then 10h and 91h. Up to a minute.", false, native);
+#if ATABOY_CTL
+    // The bus call and what it sets: shared with the API's setup.ctrlg job.
+    uint8_t st = 0;
+    int r = mchs_apply(v[0], v[1], v[2], native, &st, native ? CTL_SRC_TUI_CTRLG_NATIVE : CTL_SRC_TUI_CTRLG_IDP);
+    if (r == IDE_MCHS_OK) return false;
+#else
     id_w49_known = false;           // no IDENTIFY: nothing to say about IORDY
     uint8_t st = 0;
     int r = native ? ide_manual_chs_native((uint8_t)v[1], (uint8_t)v[2], &st)
@@ -1523,11 +1608,9 @@ static bool run_manual_chs(void) {
         cur_cyls = (uint16_t)v[0]; cur_heads = (uint8_t)v[1]; cur_spt = (uint8_t)v[2];
         strcpy(hdd_model_raw, native ? MCHS_MODEL_NATIVE : MCHS_MODEL);
         sync_to_config();
-#if ATABOY_CTL
-        ctl_setup_noted(native ? CTL_SRC_TUI_CTRLG_NATIVE : CTL_SRC_TUI_CTRLG_IDP);
-#endif
         return false;
     }
+#endif
     // The drive was reset, so whatever geometry it had is gone: nothing is
     // shown as set, and there is nothing to mount.
     const char *why = r == IDE_MCHS_REFUSED  ? "drive refused geometry" :
@@ -1605,6 +1688,38 @@ bool menus_api_unmount(void) {
     return native_before && !ide_manual_chs_native_active();
 }
 
+// setup.ctrlg (SPEC-v1 4.14): Ctrl+G after its Y, through mchs_apply. The
+// job has checked what the dialog would have waited for (a USB command, a
+// pending reset) and refused instead of waiting. When the drive was reset
+// and did not take the geometry, the state is what the dialog's error box
+// leaves once dismissed (detect_result_dismiss), without the box: with no
+// terminal nobody could dismiss it. Returns IDE_MCHS_*.
+int menus_api_ctrlg(uint16_t c, uint8_t h, uint8_t s, bool native, uint8_t *st) {
+    int r = mchs_apply(c, h, s, native, st, native ? CTL_SRC_API_CTRLG_NATIVE : CTL_SRC_API_CTRLG_IDP);
+    if (r != IDE_MCHS_OK && r != IDE_MCHS_BAD_ARGS && r != IDE_MCHS_IDP_SENT) {
+        hdd_status_text[0] = '\0';
+        media_changed_waiting = true;   // as detect_result_dismiss, and every other unmount path
+        hdd_model_raw[0] = '\0';
+        if (ide_mchs_no_identify()) strcpy(hdd_model_raw, MCHS_MODEL_CLEARED);
+        cur_cyls = 0; cur_heads = 0; cur_spt = 0; use_lba_mode = false; total_lba_sectors = 0;
+        sync_to_config();
+        ctl_setup_noted(CTL_SRC_NONE);
+    }
+    needs_full_redraw = true;
+    return r;
+}
+
+// mount (SPEC-v1 4.14): TUI confirm-3, with the API's marker value, and the
+// screen follows (R-API-1 finding 2): MOUNTED, whose keys touch no bus.
+void menus_api_mount(void) {
+    log_mount(OBS_EV_MOUNT, OBS_MNT_API);
+    is_mounted = true;
+    media_changed_waiting = true;
+    current_screen = SCREEN_MOUNTED;
+    needs_full_redraw = true;
+    CTL_EPOCH_BUMP();
+}
+
 // detach, once no USB read is left running (the caller waited): what the
 // error box's dismissal clears (detect_result_dismiss), and the IDENTIFY
 // words, so nothing on the ATAboy can mount this drive again without a new
@@ -1632,6 +1747,9 @@ void menus_api_detach_clear(void) {
 // (run_auto_detect says so), nothing sent either way. True when the
 // question is to be drawn.
 static bool auto_detect_enter(void) {
+#if ATABOY_CTL
+    if (is_mounted) { api_mounted_box(); return false; }        // R-API-1 finding 2
+#endif
     if (ide_mchs_no_identify()) { (void)run_auto_detect(); return false; }
 #if ATABOY_CTL
     if (ide_identify_forbidden()) { (void)run_auto_detect(); return false; }   // refused at once, no Y/N
@@ -1874,6 +1992,14 @@ void core1_entry(void) {
 
         if (current_screen == SCREEN_CONFIRM) {
             if (k == 'y' || k == 'Y') {
+#if ATABOY_CTL
+                if ((confirm_type == 0 || confirm_type == 6) && is_mounted) {
+                    // R-API-1 finding 2: Load Defaults' reset of the set-up, and Auto
+                    // Detect's RESET- and IDENTIFY, never under a mounted drive.
+                    api_mounted_box();
+                    current_screen = SCREEN_MOUNTED;
+                } else
+#endif
                 if (confirm_type == 0) {
                     // Holistic review L-1: as F10, never under a USB command.
 #if ATABOY_CTL

@@ -33,12 +33,22 @@ static size_t rxi;
 static std::string tty;                     // everything the TUI sent to interface 0
 static void (*on_idle)() = nullptr;
 static uint64_t idle_after_ns = 0;
-static inline void queue_add_blocking(queue_t *, const void *c) { tty.push_back(*(const char *)c); }
+// R-API-1 finding 1 (SPEC-v1 5.3, I-23): a job body must never touch the
+// TUI's queues. Each use while a job runs is counted; a read then gets 'N'
+// at once, so a job that would wait for a key ends instead of hanging, and
+// the count fails the test.
+static int job_tui_io = 0;
+static bool job_running_now();
+static inline void queue_add_blocking(queue_t *, const void *c) {
+    if (job_running_now()) job_tui_io++;
+    tty.push_back(*(const char *)c);
+}
 // test_ctl core1-tui: core 1 is its real loop, and core 0's passes (and the
 // test's timed checks) come from its input polls (core0_tick, below).
 static bool core0_in_loop = false;
 static void core0_tick();
 static inline bool queue_try_remove(queue_t *, void *out) {
+    if (job_running_now()) { job_tui_io++; *(char *)out = 'N'; return true; }
     if (core0_in_loop) core0_tick();
     if (rxi < rx.size() && get_absolute_time() >= rx[rxi].at_us) { *(char *)out = rx[rxi++].c; return true; }
     if (on_idle && rxi == rx.size() && mock_now_ns > idle_after_ns) on_idle();
@@ -57,6 +67,7 @@ static inline bool time_reached(absolute_time_t t) { return get_absolute_time() 
 #include "board_jumpers.c"          // stage 3: JP1 and JP2 against mock_pico.h's pad register file
 #endif
 
+static bool job_running_now() { return ctl_job.state == CTL_JOB_RUNNING; }
 bool core1_stack_intact(void) { return true; }
 void fault_stop(uint32_t code) { printf("FAIL: fault_stop(%08X) reached\n", (unsigned)code); exit(250); }
 // A test that drives the tripwire on purpose (identify.forbid, I-22) sets
@@ -95,7 +106,8 @@ void config_flash_copy(config_t *out) { *out = flash_sector; }
 bool config_loaded_from_flash(void) { return loaded_from_flash_stub; }
 
 static uint64_t rand_value = 0x7c1e2a90d4b3f001ull;
-uint64_t get_rand_64(void) { return rand_value; }
+static uint64_t rand_calls = 0;     // the first call (dev.boot) is rand_value; each later one differs (lease tokens)
+uint64_t get_rand_64(void) { return rand_value + 0x9E3779B97F4A7C15ull * rand_calls++; }
 static const char *board_serial = "E6614103E7A1B22C";
 void pico_get_unique_board_id_string(char *id_out, unsigned len) {
     snprintf(id_out, len, "%s", board_serial);
@@ -228,6 +240,9 @@ static void power_up() {
     busy_until_ns = 0;
     obs_test_reset(0, 0);
     memset(&c, 0, sizeof c);
+    rand_calls = 0;
+    pres_text[0] = 0; ctl_lease_gen = 0; ctl_lease_by = 0;
+    job_tui_io = 0;
     memset(&ctl_job, 0, sizeof ctl_job);
     ctl_tui_state = CTL_TUI_BOOT;
     ctl_epoch = 0; ctl_wp_last = CTL_WP_BOOT; ctl_setup_src = CTL_SRC_NONE; ctl_setup_at_ms = 0;

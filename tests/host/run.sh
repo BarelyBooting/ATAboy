@@ -121,4 +121,6 @@ if echo "$defs" | grep -q -- '-DATABOY_CTL=1'; then
         -I "$here/mock" -I "$here" -I "$src" -o "$out/ctl_fuzz" "$here/ctl_fuzz.cpp"
     "$out/ctl_fuzz" "$here/ctl_corpus" 100000 1
     ${PYTHON:-python} "$here/ctl_e2e.py" "$out/test_ctl"
+    # Stage 4: the presence row takes no cell any screen uses (pyte).
+    ${PYTHON:-python} "$here/presence_rows.py" "$src" $defs
 fi

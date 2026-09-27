@@ -51,5 +51,16 @@ void ctl_mount_noted(uint32_t marker_log_seq);
 // is running.
 bool menus_api_unmount(void);
 void menus_api_detach_clear(void);
+// Stage 4 (SPEC-v1 4.14), for the setup.ctrlg and mount jobs, on core 1 at
+// the idle point, drawing nothing and reading no key: Ctrl+G after its Y
+// (IDE_MCHS_*), and TUI confirm-3 with the API's marker.
+int  menus_api_ctrlg(uint16_t cyls, uint8_t heads, uint8_t spt, bool native, uint8_t *status);
+void menus_api_mount(void);
+
+// The main menu's presence row (SPEC-v1 4.14, 6.4): the text of a guarded
+// request waiting for its JP2 act, "JP2? <op> #<id> <8 hex>", at most 37
+// characters; true while one waits. Core 1 reads what core 0 wrote.
+#define CTL_PRESENCE_TEXT 38
+bool ctl_presence_text(char *out, unsigned n);
 
 #endif

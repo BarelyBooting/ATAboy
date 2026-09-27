@@ -209,9 +209,9 @@ static void test_op_table() {
         { "job.last", CTL_TIER_R, false, 5, true },
         { "wp.on", CTL_TIER_S, false, 5, true }, { "pipelined.off", CTL_TIER_S, false, 5, true },
         { "identify.forbid", CTL_TIER_S, false, 5, true }, { "unmount", CTL_TIER_S, true, 30000, true },
-        { "detach", CTL_TIER_S, true, 30000, true }, { "session.open", CTL_TIER_SESSION, false, 5, false },
-        { "session.close", CTL_TIER_SESSION, false, 5, false }, { "setup.ctrlg", CTL_TIER_M, true, 75000, false },
-        { "mount", CTL_TIER_M, true, 1000, false },
+        { "detach", CTL_TIER_S, true, 30000, true }, { "session.open", CTL_TIER_SESSION, false, 5, true },
+        { "session.close", CTL_TIER_SESSION, false, 5, true }, { "setup.ctrlg", CTL_TIER_M, true, 75000, true },
+        { "mount", CTL_TIER_M, true, 1000, true },
     };
     CHECK(CTL_OP_COUNT == 20 && sizeof want / sizeof want[0] == 20, "%d ops", CTL_OP_COUNT);
     for (int i = 0; i < CTL_OP_COUNT && i < 20; i++)
@@ -267,10 +267,16 @@ static void test_hello() {
     CHECK(caps.obj.size() == CTL_OP_COUNT + CTL_HUMAN_ONLY_COUNT + CTL_NOT_IN_V1_COUNT, "%zu caps", caps.obj.size());
     for (int i = 0; i < CTL_OP_COUNT; i++) {
         const J &cap = caps[ctl_ops[i].name];
-        if (i <= CTL_OP_DETACH)             // Tier R and, from stage 2, Tier S
+        if (ctl_ops[i].tier != CTL_TIER_M)  // Tier R, Tier S (stage 2), the session ops (stage 4)
             CHECK(cap["state"].is("OPERATIONAL") && !cap.get("why"), "%s not OPERATIONAL", ctl_ops[i].name);
-        else
-            CHECK(cap["state"].is("ABSENT") && cap["why"].is("NOT_BUILT"), "%s not ABSENT/NOT_BUILT", ctl_ops[i].name);
+        else                                // stage 4: no lease held; without the jumpers never usable
+#if ATABOY_BOARD_JUMPERS
+            CHECK(cap["state"].is("LOCKED") && cap["why"].is("NO_LEASE"), "%s: %s %s", ctl_ops[i].name,
+                  cap["state"].s.c_str(), cap["why"].s.c_str());
+#else
+            CHECK(cap["state"].is("LOCKED") && cap["why"].is("JUMPERS_UNSUPPORTED"), "%s: %s %s", ctl_ops[i].name,
+                  cap["state"].s.c_str(), cap["why"].s.c_str());
+#endif
     }
     for (int i = 0; i < CTL_HUMAN_ONLY_COUNT; i++)
         CHECK(caps[ctl_human_only[i]]["state"].is("ABSENT") && caps[ctl_human_only[i]]["why"].is("HUMAN_ONLY"),
@@ -286,8 +292,7 @@ static void test_hello() {
     for (auto &x : want) CHECK(lim[x.k].t == J::INT && lim[x.k].n == x.v, "limits.%s = %llu", x.k, (unsigned long long)lim[x.k].n);
     CHECK(res["board"]["die"].is("RP2350") && res["board"]["stepping"].n == 4 && res["board"]["package"].is("UNKNOWN"), "board");
     // Every op listed ABSENT is refused as unknown, and a human-only one too.
-    for (const char *op : { "session.open", "session.close", "setup.ctrlg", "mount", "wp.off", "debug.r",
-                            "setup.detect", "setup.geometry", "no.such" })
+    for (const char *op : { "wp.off", "debug.r", "setup.detect", "setup.geometry", "no.such" })
         CHECK(is_refusal(ask1(req(2, op)), "E_UNKNOWN_OP"), "%s not E_UNKNOWN_OP", op);
 }
 
@@ -1737,8 +1742,8 @@ static void test_jp1_lock() {
     CHECK(w["outcome"].is("DONE") && !w["result"]["changed"].b && w["result"]["wp"]["forced_by"].arr.size() == 1, "wp.on under JP1");
     J h = ask1(req(3, "hello"));
     CHECK(h["result"]["caps"]["wp.on"]["state"].is("OPERATIONAL") && h["result"]["caps"]["unmount"]["state"].is("OPERATIONAL") &&
-          h["result"]["caps"]["setup.ctrlg"]["state"].is("ABSENT") && h["result"]["caps"]["setup.ctrlg"]["why"].is("NOT_BUILT"),
-          "caps under JP1 (stage 3 builds no Tier M)");
+          h["result"]["caps"]["setup.ctrlg"]["state"].is("LOCKED") && h["result"]["caps"]["setup.ctrlg"]["why"].is("JP1_FITTED"),
+          "caps under JP1");
     // Taken off: still locked until 20 OPEN samples over 10 ms (8.1), and
     // write protect stays on: the "Disabled" of before does not come back.
     e0 = ctl_epoch;
@@ -2020,20 +2025,740 @@ static void test_tier_m_caps() {
         CHECK(st == x.st && ((!why && !x.why) || (why && x.why && !strcmp(why, x.why))), "jp1 %u lease %d: %u %s",
               x.jp1, x.lease, st, why ? why : "-");
     }
-    // hello, JP1 open, fitted, and a pad wrong: the same caps each time.
+    // hello, JP1 open, fitted, and a pad wrong: Tier R, S and the session ops
+    // OPERATIONAL each time; Tier M LOCKED, why from the jumpers first.
+    static const char *const tier_m_why[3] = { "NO_LEASE", "JP1_FITTED", "JUMPERS_UNREADABLE" };
     for (int k = 0; k < 3; k++) {
         if (k == 1) { jp1_fit(true); pump(1); }
         if (k == 2) { jp1_fit(false); pump(30); mock_pads.io[30] &= ~0x40u; pump(1); }
         J h = ask1(req(1 + k, "hello"), nullptr, 20);
         const J &caps = h["result"]["caps"];
         for (int op = 0; op < CTL_OP_COUNT; op++) {
-            bool rs = ctl_ops[op].tier == CTL_TIER_R || ctl_ops[op].tier == CTL_TIER_S;
+            bool rs = ctl_ops[op].tier != CTL_TIER_M;
             CHECK(rs ? caps[ctl_ops[op].name]["state"].is("OPERATIONAL") && !caps[ctl_ops[op].name].get("why")
-                     : caps[ctl_ops[op].name]["state"].is("ABSENT") && caps[ctl_ops[op].name]["why"].is("NOT_BUILT"),
+                     : caps[ctl_ops[op].name]["state"].is("LOCKED") && caps[ctl_ops[op].name]["why"].is(tier_m_why[k]),
                   "hello (jumpers %d): %s %s %s", k, ctl_ops[op].name, caps[ctl_ops[op].name]["state"].s.c_str(),
                   caps[ctl_ops[op].name]["why"].s.c_str());
         }
     }
+}
+#endif
+
+// ---- 19. stage 4: the lease and Tier M (SPEC-v1 4.13, 4.14, 6; I-7, I-26 to I-28) ----
+// Requests with a token, the lease, an act (JP2 OPEN 250 ms then FITTED 250
+// ms: one fit event), and what reached the simulated drive.
+static std::string reqt(uint32_t id, const char *op, const std::string &token, const std::string &args) {
+    char b[1100];
+    snprintf(b, sizeof b, "{\"v\":1,\"id\":%u,\"op\":\"%s\",\"token\":\"%s\",\"args\":%s}\n", id, op, token.c_str(), args.c_str());
+    return b;
+}
+static std::string lease_token;
+static J open_lease(uint32_t id, unsigned idle_s = 300, const char *client = "test") {
+    char a[96];
+    snprintf(a, sizeof a, "{\"client\":\"%s\",\"tui_lock\":false,\"idle_s\":%u}", client, idle_s);
+    J r = ask1(req(id, "session.open", a));
+    if (r["outcome"].is("DONE")) lease_token = r["result"]["token"].s;
+    return r;
+}
+static std::string ctrlg_args(unsigned c = 980, unsigned h = 10, unsigned s = 17, const char *mode = "idp",
+                              const char *dev = "master", const char *extra = "") {
+    char b[256];
+    snprintf(b, sizeof b, "{\"cyls\":%u,\"heads\":%u,\"spt\":%u,\"mode\":\"%s\",\"device\":\"%s\",\"drive_power_cycled\":true%s}",
+             c, h, s, mode, dev, extra);
+    return b;
+}
+static std::string mount_args(const char *src = "API_CTRLG_IDP", unsigned c = 980, unsigned h = 10, unsigned s = 17,
+                              const char *extra = "") {
+    char b[256];
+    snprintf(b, sizeof b, "{\"expect\":{\"source\":\"%s\",\"mode\":\"CHS\",\"device\":\"MASTER\",\"cyls\":%u,\"heads\":%u,\"spt\":%u}%s}",
+             src, c, h, s, extra);
+    return b;
+}
+// The act: JP2 open 250 ms, then fitted 250 ms (an event 200 ms after the edge).
+#if ATABOY_BOARD_JUMPERS
+static void act() { hold2(false, 250); hold2(true, 250); hold2(false, 30); }
+#endif
+// A line sent, no answer expected yet (a Tier M request waits).
+static void send_only(const std::string &line, uint32_t ms = 5) { host_send(line); pump(ms); }
+static std::string sha_hex(const std::string &line) {
+    std::string l = line;
+    while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+    uint8_t dg[32];
+    ctl_sha256(l.data(), l.size(), dg);
+    return hex(dg, 32);
+}
+static J one_answer(bool *ok = nullptr) {
+    std::vector<std::string> r = host_lines();
+    J j;
+    std::string why;
+    bool good = r.size() == 1 && parse_response(r[0], j, &why) && envelope_problem(j).empty();
+    if (!good) printf("  (answer problem: %zu lines %s)\n", r.size(), why.c_str());
+    if (ok) *ok = good;
+    return j;
+}
+static J status4(uint32_t id) { return ask1(req(id, "status"), nullptr, 10); }
+static void power_drive() { sim.nsect = 980u * 10 * 17; }
+
+#if ATABOY_BOARD_JUMPERS
+// The lease (4.13, 6.1), both ways.
+static void test_lease() {
+    fresh("stage 4: the lease");
+    uint32_t e0 = ctl_epoch;
+    J r = open_lease(1, 300, "palimpsest");
+    CHECK(r["outcome"].is("DONE") && all_keys(r["result"], { "token", "idle_s", "tui_lock" }) && lease_token.size() == 32 &&
+          lease_token.find_first_not_of("0123456789abcdef") == std::string::npos && r["result"]["idle_s"].n == 300 &&
+          !r["result"]["tui_lock"].b && ctl_epoch == e0 + 1, "session.open: %s", r["outcome"].s.c_str());
+    J s = status4(2);
+    CHECK(s["result"]["lease"]["held"].b && s["result"]["lease"]["client"].is("palimpsest") &&
+          s["result"]["lease"]["idle_ms_left"].n > 290000 && !s["result"]["lease"]["tui_lock"].b, "status.lease");
+    std::vector<std::string> raw = ask(req(22, "status"), 10);
+    CHECK(raw.size() == 1 && raw[0].find(lease_token) == std::string::npos, "status shows the token");
+    // A second client: E_LEASE_HELD with who and how long, never the token.
+    J r2 = open_lease(3, 60, "other");
+    CHECK(is_refusal(r2, "E_LEASE_HELD") && r2["err"]["client"].is("palimpsest") && r2["err"]["idle_ms_left"].t == J::INT &&
+          !r2.get("result"), "a second open: %s", r2["err"]["code"].s.c_str());
+    // tui_lock is not built in this stage: refused, nothing opened.
+    J r3 = ask1(req(4, "session.open", "{\"client\":\"x\",\"tui_lock\":true,\"idle_s\":60}"));
+    CHECK(is_refusal(r3, "E_PRECONDITION") && r3["err"]["why"].is("TUI_LOCK_NOT_BUILT"), "tui_lock true: %s",
+          r3["err"]["code"].s.c_str());
+    // session.close: its token only.
+    std::string good = lease_token;
+    J c1 = ask1(req(5, "session.close"));
+    CHECK(is_refusal(c1, "E_SCHEMA") && c1["err"]["field"].is("token"), "close without a token");
+    J c2 = ask1(reqt(6, "session.close", "00112233445566778899aabbccddeeff", "{}"));
+    CHECK(is_refusal(c2, "E_LEASE_INVALID"), "close with another token: %s", c2["err"]["code"].s.c_str());
+    e0 = ctl_epoch;
+    J c3 = ask1(reqt(7, "session.close", good, "{}"));
+    CHECK(c3["outcome"].is("DONE") && c3["result"]["closed"].b && !c.lease.held && ctl_epoch == e0 + 1, "close");
+    J c4 = ask1(reqt(8, "session.close", good, "{}"));
+    CHECK(is_refusal(c4, "E_LEASE_REVOKED") && c4["err"]["by"].is("CLOSED"), "the old token: %s", c4["err"]["code"].s.c_str());
+    J c5 = ask1(reqt(9, "session.close", "00112233445566778899aabbccddeeff", "{}"));
+    CHECK(is_refusal(c5, "E_NO_LEASE"), "close with no lease: %s", c5["err"]["code"].s.c_str());
+    // A new lease has another token.
+    open_lease(10);
+    CHECK(lease_token != good, "the same token twice");
+    // Idle: 30 s with nothing, revoked (by IDLE); a request with the token renews.
+    fresh("stage 4: the lease's idle timer");
+    open_lease(1, 30);
+    pump(20000);
+    J k = ask1(reqt(2, "setup.ctrlg", lease_token, ctrlg_args(980, 10, 17, "idp", "slave")));   // refused, but renews
+    CHECK(is_refusal(k, "E_PRECONDITION") && c.lease.held, "a refused request with the token: %s", k["err"]["code"].s.c_str());
+    pump(20000);
+    CHECK(c.lease.held, "renewed lease ended after 20 s");
+    pump(11000);
+    J k2 = ask1(reqt(3, "session.close", lease_token, "{}"));
+    CHECK(!c.lease.held && is_refusal(k2, "E_LEASE_REVOKED") && k2["err"]["by"].is("IDLE"), "idle: %s %s",
+          k2["err"]["code"].s.c_str(), k2["err"]["by"].s.c_str());
+    // The port closing and a USB reset end it too.
+    fresh("stage 4: the lease and the port");
+    open_lease(1);
+    std::string t1 = lease_token;
+    tud_cdc_line_state_cb(1, false, false); pump(3); tud_cdc_line_state_cb(1, true, false); pump(3);
+    J p1 = ask1(reqt(2, "session.close", t1, "{}"));
+    CHECK(is_refusal(p1, "E_LEASE_REVOKED") && p1["err"]["by"].is("PORT_CLOSED"), "DTR drop: %s", p1["err"]["by"].s.c_str());
+    open_lease(3);
+    std::string t2 = lease_token;
+    ctl_on_usb_mount(); pump(3);
+    J p2 = ask1(reqt(4, "session.close", t2, "{}"));
+    CHECK(is_refusal(p2, "E_LEASE_REVOKED") && p2["err"]["by"].is("USB_RESET"), "USB reset: %s", p2["err"]["by"].s.c_str());
+    // hello: Tier M OPERATIONAL while a lease is held (3.4).
+    open_lease(5);
+    J h = ask1(req(6, "hello"), nullptr, 20);
+    CHECK(h["result"]["caps"]["setup.ctrlg"]["state"].is("OPERATIONAL") && h["result"]["caps"]["mount"]["state"].is("OPERATIONAL"),
+          "hello with a lease: %s", h["result"]["caps"]["mount"]["state"].s.c_str());
+}
+
+// The request first, then the act (4.14; owner, R-API-1 finding 3; I-26).
+static void test_presence() {
+    fresh("stage 4: request first, then the act");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);                                  // JP2 off, long enough
+    std::string line = reqt(2, "setup.ctrlg", lease_token, ctrlg_args());
+    uint32_t e0 = ctl_epoch;
+    int n91 = sim.cmd_count[0x91], nhw = sim.hw_resets;
+    send_only(line);
+    CHECK(host_lines().empty() && c.pres.waiting, "no answer while it waits");
+    J s = status4(3);
+    const J &p = s["result"]["presence"];
+    CHECK(p["waiting"].b && p["op"].is("setup.ctrlg") && p["id"].n == 2 && p["request_sha256"].is(sha_hex(line).c_str()) &&
+          p["ms_left"].n > 119000 && p["ms_left"].n <= 120000 && s["result"]["job"]["queued"].is("NONE") && ctl_epoch == e0,
+          "status.presence: %s id %llu", p["op"].s.c_str(), (unsigned long long)p["id"].n);
+    char t[CTL_PRESENCE_TEXT];
+    CHECK(ctl_presence_text(t, sizeof t) && !strncmp(t, "JP2? setup.ctrlg #2 ", 20) && !strncmp(t + 20, sha_hex(line).c_str(), 8) &&
+          strlen(t) == 28, "the presence row: %s", t);
+    CHECK(sim.cmd_count[0x91] == n91 && sim.hw_resets == nhw, "something sent while it waits");
+    uint32_t lg = log_next;
+    hold2(true, 250);                                   // the act
+    bool ok;
+    J a = one_answer(&ok);
+    CHECK(ok && a["outcome"].is("DONE") && a["id"].n == 2 && a["result"]["status"].t == J::INT && a["result"]["mode"].is("idp") &&
+          a["result"]["source"].is("API_CTRLG_IDP") && a["result"]["device"].is("MASTER") &&
+          a["result"]["geometry"]["cyls"].n == 980 && a["result"]["geometry"]["heads"].n == 10 &&
+          a["result"]["geometry"]["spt"].n == 17 && a["result"]["geometry"]["total_sectors"].n == 980u * 10 * 17 &&
+          !a["result"]["mount_credit"].b, "setup.ctrlg after the act: %s", a["outcome"].s.c_str());
+    CHECK(sim.cmd_count[0x91] == n91 + 1 && sim.hw_resets == nhw + 1 && sim.cmd_count[0xEC] == 0 && ide_mchs_no_identify() &&
+          ctl_setup_src == CTL_SRC_API_CTRLG_IDP && !c.pres.waiting && !ctl_presence_text(t, sizeof t),
+          "the drive: 91h +%d, RESET- +%d, ECh %d", sim.cmd_count[0x91] - n91, sim.hw_resets - nhw, sim.cmd_count[0xEC]);
+    // Every bus event of it between its API_BEGIN and API_END (I-13).
+    int begin = -1, end = -1, bus_out = 0;
+    for (uint32_t q = lg; q < log_next; q++) {
+        const obs_log_entry_t &e = log_ring[q % OBS_LOG_ENTRIES];
+        if (e.kind == OBS_EV_API && e.value == CTL_OP_SETUP_CTRLG) { if (e.outcome == OBS_API_BEGIN) begin = (int)q; else end = (int)q; }
+        else if ((e.kind == OBS_EV_CMD || e.kind == OBS_EV_CTRL || e.kind == OBS_EV_RESET) && (begin < 0 || end >= 0)) bus_out++;
+    }
+    CHECK(begin > 0 && end > begin && bus_out == 0, "API markers %d..%d, %d bus events outside", begin, end, bus_out);
+    J jl = ask1(req(4, "job.last"));
+    CHECK(jl["result"]["op"].is("setup.ctrlg") && jl["result"]["id"].n == 2 && jl["result"]["request_sha256"].is(sha_hex(line).c_str()),
+          "job.last");
+
+    // An act before the request: nothing; the request waits for its own.
+    fresh("stage 4: an act before the request");
+    power_drive();
+    open_lease(1);
+    act();
+    uint32_t ev0 = bj_fit_events();
+    CHECK(ev0 >= 1, "the act made no event");
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    hold2(true, 1000);                                  // left fitted: no event
+    CHECK(c.pres.waiting && host_lines().empty() && sim.cmd_count[0x91] == 0, "an earlier act approved it");
+    // 120 s: E_PRESENCE_REQUIRED, nothing sent, the slot free.
+    pump(117500);
+    CHECK(c.pres.waiting, "withdrawn before 120 s");
+    pump(1500);
+    J w = one_answer();
+    CHECK(is_refusal(w, "E_PRESENCE_REQUIRED") && w["retry"].is("SAFE") && !c.pres.waiting && sim.cmd_count[0x91] == 0 &&
+          sim.hw_resets == 0, "at 120 s: %s", w["err"]["code"].s.c_str());
+    // The same id again: the replay table holds that answer.
+    J w2 = ask1(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    CHECK(w2.get("replayed") && is_refusal(w2, "E_PRESENCE_REQUIRED"), "resent: not replayed");
+
+    // An act done at 119.9 s runs; its OPEN may have begun before the arrival.
+    fresh("stage 4: the OPEN before the arrival, the edge after");
+    power_drive();
+    open_lease(1);
+    hold2(false, 1000);                                 // JP2 off since before the request
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    pump(119700 - 250);
+    hold2(true, 250);                                   // the edge at about 119.45 s, the event 200 ms later
+    J late = one_answer();
+    CHECK(late["outcome"].is("DONE"), "an act inside the 120 s: %s %s", late["outcome"].s.c_str(), late["err"]["code"].s.c_str());
+
+    // A second request while one waits.
+    fresh("stage 4: one waits; a second is E_INFLIGHT");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    std::string l1 = reqt(2, "setup.ctrlg", lease_token, ctrlg_args());
+    send_only(l1);
+    J second = ask1(reqt(3, "setup.ctrlg", lease_token, ctrlg_args(990)));
+    CHECK(is_refusal(second, "E_INFLIGHT") && c.pres.waiting && c.pres.id == 2, "a second request: %s",
+          second["err"]["code"].s.c_str());
+    J s2 = status4(4);
+    CHECK(s2["result"]["presence"]["request_sha256"].is(sha_hex(l1).c_str()), "the waiting request changed");
+    J mnt = ask1(reqt(5, "mount", lease_token, mount_args()));
+    CHECK(is_refusal(mnt, "E_INFLIGHT"), "a mount while one waits: %s", mnt["err"]["code"].s.c_str());
+    // taskfile.snapshot too (SPEC-v1 3.5): the mailbox stays free for the act.
+    J tfs = ask1(req(7, "taskfile.snapshot"));
+    CHECK(is_refusal(tfs, "E_INFLIGHT") && ctl_job.state == CTL_JOB_EMPTY && c.pres.waiting && c.pres.id == 2,
+          "taskfile.snapshot while one waits: %s", tfs["err"]["code"].s.c_str());
+    hold2(true, 250);
+    J first = one_answer();
+    CHECK(first["outcome"].is("DONE") && first["id"].n == 2, "the first after the act");
+    // The second, resent as a new id, waits for its own act (one act, one request).
+    send_only(reqt(6, "setup.ctrlg", lease_token, ctrlg_args(990)));
+    hold2(true, 1000);
+    CHECK(c.pres.waiting && c.pres.id == 6 && host_lines().empty(), "one act ran two requests");
+    hold2(false, 250); hold2(true, 250);
+    J third = one_answer();
+    CHECK(third["outcome"].is("DONE") && third["id"].n == 6, "the second's own act: %s", third["outcome"].s.c_str());
+}
+
+// Withdrawal (4.14): each NOT_EXECUTED, nothing sent, the slot free.
+static void test_withdrawal() {
+    struct Case { const char *name; void (*make)(); const char *code; const char *by; void (*before)(); } cases[] = {
+        { "session.close", [] {
+            host_send(reqt(90, "session.close", lease_token, "{}")); pump(10);
+        }, "E_LEASE_REVOKED", "CLOSED", nullptr },
+        { "JP1 fitted", [] { jp1_fit(true); pump(3); }, "E_LOCKED", nullptr, nullptr },
+        { "a pad set up wrong", [] { mock_pads.io[31] |= 0x4u; pump(3); }, "E_LOCKED", nullptr, nullptr },
+        { "the TUI turning write protect off", [] {
+            config.drive_write_protected = false; ctl_wp_last = CTL_WP_TUI; hooked(); pump(3);
+        }, "E_STALE", nullptr, nullptr },
+        // A wp.on from another client (write protect was off when the request came).
+        { "wp.on", [] { host_send(req(93, "wp.on")); pump(10); }, "E_STALE", nullptr,
+          [] { config.drive_write_protected = false; ctl_wp_last = CTL_WP_TUI; hooked(); pump(3); } },
+        { "identify.forbid", [] { host_send(req(91, "identify.forbid")); pump(10); }, "E_STALE", nullptr, nullptr },
+        { "detach", [] { host_send(req(92, "detach", named(0).c_str())); pump(40); }, "E_STALE", nullptr, nullptr },
+        // An unmount naming the current mount, with nothing mounted: it changes
+        // no state (no epoch), and still withdraws it (SPEC-v1 3.5, the ratchet wins).
+        { "unmount, nothing mounted", [] { host_send(req(94, "unmount", named(0).c_str())); pump(40); }, "E_STALE", nullptr,
+          nullptr },
+    };
+    for (auto &k : cases) {
+        fresh("stage 4: a waiting request withdrawn");
+        power_drive();
+        config.drive_write_protected = true;
+        open_lease(1);
+        hold2(false, 400);
+        if (k.before) k.before();
+        send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+        CHECK(c.pres.waiting, "%s: not waiting", k.name);
+        k.make();
+        std::vector<std::string> got = host_lines();
+        J w;
+        bool found = false, order = true;
+        for (size_t i = 0; i < got.size(); i++) {
+            J x;
+            if (!parse_response(got[i], x) || x["id"].n != 2) continue;
+            w = x; found = true;
+            if (k.by && !strcmp(k.by, "CLOSED")) order = i + 1 < got.size();     // before the close's own DONE
+        }
+        CHECK(found && is_refusal(w, k.code) && (!k.by || w["err"]["by"].is(k.by)) && order && !c.pres.waiting &&
+              sim.cmd_count[0x91] == 0 && sim.hw_resets == 0, "%s: %s %s (%zu lines)", k.name, w["err"]["code"].s.c_str(),
+              w["err"]["by"].s.c_str(), got.size());
+        // And the act after it runs nothing.
+        jp1_fit(false); mock_pads.io[31] &= ~0x4u; pump(30);
+        act();
+        CHECK(sim.cmd_count[0x91] == 0 && host_lines().size() <= 1, "%s: the act after the withdrawal ran it", k.name);
+    }
+    // The port closing, and a USB reset: the request withdrawn (no answer
+    // sent: the port is gone), its answer kept for a byte-identical resend
+    // (3.5), with how the lease ended.
+    for (int usb = 0; usb < 2; usb++) {
+        fresh(usb ? "stage 4: a waiting request and a USB reset" : "stage 4: a waiting request and the port closing");
+        power_drive();
+        open_lease(1);
+        hold2(false, 400);
+        std::string line = reqt(2, "setup.ctrlg", lease_token, ctrlg_args());
+        send_only(line);
+        CHECK(c.pres.waiting, "not waiting");
+        if (usb) { ctl_on_usb_mount(); pump(3); }
+        else { tud_cdc_line_state_cb(1, false, false); pump(3); tud_cdc_line_state_cb(1, true, false); pump(3); }
+        CHECK(!c.pres.waiting && host_lines().empty(), "%s: still waiting", usb ? "USB reset" : "the port closed");
+        act();
+        CHECK(sim.cmd_count[0x91] == 0 && sim.hw_resets == 0, "an act after the %s ran it", usb ? "USB reset" : "port closed");
+        J again = ask1(line);
+        CHECK(again.get("replayed") && is_refusal(again, "E_LEASE_REVOKED") && again["err"]["by"].is(usb ? "USB_RESET" : "PORT_CLOSED"),
+              "the kept answer: %s by %s", again["err"]["code"].s.c_str(), again["err"]["by"].s.c_str());
+    }
+    // The lease's idle timer is paused while its request waits (finding 14).
+    fresh("stage 4: the idle timer while a request waits");
+    open_lease(1, 30);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    pump(100000);
+    CHECK(c.lease.held && c.pres.waiting, "a 30 s lease lapsed while its request waited");
+    pump(25000);
+    J w = one_answer();
+    CHECK(is_refusal(w, "E_PRESENCE_REQUIRED") && c.lease.held, "at 120 s");
+    pump(31000);
+    CHECK(!c.lease.held, "the timer did not restart after the wait");
+}
+
+// Arrival refusals (4.14): each answered at once, nothing waits, nothing sent.
+static void test_tier_m_arrival() {
+    struct Case { const char *name; std::string line; const char *code; void (*before)(); };
+    fresh("stage 4: arrival refusals");
+    power_drive();
+    open_lease(1);
+    std::string tk = lease_token;
+    Case cases[] = {
+        { "no token", req(10, "setup.ctrlg", ctrlg_args().c_str()), "E_SCHEMA", nullptr },
+        { "another token", reqt(11, "setup.ctrlg", "00112233445566778899aabbccddeeff", ctrlg_args()), "E_LEASE_INVALID", nullptr },
+        { "heads 17", reqt(12, "setup.ctrlg", tk, ctrlg_args(980, 17)), "E_RANGE", nullptr },
+        { "cyls 0", reqt(13, "setup.ctrlg", tk, ctrlg_args(0)), "E_RANGE", nullptr },
+        { "spt 0", reqt(14, "setup.ctrlg", tk, ctrlg_args(980, 10, 0)), "E_RANGE", nullptr },
+        { "mode", reqt(15, "setup.ctrlg", tk, ctrlg_args(980, 10, 17, "lba")), "E_SCHEMA", nullptr },
+        { "device", reqt(16, "setup.ctrlg", tk, ctrlg_args(980, 10, 17, "idp", "both")), "E_SCHEMA", nullptr },
+        { "drive_power_cycled false", reqt(17, "setup.ctrlg", tk,
+          "{\"cyls\":980,\"heads\":10,\"spt\":17,\"mode\":\"idp\",\"device\":\"master\",\"drive_power_cycled\":false}"), "E_SCHEMA", nullptr },
+        { "slave, the device master", reqt(18, "setup.ctrlg", tk, ctrlg_args(980, 10, 17, "idp", "slave")), "E_PRECONDITION", nullptr },
+        { "stale expect_epoch", reqt(19, "setup.ctrlg", tk, ctrlg_args(980, 10, 17, "idp", "master", ",\"expect_epoch\":1")),
+          "E_STALE", nullptr },
+        { "mounted", reqt(20, "setup.ctrlg", tk, ctrlg_args()), "E_STATE", [] { tui_setup_chs(980, 10, 17); tui_mount(); } },
+        { "a USB command running", reqt(21, "setup.ctrlg", tk, ctrlg_args()), "E_BUS_BUSY",
+          [] { busy_until_ns = mock_now_ns + 5000000000ull; } },
+        { "JP1 fitted", reqt(22, "setup.ctrlg", tk, ctrlg_args()), "E_LOCKED", [] { jp1_fit(true); pump(2); } },
+        { "native after a 91h", reqt(23, "setup.ctrlg", tk, ctrlg_args(980, 10, 17, "native")), "E_PRECONDITION",
+          [] { idp_written = true; hooked(); } },
+        { "a job in flight", reqt(24, "setup.ctrlg", tk, ctrlg_args()), "E_INFLIGHT",
+          [] { core1_runs = false; host_send(req(99, "taskfile.snapshot")); pump(5); } },
+        { "mount of a settings-only geometry", reqt(25, "mount", tk, mount_args("TUI_DETECT_NORMAL")), "E_PRECONDITION",
+          [] { config.cyls = 980; config.heads = 10; config.spt = 17; hooked(); } },
+        { "mount expecting another geometry", reqt(26, "mount", tk, mount_args("TUI_DETECT_NORMAL", 981)), "E_STALE",
+          [] { tui_setup_chs(980, 10, 17); } },
+        { "mount expecting another source", reqt(27, "mount", tk, mount_args("TUI_MANUAL")), "E_STALE",
+          [] { tui_setup_chs(980, 10, 17); } },
+        { "mount, native geometry gone", reqt(28, "mount", tk, mount_args("API_CTRLG_NATIVE")), "E_PRECONDITION",
+          [] { use_lba_mode = false; cur_cyls = 980; cur_heads = 10; cur_spt = 17; sync_to_config();
+               ctl_setup_noted(CTL_SRC_API_CTRLG_NATIVE); } },
+        { "mount, no such source", reqt(29, "mount", tk, mount_args("NONE")), "E_SCHEMA", nullptr },
+    };
+    for (auto &k : cases) {
+        fresh("stage 4: arrival refusals");
+        power_drive();
+        open_lease(1);
+        std::string line = k.line;
+        size_t at = line.find(tk);
+        if (at != std::string::npos) line.replace(at, tk.size(), lease_token);
+        if (k.before) k.before();
+        std::string d0 = state2();
+        uint32_t e0 = ctl_epoch;
+        int n91 = sim.cmd_count[0x91], nhw = sim.hw_resets;
+        J r = ask1(line);
+        CHECK(is_refusal(r, k.code) && !c.pres.waiting && ctl_epoch == e0 && state2() == d0 && sim.cmd_count[0x91] == n91 &&
+              sim.hw_resets == nhw, "%s: %s (%s %s)", k.name, r["err"]["code"].s.c_str(), r["err"]["why"].s.c_str(),
+              r["err"]["field"].s.c_str());
+        core1_runs = true; busy_until_ns = 0; jp1_fit(false);
+    }
+}
+
+// The declared pair (owner Q3): one act, the mount on its credit.
+static void pair_setup(uint32_t id, bool then_mount = true) {
+    power_drive();
+    hold2(false, 400);
+    send_only(reqt(id, "setup.ctrlg", lease_token, ctrlg_args(980, 10, 17, "idp", "master", then_mount ? ",\"then_mount\":true" : "")));
+    hold2(true, 250);
+}
+static void test_pair() {
+    fresh("stage 4: the declared pair");
+    open_lease(1);
+    pair_setup(2);
+    J a = one_answer();
+    CHECK(a["outcome"].is("DONE") && a["result"]["mount_credit"].b, "the set-up: %s credit %d", a["outcome"].s.c_str(),
+          a["result"]["mount_credit"].b);
+    J s = status4(3);
+    CHECK(s["result"]["jumpers"]["mount_credit_ms_left"].n > 55000, "credit %llu ms", (unsigned long long)s["result"]["jumpers"]["mount_credit_ms_left"].n);
+    pump(30000);
+    uint32_t ms0 = ctl_mount_seq;
+    J m = ask1(reqt(4, "mount", lease_token, mount_args()), nullptr, 20);
+    CHECK(m["outcome"].is("DONE") && m["result"]["used_credit"].b && m["result"]["mounted"].b &&
+          m["result"]["mount_seq"].n == ms0 + 1 && m["result"]["total_sectors"].n == 980u * 10 * 17 && is_mounted &&
+          current_screen == SCREEN_MOUNTED && !c.pres.waiting, "the mount on the credit: %s %s", m["outcome"].s.c_str(),
+          m["err"]["code"].s.c_str());
+    // The MOUNT marker says the API mounted (5.4).
+    CHECK(log_ring[ctl_mount_log_seq % OBS_LOG_ENTRIES].kind == OBS_EV_MOUNT &&
+          log_ring[ctl_mount_log_seq % OBS_LOG_ENTRIES].value == OBS_MNT_API, "marker value");
+    // Used: after an unmount, the same mount waits for its own act.
+    J u = ask1(req(5, "unmount", named(ctl_mount_seq).c_str()));
+    CHECK(u["outcome"].is("DONE") && !is_mounted, "unmount");
+    send_only(reqt(6, "mount", lease_token, mount_args()));
+    CHECK(c.pres.waiting && c.pres.op == CTL_OP_MOUNT, "a second mount on a spent credit");
+    hold2(false, 250); hold2(true, 250);
+    J m2 = one_answer();
+    CHECK(m2["outcome"].is("DONE") && !m2["result"]["used_credit"].b, "the mount's own act: %s", m2["outcome"].s.c_str());
+
+    // The 60 s: at 59 s it runs on the credit, at 61 s it waits for an act.
+    for (uint32_t after : { 59000u, 61000u }) {
+        fresh("stage 4: the credit's 60 s");
+        open_lease(1);
+        pair_setup(2);
+        (void)one_answer();
+        pump(after - 30);
+        host_send(reqt(3, "mount", lease_token, mount_args()));
+        pump(20);
+        bool on_credit = after < 60000;
+        CHECK(on_credit ? (is_mounted && !c.pres.waiting) : (!is_mounted && c.pres.waiting), "mount at %u ms: mounted %d waiting %d",
+              after, (int)is_mounted, (int)c.pres.waiting);
+    }
+    // No credit: without then_mount, after a failed set-up, after an epoch
+    // change, under another lease, for another geometry.
+    struct Case { const char *name; void (*between)(); bool then_mount; bool fail; } cases[] = {
+        { "without then_mount", nullptr, false, false },
+        { "a set-up that failed", nullptr, true, true },
+        { "an epoch change (wp.on)", [] { config.drive_write_protected = false; hooked(); pump(3);
+                                          host_send(req(80, "wp.on")); pump(5); host_lines(); }, true, false },
+        { "JP1 fitted and off again", [] { jp1_fit(true); pump(3); jp1_fit(false); pump(30); }, true, false },
+        { "another lease", [] { host_send(reqt(81, "session.close", lease_token, "{}")); pump(5); host_lines();
+                                open_lease(82); }, true, false },
+    };
+    for (auto &k : cases) {
+        fresh("stage 4: no credit");
+        open_lease(1);
+        if (k.fail) { sim.reject_idp = true; media_changed_waiting = false; strcpy(hdd_status_text, "old"); }
+        pair_setup(2, k.then_mount);
+        J a2 = one_answer();
+        sim.reject_idp = false;
+        CHECK(k.fail ? a2["outcome"].is("FAILED") && a2["err"]["code"].is("E_DRIVE") && a2["err"]["why"].is("REFUSED")
+                     : a2["outcome"].is("DONE") && a2["result"]["mount_credit"].b == k.then_mount,
+              "%s: the set-up %s %s", k.name, a2["outcome"].s.c_str(), a2["err"]["why"].s.c_str());
+        if (k.between) k.between();
+        CHECK(!credit_live(now_ms()), "%s: a credit is live", k.name);
+        if (k.fail) {
+            // The failed set-up left what a dismissed error box leaves.
+            CHECK(ctl_setup_src == CTL_SRC_NONE && config.cyls == 0 && !strcmp(hdd_model_raw, MCHS_MODEL_CLEARED) &&
+                  !show_detect_result && job_tui_io == 0 && media_changed_waiting && !hdd_status_text[0],
+                  "%s: the state after it (media change %d, status text '%s')", k.name, (int)media_changed_waiting, hdd_status_text);
+            continue;
+        }
+        send_only(reqt(90, "mount", lease_token, mount_args()), 20);
+        CHECK(!is_mounted && c.pres.waiting && c.pres.op == CTL_OP_MOUNT, "%s: a mount without an act (mounted %d)", k.name,
+              (int)is_mounted);
+    }
+    // A mount expecting another geometry never uses the credit (E_STALE at arrival).
+    fresh("stage 4: the credit and another geometry");
+    open_lease(1);
+    pair_setup(2);
+    (void)one_answer();
+    J other = ask1(reqt(3, "mount", lease_token, mount_args("API_CTRLG_IDP", 979)));
+    CHECK(is_refusal(other, "E_STALE") && !is_mounted && credit_live(now_ms()), "another geometry: %s", other["err"]["code"].s.c_str());
+}
+
+// At pickup (5.3, 4.14; findings 9 and 14): the act was spent, the request
+// refused if its lease, JP1 or a precondition changed meanwhile.
+static void test_pickup() {
+    struct Case { const char *name; void (*between)(); const char *code; } cases[] = {
+        { "JP1 fitted", [] { jp1_fit(true); pump(3); }, "E_LOCKED" },
+        { "the TUI mounted", [] { tui_setup_chs(980, 10, 17); tui_mount(); }, "E_STATE" },
+        { "a USB command started", [] { busy_until_ns = mock_now_ns + 5000000000ull; }, "E_BUS_BUSY" },
+    };
+    for (auto &k : cases) {
+        fresh("stage 4: at pickup");
+        power_drive();
+        open_lease(1);
+        hold2(false, 400);
+        send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+        core1_runs = false;                             // core 1 in a dialog: the approved job waits
+        hold2(true, 250);
+        CHECK(ctl_job.state == CTL_JOB_QUEUED && !c.pres.waiting, "%s: not queued", k.name);
+        k.between();
+        core1_runs = true;
+        pump(20);
+        std::vector<std::string> got = host_lines();
+        J r;
+        for (auto &l : got) { J x; if (parse_response(l, x) && x["id"].n == 2) r = x; }
+        CHECK(is_refusal(r, k.code) && sim.cmd_count[0x91] == 0 && sim.hw_resets == 0 && !c.jl_present,
+              "%s: %s", k.name, r["err"]["code"].s.c_str());
+        jp1_fit(false); busy_until_ns = 0;
+    }
+    // The lease closed while the approved job waits for core 1: withdrawn
+    // (finding 9), answered before the close's own DONE.
+    fresh("stage 4: a queued job and the lease's end");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    core1_runs = false;
+    hold2(true, 250);
+    host_send(reqt(3, "session.close", lease_token, "{}"));
+    pump(10);
+    std::vector<std::string> got = host_lines();
+    J w, cl;
+    if (got.size() == 2) { parse_response(got[0], w); parse_response(got[1], cl); }
+    CHECK(got.size() == 2 && w["id"].n == 2 && is_refusal(w, "E_LEASE_REVOKED") && w["err"]["by"].is("CLOSED") &&
+          cl["id"].n == 3 && cl["outcome"].is("DONE") && ctl_job.state == CTL_JOB_EMPTY, "%zu lines", got.size());
+    core1_runs = true;
+    pump(50);
+    CHECK(sim.cmd_count[0x91] == 0 && sim.hw_resets == 0, "a withdrawn job ran");
+    // The idle timer paused while its job is queued (finding 14): a 30 s
+    // lease, core 1 away 40 s, the job still runs.
+    fresh("stage 4: the idle timer while its job is queued");
+    power_drive();
+    open_lease(1, 30);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    core1_runs = false;
+    hold2(true, 250);
+    pump(29000);
+    core1_runs = true;
+    pump(20);
+    J done = one_answer();
+    CHECK(done["outcome"].is("DONE") && c.lease.held, "after 29 s queued: %s, lease %d", done["outcome"].s.c_str(), (int)c.lease.held);
+}
+
+// No terminal on interface 0 (R-API-1 finding 1): the job neither draws nor
+// reads a key, ends within its time, and the TUI's queue is as it was.
+static void test_tier_m_no_terminal() {
+    fresh("stage 4: Tier M with no terminal");
+    power_drive();
+    cdc_connected = false;
+    tty.assign(4096, 'q');
+    std::string tty0 = tty;
+    open_lease(1);
+    pair_setup(2);
+    J a = one_answer();
+    J m = ask1(reqt(3, "mount", lease_token, mount_args()), nullptr, 20);
+    CHECK(a["outcome"].is("DONE") && m["outcome"].is("DONE") && tty == tty0 && job_tui_io == 0,
+          "with no terminal: %s %s, TUI queue used %d times", a["outcome"].s.c_str(), m["outcome"].s.c_str(), job_tui_io);
+    // A drive that does not answer: the job ends (FAILED), within 75 s, and draws nothing.
+    fresh("stage 4: Tier M with no terminal, no drive");
+    sim.hw_reset_wedges = true;                          // BSY for ever after RESET-
+    cdc_connected = false;
+    tty.assign(4096, 'q');
+    tty0 = tty;
+    open_lease(1);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    hold2(true, 250);
+    pump(80000);
+    J f = one_answer();
+    CHECK(f["outcome"].is("FAILED") && f["err"]["code"].is("E_DRIVE") && tty == tty0 && job_tui_io == 0 &&
+          c.jl_present && c.jl_ended - c.jl_started < 75000 && ctl_job.state == CTL_JOB_EMPTY,
+          "no drive: %s %s tty %d io %d t %llu state %u", f["outcome"].s.c_str(), f["err"]["why"].s.c_str(), tty == tty0, job_tui_io, (unsigned long long)(c.jl_ended - c.jl_started), (unsigned)ctl_job.state);
+    // Refused at pickup (a USB command started after the act): nothing
+    // sent, nothing drawn, nothing waiting afterwards.
+    fresh("stage 4: Tier M with no terminal, refused at pickup");
+    power_drive();
+    cdc_connected = false;
+    tty.assign(4096, 'q');
+    tty0 = tty;
+    open_lease(1);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    core1_runs = false;
+    hold2(true, 250);
+    busy_until_ns = mock_now_ns + 5000000000ull;
+    core1_runs = true;
+    pump(20);
+    J rf = one_answer();
+    CHECK(is_refusal(rf, "E_BUS_BUSY") && sim.commands == 0 && sim.hw_resets == 0 && tty == tty0 && job_tui_io == 0 &&
+          ctl_job.state == CTL_JOB_EMPTY && !c.pres.waiting && !c.jl_present,
+          "refused at pickup: %s, commands %d, resets %d, tty %d, io %d", rf["err"]["code"].s.c_str(), sim.commands,
+          sim.hw_resets, tty == tty0, job_tui_io);
+    busy_until_ns = 0;
+    cdc_connected = false;
+}
+
+// After an API mount (R-API-1 finding 2, I-24): the screen is MOUNTED, and
+// the TUI's bus keys refuse while mounted, nothing sent.
+static void test_mounted_keys() {
+    fresh("stage 4: the TUI's bus keys while mounted");
+    open_lease(1);
+    pair_setup(2);
+    (void)one_answer();
+    J m = ask1(reqt(3, "mount", lease_token, mount_args()), nullptr, 20);
+    CHECK(m["outcome"].is("DONE") && current_screen == SCREEN_MOUNTED, "screen %d",
+          current_screen);
+    int cmds = sim.commands, hw = sim.hw_resets, writes = sim.reg_writes;
+    for (int k : { 'R', 'I', 'T', 'E', 'S' }) {
+        current_screen = SCREEN_DEBUG;
+        debug_key(k);
+    }
+    CHECK(sim.commands == cmds && sim.hw_resets == hw && sim.reg_writes == writes, "Debug keys while mounted: %d commands, %d resets",
+          sim.commands - cmds, sim.hw_resets - hw);
+    // Auto Detect's Enter and Y, and Load Defaults' Y: refused with a box.
+    size_t t0 = tty.size();
+    rx.push_back({ get_absolute_time(), ' ' });
+    current_screen = SCREEN_MAIN;
+    CHECK(!auto_detect_enter() && sim.hw_resets == hw && tty.find("Drive mounted", t0) != std::string::npos, "Auto Detect's Enter");
+    current_screen = SCREEN_MOUNTED;
+}
+
+#endif
+#if ATABOY_BOARD_JUMPERS
+// An act whose FITTED edge came before the request arrived, its event
+// completing while the request waits: approves nothing (X60, I-26).
+static void test_banked_act() {
+    fresh("stage 4: an edge before the arrival");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    jp2_fit(true);
+    pump(100);                                          // the edge is 100 ms old
+    uint32_t ev0 = bj_fit_events();
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    pump(300);                                          // the event completes now, the request waiting
+    CHECK(bj_fit_events() == ev0 + 1 && c.pres.waiting && sim.cmd_count[0x91] == 0 && host_lines().empty(),
+          "an edge from before the arrival approved it (events +%u, waiting %d)", bj_fit_events() - ev0, (int)c.pres.waiting);
+    hold2(false, 250); hold2(true, 250);
+    J r = one_answer();
+    CHECK(r["outcome"].is("DONE"), "the act after the arrival: %s", r["outcome"].s.c_str());
+}
+
+// The same two rules where the millisecond clock wraps (every 2^32 ms, 49.7
+// days up): an edge just before the wrap is not after an arrival just past
+// it, and an edge just past the wrap is after an arrival just before it.
+static void test_presence_wrap() {
+    const uint64_t wrap_ns = 4294967296ull * 1000000ull;
+    // A banked act: the edge 100 ms before the wrap, the request 50 ms after it.
+    mock_now_ns = wrap_ns - 3000000000ull;              // power_up adds 1 s: 2 s before the wrap
+    fresh("stage 4: an edge before the clock's wrap, the arrival after it");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    pump((uint32_t)(0u - 100u) - t_ms());                // to 100 ms before the wrap
+    jp2_fit(true);
+    pump(150);                                           // 50 ms past it
+    CHECK(t_ms() < 1000, "not past the wrap (%u)", (unsigned)t_ms());
+    uint32_t ev0 = bj_fit_events();
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    pump(300);                                           // the event completes, the request waiting
+    CHECK(bj_fit_events() == ev0 + 1 && c.pres.waiting && sim.cmd_count[0x91] == 0 && host_lines().empty(),
+          "an edge from before the wrap approved a request from after it (events +%u, waiting %d)", bj_fit_events() - ev0,
+          (int)c.pres.waiting);
+    // A true act: the request 50 ms before the wrap, the edge 100 ms after it.
+    mock_now_ns = wrap_ns - 3000000000ull;
+    fresh("stage 4: an arrival before the clock's wrap, the edge after it");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    pump((uint32_t)(0u - 60u) - t_ms());                 // to 60 ms before the wrap
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()), 10);
+    CHECK(c.pres.waiting && c.pres.arrival_ms > 0xFFFF0000u, "no request just before the wrap (%u)", (unsigned)c.pres.arrival_ms);
+    hold2(false, 150);                                   // 100 ms past the wrap
+    hold2(true, 250);
+    J r = one_answer();
+    CHECK(r["outcome"].is("DONE") && sim.cmd_count[0x91] == 1, "an act after the wrap for a request before it: %s %s",
+          r["outcome"].s.c_str(), r["err"]["code"].s.c_str());
+}
+
+// The credit is the mount's only (X50): a second set-up with a credit live
+// waits for its own act.
+static void test_credit_mount_only() {
+    fresh("stage 4: the credit is for a mount only");
+    open_lease(1);
+    pair_setup(2);
+    J a = one_answer();
+    CHECK(a["result"]["mount_credit"].b && credit_live(now_ms()), "no credit");
+    send_only(reqt(3, "setup.ctrlg", lease_token, ctrlg_args(990, 10, 17)));
+    CHECK(c.pres.waiting && c.pres.op == CTL_OP_SETUP_CTRLG && ctl_job.state == CTL_JOB_EMPTY && host_lines().empty(),
+          "a set-up ran on the mount's credit");
+}
+
+// The layers of setup.ctrlg's ranges (X17): the schema refuses (E_RANGE),
+// and ctl_mreq_check refuses on its own a request the schema never saw.
+static void test_ctrlg_layers() {
+    fresh("stage 4: setup.ctrlg's ranges, each layer");
+    ctlj_doc_t d;
+    for (const char *args : { "{\"cyls\":0,\"heads\":10,\"spt\":17,\"mode\":\"idp\",\"device\":\"master\",\"drive_power_cycled\":true}",
+                              "{\"cyls\":980,\"heads\":17,\"spt\":17,\"mode\":\"idp\",\"device\":\"master\",\"drive_power_cycled\":true}",
+                              "{\"cyls\":980,\"heads\":10,\"spt\":0,\"mode\":\"idp\",\"device\":\"master\",\"drive_power_cycled\":true}" }) {
+        std::string line = reqt(1, "setup.ctrlg", "00112233445566778899aabbccddeeff", args);
+        line.pop_back();
+        ctl_req_t r;
+        CHECK(ctlj_parse(line.data(), line.size(), &d) == CTLJ_OK && ctl_check_request(&d, &r) == CTL_E_RANGE,
+              "schema: %s", args);
+    }
+    struct { uint16_t cy; uint8_t h, s; const char *field; } bad[] = { { 0, 10, 17, "cyls" }, { 980, 17, 17, "heads" },
+                                                                        { 980, 0, 17, "heads" }, { 980, 10, 0, "spt" } };
+    for (auto &b : bad) {
+        ctl_mreq_t m = {};
+        m.cyls = b.cy; m.heads = b.h; m.spt = b.s; m.dev_base = 0xA0;
+        const char *field, *why;
+        int e = ctl_mreq_check(CTL_OP_SETUP_CTRLG, &m, &field, &why);
+        CHECK(e == CTL_E_RANGE && field && !strcmp(field, b.field), "ctl_mreq_check %u/%u/%u: %d %s", b.cy, b.h, b.s, e,
+              field ? field : "-");
+    }
+    ctl_mreq_t ok = {};
+    ok.cyls = 980; ok.heads = 16; ok.spt = 255; ok.dev_base = 0xA0;
+    const char *f, *w;
+    CHECK(ctl_mreq_check(CTL_OP_SETUP_CTRLG, &ok, &f, &w) == CTL_E_NONE, "980/16/255 refused");
+}
+#endif
+#if ATABOY_BOARD_JUMPERS
+// Without jumpers there is no Tier M (8.1): every Tier M request E_LOCKED.
+#else
+static void test_tier_m_no_jumpers() {
+    fresh("stage 4: no jumpers, no Tier M");
+    power_drive();
+    open_lease(1);
+    J r = ask1(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    CHECK(is_refusal(r, "E_LOCKED") && r["err"]["why"].is("JUMPERS_UNSUPPORTED") && !c.pres.waiting &&
+          sim.cmd_count[0x91] == 0, "setup.ctrlg: %s %s", r["err"]["code"].s.c_str(), r["err"]["why"].s.c_str());
+    tui_setup_chs(980, 10, 17);
+    J m = ask1(reqt(3, "mount", lease_token, mount_args("TUI_DETECT_NORMAL")));
+    CHECK(is_refusal(m, "E_LOCKED") && !is_mounted, "mount: %s", m["err"]["code"].s.c_str());
 }
 #endif
 
@@ -2219,10 +2944,68 @@ static void test_core1_tui() {
     key_at(B(29.5), " ");
     at(B(30.0), [] { core0_hold = false; mock_jumper_fitted[0] = false; });
     at(B(31.0), [] { CHECK(bj_jp1() == BJ_OPEN && config.drive_write_protected, "JP1 off again"); });
-    idle_after_ns = (base + T(32.0)) * 1000;
+    // 9. Stage 4, the presence row (SPEC-v1 4.14): a guarded request waiting
+    // for its act shows on the main menu, row 13 from column 43, drawn by the
+    // TUI's loop; withdrawn (session.close), the row is blanked.
+    key_at(B(31.2), "\x1b");                        // Features -> the main menu
+    at(B(31.5), [] { host_send(req(70, "session.open", "{\"client\":\"tui\",\"tui_lock\":false,\"idle_s\":300}")); });
+    at(B(32.0), [] {
+        bool ok;
+        J r = last_answer(&ok);
+        CHECK(ok && r["outcome"].is("DONE") && current_screen == SCREEN_MAIN, "presence row: session.open %s, screen %d",
+              r["outcome"].s.c_str(), current_screen);
+        lease_token = r["result"]["token"].s;
+        mark_91 = (int)tty.size();
+        host_send(reqt(71, "setup.ctrlg", lease_token, ctrlg_args()));
+    });
+    at(B(33.0), [] {
+        char want[64];
+        snprintf(want, sizeof want, "\033[13;43H" FG_YELLOW "JP2? setup.ctrlg #71 %.8s", c.pres.waiting ? hex(c.pres.digest, 4).c_str() : "none");
+        CHECK(c.pres.waiting && tty.find(want, (size_t)mark_91) != std::string::npos, "presence row not drawn");
+        mark_91 = (int)tty.size();
+        host_send(reqt(72, "session.close", lease_token, "{}"));
+    });
+    at(B(34.0), [] {
+        std::vector<std::string> r = host_lines();
+        std::string blank = "\033[13;43H" FG_YELLOW + std::string(37, ' ');
+        CHECK(r.size() == 2 && !c.pres.waiting && tty.find(blank, (size_t)mark_91) != std::string::npos,
+              "presence row: %zu answers, row blanked %d", r.size(), tty.find(blank, (size_t)mark_91) != std::string::npos);
+    });
+    const double t10 = 35.0;
 #else
-    idle_after_ns = (base + T(25.0)) * 1000;
+    const double t10 = 25.0;
 #endif
+    // 10. Stage 4, R-API-1 finding 2 (SPEC-v1 5.3, I-24): Load Defaults' Y
+    // and Auto Detect's Y with a drive mounted (a question left open when a
+    // mount came: no path today makes one, so the state is set here) are
+    // refused with the box, nothing saved, nothing sent, the screen MOUNTED.
+    // (identify.forbid from part 5 is still on: Auto Detect's own refusal
+    // would say so with another box and leave the main menu.)
+    static int saves10, hw10, ec10;
+    at(B(t10), [] {
+        is_mounted = true; hooked();
+        current_screen = SCREEN_CONFIRM; confirm_type = 0; needs_full_redraw = true;
+        saves10 = saves; hw10 = sim.hw_resets; ec10 = sim.cmd_count[0xEC]; mark_91 = (int)tty.size();
+    });
+    key_at(B(t10 + 0.3), "y");
+    key_at(B(t10 + 0.7), " ");                      // the box's key
+    at(B(t10 + 1.0), [] {
+        CHECK(tty.find(API_MOUNTED_BOX, (size_t)mark_91) != std::string::npos && saves == saves10 && sim.hw_resets == hw10 &&
+              current_screen == SCREEN_MOUNTED && is_mounted, "Load Defaults' Y while mounted: saves +%d, screen %d",
+              saves - saves10, current_screen);
+        current_screen = SCREEN_CONFIRM; confirm_type = 6; needs_full_redraw = true;
+        mark_91 = (int)tty.size();
+    });
+    key_at(B(t10 + 1.3), "y");
+    key_at(B(t10 + 1.7), " ");
+    at(B(t10 + 2.0), [] {
+        CHECK(tty.find(API_MOUNTED_BOX, (size_t)mark_91) != std::string::npos && sim.hw_resets == hw10 &&
+              sim.cmd_count[0xEC] == ec10 && current_screen == SCREEN_MOUNTED && is_mounted,
+              "Auto Detect's Y while mounted: resets +%d, screen %d", sim.hw_resets - hw10, current_screen);
+        is_mounted = false; hooked();
+        current_screen = SCREEN_MAIN; needs_full_redraw = true;
+    });
+    idle_after_ns = (base + T(t10 + 2.5)) * 1000;
     on_idle = core1_tui_done;
     core0_in_loop = true;
     core1_entry();
@@ -2230,7 +3013,10 @@ static void test_core1_tui() {
 
 // ---- serve: the Control port on stdin/stdout, for ctl_e2e.py ------------------
 // jp (stage 3, ctl_e2e.py): 1, JP1 fitted after the mount; 2, GPIO31's pad
-// set up wrong (both pulls on) after it.
+// set up wrong (both pulls on) after it; 3 (stage 4), nothing mounted and
+// nothing set up. A line "#ACT" (stage 4) is not the port's: it is the
+// human's JP2 act (open 250 ms, fitted 250 ms), taken here, answered with
+// nothing.
 static void serve(int jp = 0) {
 #ifdef _WIN32
     _setmode(_fileno(stdin), _O_BINARY);
@@ -2245,8 +3031,10 @@ static void serve(int jp = 0) {
     sim.nsect = 980u * 10 * 17;
     config.drive_write_protected = false; ctl_wp_last = CTL_WP_TUI; hooked();
     config.pipelined_reads = true; hooked();
-    tui_setup_chs(980, 10, 17);
-    tui_mount();
+    if (jp != 3) {
+        tui_setup_chs(980, 10, 17);
+        tui_mount();
+    }
     pump(2);
 #if ATABOY_BOARD_JUMPERS
     if (jp == 1) { mock_jumper_fitted[0] = true; pump(2); }
@@ -2255,12 +3043,23 @@ static void serve(int jp = 0) {
     (void)jp;
 #endif
     static char buf[4096];
+    std::string cur;
     for (;;) {
         size_t n = fread(buf, 1, 1, stdin);        // one byte at a time: never waits for more than the host sent
         if (n == 0) break;
-        port.rx.push_back((uint8_t)buf[0]);
+        cur.push_back(buf[0]);
         if (buf[0] != '\n') continue;
-        pump(30);
+        if (cur == "#ACT\n") {
+#if ATABOY_BOARD_JUMPERS
+            mock_jumper_fitted[1] = false; pump(250);
+            mock_jumper_fitted[1] = true; pump(250);
+            mock_jumper_fitted[1] = false; pump(30);
+#endif
+        } else {
+            for (char ch : cur) port.rx.push_back((uint8_t)ch);
+            pump(30);
+        }
+        cur.clear();
         if (!port.got.empty()) { fwrite(port.got.data(), 1, port.got.size(), stdout); fflush(stdout); port.got.clear(); }
     }
 }
@@ -2270,6 +3069,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "serve")) { serve(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "serve-jp1")) { serve(1); return 0; }
     if (argc > 1 && !strcmp(argv[1], "serve-pads")) { serve(2); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "serve-idle")) { serve(3); return 0; }
     if (argc > 1 && !strcmp(argv[1], "core1")) test_core1_loop();          // does not return
     if (argc > 1 && !strcmp(argv[1], "core1-confirm")) test_core1_confirm(); // does not return
     if (argc > 1 && !strcmp(argv[1], "core1-tui")) test_core1_tui();       // does not return
@@ -2311,6 +3111,22 @@ int main(int argc, char **argv) {
     test_jp2_events();
     test_jp2_changes_nothing();
     test_tier_m_caps();
+#endif
+#if ATABOY_BOARD_JUMPERS
+    test_lease();
+    test_presence();
+    test_withdrawal();
+    test_tier_m_arrival();
+    test_pair();
+    test_pickup();
+    test_tier_m_no_terminal();
+    test_mounted_keys();
+    test_banked_act();
+    test_presence_wrap();
+    test_credit_mount_only();
+    test_ctrlg_layers();
+#else
+    test_tier_m_no_jumpers();
 #endif
     fresh("end");                                   // the last test's epoch cross-check
     printf("%d checks, %d failed\n", checks, failures);

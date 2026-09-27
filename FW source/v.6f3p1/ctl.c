@@ -62,6 +62,7 @@ extern bool usb_msc_ide_busy(void);         // usb.c
 typedef struct {
     uint8_t  mounted, lba, wp, pipelined, dev_base, no_identify, native_active, native_declared;
     uint8_t  forbidden, manual_chs, idp, setup_src;
+    uint32_t lease_gen;             // stage 4: the lease (0: none held)
 #if ATABOY_BOARD_JUMPERS
     uint8_t  jp1;                   // JP1's lock state (stage 3); JP2's level is not in the epoch (4.3)
 #endif
@@ -107,6 +108,47 @@ static struct {
     uint8_t  jl_digest[32];
     uint32_t jl_len;
     char     jl_resp[CTL_JOB_LAST_BYTES];
+    const char *err_why;            // err.why of a core-0 op's refusal
+    // Stage 4. The lease (SPEC-v1 6.1). The token is 32 lower-case hex
+    // characters from the TRNG; it is compared, never logged or shown.
+    struct {
+        bool     held;
+        char     token[33];
+        char     client[17];
+        uint32_t idle_ms, last_ms, gen, next_gen;
+        bool     old_valid;         // the last lease's token and how it ended
+        char     old_token[33];
+        uint8_t  old_by;
+    } lease;
+    // The presence slot (4.14): the one Tier M request waiting for its act.
+    struct {
+        bool     waiting;
+        uint8_t  op;
+        uint32_t id, arrival_ms, arrival_epoch, lease_gen;
+        uint8_t  digest[32];
+        int      slot;              // its replay slot
+        ctl_mreq_t m;
+    } pres;
+    // The declared pair's mount credit (owner Q3): one mount, same lease,
+    // same geometry, within 60 s of the set-up's end, no epoch change since.
+    struct {
+        bool     live;
+        uint32_t lease_gen, end_ms, epoch;
+    } credit;
+    // Answers owed, in order, before any new line is read: requests
+    // withdrawn from the slot or the mailbox, and session.close's own.
+    struct {
+        uint8_t  kind, err, by, retry;
+        uint32_t id, port_gen;
+        int      slot;
+        const char *msg, *why;
+    } outq[3];
+    uint8_t  outq_n;
+    // err.by, err.client and err.idle_ms_left of the next refusal (send_error).
+    uint8_t  ex_by;
+    const char *ex_client;
+    bool     ex_idle;
+    uint32_t ex_idle_ms;
 } c;
 
 static volatile bool dtr_dropped, usb_mounted;      // set by the two callbacks
@@ -143,6 +185,7 @@ static void fingerprint(ctl_fp_t *f) {
     f->manual_chs = ide_manual_chs_active();
     f->idp = ide_idp_sent_since_boot();
     f->setup_src = ctl_setup_src;
+    f->lease_gen = c.lease.held ? c.lease.gen : 0;
 #if ATABOY_BOARD_JUMPERS
     f->jp1 = bj_jp1();
 #endif
@@ -214,6 +257,9 @@ static uint32_t finish(ctlw_t *w, bool send) {
     return w->len;
 }
 
+// err.by (SPEC-v1 6.1), by CTL_BY_*.
+static const char *const by_name[] = { "", "CLOSED", "TUI", "USB_RESET", "PORT_CLOSED", "IDLE" };
+
 // detach's failure result (SPEC-v1 3.3, 4.12): the state it left, known.
 static bool fail_detach;
 static uint32_t send_error(bool id_ok, uint32_t id, uint8_t outcome, uint8_t retry, uint8_t err,
@@ -235,6 +281,10 @@ static uint32_t send_error(bool id_ok, uint32_t id, uint8_t outcome, uint8_t ret
     ctlw_str(&w, "msg", msg);
     if (why) ctlw_str(&w, "why", why);
     if (field) ctlw_str(&w, "field", field);
+    if (c.ex_by) ctlw_str(&w, "by", by_name[c.ex_by]);
+    if (c.ex_client) ctlw_str(&w, "client", c.ex_client);
+    if (c.ex_idle) ctlw_uint(&w, "idle_ms_left", c.ex_idle_ms);
+    c.ex_by = CTL_BY_NONE; c.ex_client = 0; c.ex_idle = false;
     ctlw_end_obj(&w);
     if (err == CTL_E_PARSE) c.parse_errors++;
     return finish(&w, send);
@@ -305,7 +355,7 @@ static int op_hello(ctlw_t *w, const ctlj_doc_t *d, int args) {
         ctl_op_cap(op, &st, &why);
 #if ATABOY_BOARD_JUMPERS
         if (st == CTL_CAP_LOCKED && ctl_ops[op].tier == CTL_TIER_M)
-            ctl_tier_m_cap(bj_jp1(), false, &st, &why);         // stage 4: the lease
+            ctl_tier_m_cap(bj_jp1(), c.lease.held, &st, &why);
 #endif
         ctlw_obj(w, ctl_ops[op].name);
         ctlw_str(w, "state", st == CTL_CAP_OPERATIONAL ? "OPERATIONAL" : st == CTL_CAP_LOCKED ? "LOCKED" : "ABSENT");
@@ -354,6 +404,30 @@ static const char *const wp_last_name[] = { "BOOT", "TUI", "API" };
 #if ATABOY_BOARD_JUMPERS
 static const char *const jumper_name[] = { "UNKNOWN", "OPEN", "FITTED", "UNREADABLE" };    // BJ_*
 #endif
+
+// The declared pair's credit (owner Q3), live: earned and not used, the
+// lease it was earned under still held, within its 60 s, and no epoch change
+// since the set-up ended (a TUI action, a ratchet op, JP1, the lease ending,
+// another set-up; JP2's level is not one). That a mount it takes expects
+// exactly what the set-up set follows: with no epoch change since, the
+// state is the set-up's, and a mount's expect is compared with the state
+// before this is asked (ctl_mreq_check, E_STALE).
+static bool credit_live(uint32_t now) {
+    return c.credit.live && c.lease.held && c.credit.lease_gen == c.lease.gen &&
+           now - c.credit.end_ms <= CTL_MOUNT_CREDIT_S * 1000u && ctl_epoch == c.credit.epoch;
+}
+
+// The credit and the lease's idle time, as status shows them.
+static uint32_t credit_ms_left(uint32_t now) {
+    if (!credit_live(now)) return 0;
+    uint32_t used = now - c.credit.end_ms;
+    return used < CTL_MOUNT_CREDIT_S * 1000u ? CTL_MOUNT_CREDIT_S * 1000u - used : 0;
+}
+static uint32_t lease_idle_left(uint32_t now) {
+    if (!c.lease.held) return 0;
+    uint32_t idle = now - c.lease.last_ms;
+    return idle < c.lease.idle_ms ? c.lease.idle_ms - idle : 0;
+}
 
 // The wp object of status and of wp.on's result (SPEC-v1 4.3, 4.12).
 static void write_wp(ctlw_t *w) {
@@ -432,20 +506,28 @@ static void write_status(ctlw_t *w) {
     ctlw_str(w, "jp1", "NOT_BUILT");
     ctlw_str(w, "jp2", "NOT_BUILT");
 #endif
-    ctlw_uint(w, "mount_credit_ms_left", 0);
+    ctlw_uint(w, "mount_credit_ms_left", credit_ms_left(now_ms()));
     ctlw_end_obj(w);
-    ctlw_obj(w, "presence");                    // stage 4: no Tier M, nothing ever waits
-    ctlw_bool(w, "waiting", false);
-    ctlw_str(w, "op", "NONE");
-    ctlw_null(w, "id");
-    ctlw_null(w, "request_sha256");
-    ctlw_uint(w, "ms_left", 0);
+    ctlw_obj(w, "presence");                    // 4.14: the waiting Tier M request
+    ctlw_bool(w, "waiting", c.pres.waiting);
+    if (c.pres.waiting) {
+        uint32_t waited = now_ms() - c.pres.arrival_ms;
+        ctlw_str(w, "op", ctl_ops[c.pres.op].name);
+        ctlw_uint(w, "id", c.pres.id);
+        ctlw_hex(w, "request_sha256", c.pres.digest, 32);
+        ctlw_uint(w, "ms_left", waited < CTL_PRESENCE_S * 1000u ? CTL_PRESENCE_S * 1000u - waited : 0);
+    } else {
+        ctlw_str(w, "op", "NONE");
+        ctlw_null(w, "id");
+        ctlw_null(w, "request_sha256");
+        ctlw_uint(w, "ms_left", 0);
+    }
     ctlw_end_obj(w);
-    ctlw_obj(w, "lease");                       // stage 4
-    ctlw_bool(w, "held", false);
-    ctlw_null(w, "client");
-    ctlw_uint(w, "idle_ms_left", 0);
-    ctlw_bool(w, "tui_lock", false);
+    ctlw_obj(w, "lease");                       // 6.1: never the token
+    ctlw_bool(w, "held", c.lease.held);
+    if (c.lease.held) ctlw_str(w, "client", c.lease.client); else ctlw_null(w, "client");
+    ctlw_uint(w, "idle_ms_left", lease_idle_left(now_ms()));
+    ctlw_bool(w, "tui_lock", false);            // not built (stage 4 deviation: tui_lock is refused)
     ctlw_end_obj(w);
     uint32_t js = ctl_job.state;
     bool live = js == CTL_JOB_QUEUED || js == CTL_JOB_RUNNING;
@@ -779,6 +861,294 @@ static int op_job_last(ctlw_t *w, const ctlj_doc_t *d, int args) {
     return CTL_E_NONE;
 }
 
+// ---------------------------------------------------------------------------
+//  Stage 4: the lease (SPEC-v1 4.13, 6.1)
+// ---------------------------------------------------------------------------
+
+// session.open. tui_lock (6.4) is not built in this stage: asked for, it is
+// refused and no lease opens (the host client never asks it by default).
+static int op_session_open(ctlw_t *w, const ctlj_doc_t *d, int args) {
+    if (d->node[ctlj_find(d, args, "tui_lock")].num) { c.err_field = "tui_lock"; c.err_why = "TUI_LOCK_NOT_BUILT"; return CTL_E_PRECONDITION; }
+    uint32_t now = now_ms();
+    if (c.lease.held) {
+        c.ex_client = c.lease.client;
+        c.ex_idle = true;
+        c.ex_idle_ms = lease_idle_left(now);
+        return CTL_E_LEASE_HELD;
+    }
+    static const char hx[] = "0123456789abcdef";
+    uint64_t r0 = get_rand_64(), r1 = get_rand_64();
+    for (int i = 0; i < 16; i++) {
+        c.lease.token[i] = hx[(r0 >> (60 - 4 * i)) & 15];
+        c.lease.token[16 + i] = hx[(r1 >> (60 - 4 * i)) & 15];
+    }
+    c.lease.token[32] = 0;
+    int cl = ctlj_find(d, args, "client");
+    uint32_t n = d->node[cl].str_len;
+    memcpy(c.lease.client, d->line + d->node[cl].str_off, n);
+    c.lease.client[n] = 0;
+    c.lease.idle_ms = (uint32_t)d->node[ctlj_find(d, args, "idle_s")].num * 1000u;
+    c.lease.last_ms = now;
+    c.lease.gen = ++c.lease.next_gen;
+    c.lease.held = true;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    ctl_lease_gen = c.lease.gen;
+    CTL_EPOCH_BUMP();                                       // the lease is state (4.3)
+    (void)obs_api(CTL_OP_SESSION_OPEN, c.cur_id, OBS_API_DONE);
+    ctlw_str(w, "token", c.lease.token);
+    ctlw_uint(w, "idle_s", c.lease.idle_ms / 1000u);
+    ctlw_bool(w, "tui_lock", false);
+    return CTL_E_NONE;
+}
+
+// The token of a session.close or Tier M request (4.14 step 4). The right
+// one renews the lease's idle timer; the last lease's gets E_LEASE_REVOKED
+// with how it ended.
+static int lease_check(const ctlj_doc_t *d, int token, uint8_t *by) {
+    *by = CTL_BY_NONE;
+    if (c.lease.held && ctlj_str_is(d, token, c.lease.token)) { c.lease.last_ms = now_ms(); return CTL_E_NONE; }
+    if (c.lease.old_valid && ctlj_str_is(d, token, c.lease.old_token)) { *by = c.lease.old_by; return CTL_E_LEASE_REVOKED; }
+    return c.lease.held ? CTL_E_LEASE_INVALID : CTL_E_NO_LEASE;
+}
+
+// An answer owed, sent in order before any new line is read (outq_poll).
+enum { CTL_OUTQ_REFUSE, CTL_OUTQ_CLOSED };
+static void outq_push(uint8_t kind, uint32_t id, int slot, uint32_t port_gen, uint8_t err, uint8_t retry, uint8_t by,
+                      const char *msg, const char *why) {
+    if (c.outq_n >= sizeof c.outq / sizeof c.outq[0]) return;      // never: at most two withdrawals and a close
+    c.outq[c.outq_n].kind = kind; c.outq[c.outq_n].id = id; c.outq[c.outq_n].slot = slot;
+    c.outq[c.outq_n].port_gen = port_gen; c.outq[c.outq_n].err = err; c.outq[c.outq_n].retry = retry;
+    c.outq[c.outq_n].by = by; c.outq[c.outq_n].msg = msg; c.outq[c.outq_n].why = why;
+    c.outq_n++;
+}
+
+static void presence_publish(void);
+
+// The waiting request leaves the slot without running (4.14): NOT_EXECUTED,
+// answered in order. Its replay slot keeps that answer.
+static void pres_withdraw(uint8_t err, uint8_t by, const char *msg, const char *why) {
+    if (!c.pres.waiting) return;
+    c.pres.waiting = false;
+    presence_publish();
+    outq_push(CTL_OUTQ_REFUSE, c.pres.id, c.pres.slot, c.port_gen, err,
+              err == CTL_E_STALE ? CTL_RETRY_AFTER_STATUS : CTL_RETRY_SAFE, by, msg, why);
+}
+
+// The lease ends (6.1): its waiting request and a job of it still queued
+// are withdrawn (E_LEASE_REVOKED, by), its credit ends, its token is kept
+// only to say how it ended. A job of it already running is not stopped.
+static void lease_end(uint8_t by) {
+    if (!c.lease.held) return;
+    pres_withdraw(CTL_E_LEASE_REVOKED, by, "the lease ended", 0);
+    if (ctl_job.state == CTL_JOB_QUEUED && ctl_job.lease_gen == c.lease.gen && ctl_job_cas(CTL_JOB_QUEUED, CTL_JOB_EMPTY)) {
+        outq_push(CTL_OUTQ_REFUSE, ctl_job.id, c.job_slot, c.job_port_gen, CTL_E_LEASE_REVOKED, CTL_RETRY_SAFE, by,
+                  "the lease ended before pickup", 0);
+        c.job_slot = -1;
+    }
+    c.credit.live = false;
+    memcpy(c.lease.old_token, c.lease.token, sizeof c.lease.token);
+    c.lease.old_by = by;
+    c.lease.old_valid = true;
+    c.lease.held = false;
+    ctl_lease_by = by;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    ctl_lease_gen = 0;
+    CTL_EPOCH_BUMP();
+}
+
+// session.close (4.13): its withdrawals answered first, then its own DONE.
+static void session_close(uint32_t id, int slot, const ctlj_doc_t *d, int token) {
+    uint8_t by;
+    int e = lease_check(d, token, &by);
+    if (e != CTL_E_NONE) {
+        c.ex_by = by;
+        uint32_t n = send_error(true, id, CTL_OUT_NOT_EXECUTED, CTL_RETRY_SAFE, (uint8_t)e,
+                                e == CTL_E_LEASE_REVOKED ? "that lease has ended" :
+                                e == CTL_E_NO_LEASE ? "no lease is held" : "not the lease's token", 0, "token", true);
+        if (slot >= 0) ctl_replay_finish(&c.replay, slot, c.resp, n);
+        return;
+    }
+    (void)obs_api(CTL_OP_SESSION_CLOSE, id, OBS_API_DONE);
+    lease_end(CTL_BY_CLOSED);
+    outq_push(CTL_OUTQ_CLOSED, id, slot, c.port_gen, 0, 0, 0, 0, 0);
+}
+
+// The lease's idle timer, paused while a request of it waits for presence
+// or a job of it is queued, running or not yet answered (6.1, finding 14).
+static void lease_poll(uint32_t now) {
+    if (!c.lease.held) return;
+    uint32_t js = ctl_job.state;
+    bool paused = c.pres.waiting || (js != CTL_JOB_EMPTY && ctl_job.lease_gen == c.lease.gen);
+    if (paused) c.lease.last_ms = now;
+    else if (now - c.lease.last_ms >= c.lease.idle_ms) lease_end(CTL_BY_IDLE);
+}
+
+// ---------------------------------------------------------------------------
+//  Stage 4: Tier M, request first (SPEC-v1 4.14; owner, R-API-1 finding 3)
+// ---------------------------------------------------------------------------
+
+// The presence row's text for the TUI (ctl.h), behind a sequence count:
+// core 0 writes, core 1 copies, and a copy that saw the count move is taken
+// again.
+static volatile uint32_t pres_seq;
+static char pres_text[CTL_PRESENCE_TEXT];
+static void presence_publish(void) {
+    __atomic_fetch_add(&pres_seq, 1u, __ATOMIC_SEQ_CST);        // odd: being written
+    if (c.pres.waiting) {
+        static const char hx[] = "0123456789abcdef";
+        char h8[9];
+        for (int i = 0; i < 4; i++) { h8[2 * i] = hx[c.pres.digest[i] >> 4]; h8[2 * i + 1] = hx[c.pres.digest[i] & 15]; }
+        h8[8] = 0;
+        snprintf(pres_text, sizeof pres_text, "JP2? %s #%lu %s", ctl_ops[c.pres.op].name, (unsigned long)c.pres.id, h8);
+    } else {
+        pres_text[0] = 0;
+    }
+    __atomic_fetch_add(&pres_seq, 1u, __ATOMIC_SEQ_CST);        // even: done
+}
+bool ctl_presence_text(char *out, unsigned n) {
+    for (int tries = 0; tries < 8; tries++) {
+        uint32_t s0 = __atomic_load_n(&pres_seq, __ATOMIC_SEQ_CST);
+        if (s0 & 1) continue;
+        unsigned k = 0;
+        for (; k + 1 < n && k + 1 < sizeof pres_text && pres_text[k]; k++) out[k] = pres_text[k];
+        out[k] = 0;
+        if (__atomic_load_n(&pres_seq, __ATOMIC_SEQ_CST) == s0) return out[0] != 0;
+    }
+    out[0] = 0;
+    return false;
+}
+
+// Tier M's jumper precondition (4.14 step 5): JP1 open and readable, the
+// jumpers built. why: the capability's word for it.
+static bool jumpers_forbid(const char **why) {
+#if ATABOY_BOARD_JUMPERS
+    if (bj_tier_m_open()) return false;
+    *why = bj_jp1() == BJ_FITTED ? "JP1_FITTED" : "JUMPERS_UNREADABLE";
+#else
+    *why = "JUMPERS_UNSUPPORTED";
+#endif
+    return true;
+}
+
+// A request into the mailbox (5.3): the approved one, or a mount on a credit.
+static void mailbox_put(uint8_t op, uint32_t id, const uint8_t digest[32], const ctl_mreq_t *m, uint32_t lease_gen,
+                        bool via_credit, int slot) {
+    ctl_job.op = op;
+    ctl_job.id = id;
+    memcpy(ctl_job.digest, digest, 32);
+    ctl_job.m = *m;
+    ctl_job.expect_mount_seq = 0;
+    ctl_job.has_epoch = false;
+    ctl_job.lease_gen = lease_gen;
+    ctl_job.via_credit = via_credit;
+    ctl_job.credit_end_ms = c.credit.end_ms;
+    ctl_job.credit_epoch = c.credit.epoch;
+    ctl_job.queued_ms = now_ms();
+    c.job_port_gen = c.port_gen;
+    c.job_slot = slot;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);      // the request before the state
+    ctl_job.state = CTL_JOB_QUEUED;
+}
+
+// A Tier M request's arrival (4.14), after the replay table: the token, the
+// jumpers, expect_epoch, nothing else in flight, every precondition; then
+// the mailbox at once (a mount on its pair's credit) or the presence slot.
+// A refusal is answered now and changes nothing.
+static void tier_m_arrival(uint32_t id, const uint8_t digest[32], const ctlj_doc_t *d, const ctl_req_t *r, int slot) {
+    uint8_t by;
+    const char *why = 0, *field = 0, *msg = "";
+    ctl_mreq_t m = { 0 };
+    uint8_t retry = CTL_RETRY_SAFE;
+    int e = lease_check(d, r->token, &by);
+    if (e != CTL_E_NONE) {
+        msg = e == CTL_E_LEASE_REVOKED ? "that lease has ended" : e == CTL_E_NO_LEASE ? "no lease is held" : "not the lease's token";
+        field = "token";
+    } else if (jumpers_forbid(&why)) {
+        e = CTL_E_LOCKED; msg = "JP1 fitted, the jumpers unreadable, or none built";
+    } else {
+        ctl_mreq_read(d, r->op, r->args, &m);
+        if (m.has_epoch && m.expect_epoch != ctl_epoch) {
+            e = CTL_E_STALE; msg = "the state changed since expect_epoch"; field = "expect_epoch"; retry = CTL_RETRY_AFTER_STATUS;
+        } else if (ctl_job.state != CTL_JOB_EMPTY || c.pres.waiting) {
+            e = CTL_E_INFLIGHT; msg = c.pres.waiting ? "a guarded request waits for its act" : "another job is in flight";
+        } else {
+            e = ctl_mreq_check((uint8_t)r->op, &m, &field, &why);
+            if (e != CTL_E_NONE) {
+                msg = "a precondition is not met";
+                if (e == CTL_E_STALE) retry = CTL_RETRY_AFTER_STATUS;
+            }
+        }
+    }
+    if (e != CTL_E_NONE) {
+        c.ex_by = by;
+        uint32_t n = send_error(true, id, CTL_OUT_NOT_EXECUTED, retry, (uint8_t)e, msg, why, field, true);
+        if (slot >= 0) ctl_replay_finish(&c.replay, slot, c.resp, n);
+        return;
+    }
+    uint32_t now = now_ms();
+    if (r->op == CTL_OP_MOUNT && credit_live(now)) {
+        c.credit.live = false;                              // single use: taken now, checked again at pickup
+        mailbox_put(CTL_OP_MOUNT, id, digest, &m, c.lease.gen, true, slot);
+        return;
+    }
+    c.pres.waiting = true;
+    c.pres.op = (uint8_t)r->op;
+    c.pres.id = id;
+    memcpy(c.pres.digest, digest, 32);
+    c.pres.arrival_ms = now;
+    c.pres.arrival_epoch = ctl_epoch;
+    c.pres.lease_gen = c.lease.gen;
+    c.pres.slot = slot;
+    c.pres.m = m;
+    presence_publish();
+}
+
+// The waiting request, each pass (4.14): withdrawn at JP1, at any epoch
+// change since it came, at 120 s; approved by a fit event whose FITTED edge
+// came after it did, which moves it to the mailbox in this same step.
+static void pres_poll(uint32_t now, bool fit, uint32_t edge_ms) {
+    if (!c.pres.waiting) return;
+    const char *why;
+    if (jumpers_forbid(&why)) { pres_withdraw(CTL_E_LOCKED, CTL_BY_NONE, "JP1 fitted, or the jumpers unreadable", why); return; }
+    if (ctl_epoch != c.pres.arrival_epoch) { pres_withdraw(CTL_E_STALE, CTL_BY_NONE, "the state changed while it waited", 0); return; }
+    if (now - c.pres.arrival_ms >= CTL_PRESENCE_S * 1000u) {
+        pres_withdraw(CTL_E_PRESENCE_REQUIRED, CTL_BY_NONE, "no JP2 act within 120 s", 0);
+        return;
+    }
+    // After, by the difference: the millisecond clock wraps every 49.7 days,
+    // and an edge just before a wrap is not later than an arrival after it.
+    if (fit && (int32_t)(edge_ms - c.pres.arrival_ms) > 0 && ctl_job.state == CTL_JOB_EMPTY) {
+        c.pres.waiting = false;
+        presence_publish();
+        mailbox_put(c.pres.op, c.pres.id, c.pres.digest, &c.pres.m, c.pres.lease_gen, false, c.pres.slot);
+    }
+}
+
+// The answers owed, in order, while the writer is free.
+static void outq_poll(void) {
+    while (c.outq_n && !c.resp_busy) {
+        bool send = c.outq[0].port_gen == c.port_gen && c.dtr;
+        uint32_t n;
+        if (c.outq[0].kind == CTL_OUTQ_CLOSED) {
+            ctlw_t w;
+            begin(&w, true, c.outq[0].id);
+            ctlw_bool(&w, "ok", true);
+            ctlw_str(&w, "outcome", "DONE");
+            ctlw_obj(&w, "result");
+            ctlw_bool(&w, "closed", true);
+            ctlw_end_obj(&w);
+            n = finish(&w, send);
+        } else {
+            c.ex_by = c.outq[0].by;
+            n = send_error(true, c.outq[0].id, CTL_OUT_NOT_EXECUTED, c.outq[0].retry, c.outq[0].err, c.outq[0].msg,
+                           c.outq[0].why, 0, send);
+        }
+        if (c.outq[0].slot >= 0) ctl_replay_finish(&c.replay, c.outq[0].slot, c.resp, n);
+        for (unsigned i = 1; i < c.outq_n; i++) c.outq[i - 1] = c.outq[i];
+        c.outq_n--;
+    }
+}
+
 typedef int (*ctl_op_fn)(ctlw_t *w, const ctlj_doc_t *d, int args);
 static ctl_op_fn core0_fn(int op) {
     switch (op) {
@@ -795,6 +1165,7 @@ static ctl_op_fn core0_fn(int op) {
     case CTL_OP_WP_ON:           return op_wp_on;
     case CTL_OP_PIPELINED_OFF:   return op_pipelined_off;
     case CTL_OP_IDENTIFY_FORBID: return op_identify_forbid;
+    case CTL_OP_SESSION_OPEN:    return op_session_open;
     default:
 #if ATABOY_HOST_TEST
         return ctl_test_op[op];
@@ -815,13 +1186,16 @@ static uint32_t run_core0(int op, uint32_t id, const ctlj_doc_t *d, int args) {
     ctlw_obj(&w, "result");
     c.cur_id = id;
     c.err_field = 0;
+    c.err_why = 0;
     int e = fn ? fn(&w, d, args) : CTL_E_UNKNOWN_OP;
     if (e != CTL_E_NONE)
         return send_error(true, id, CTL_OUT_NOT_EXECUTED, e == CTL_E_STALE ? CTL_RETRY_AFTER_STATUS : CTL_RETRY_SAFE,
                           (uint8_t)e,
                           e == CTL_E_BUSY_STATE ? "the state kept changing while it was read" :
-                          e == CTL_E_STALE ? "the state changed since expect_epoch" : "not available",
-                          0, c.err_field, true);
+                          e == CTL_E_STALE ? "the state changed since expect_epoch" :
+                          e == CTL_E_LEASE_HELD ? "another client holds the lease" :
+                          e == CTL_E_PRECONDITION ? "a precondition is not met" : "not available",
+                          c.err_why, c.err_field, true);
     ctlw_end_obj(&w);
     uint32_t n = finish(&w, true);
     if (w.overflow)     // never with this build's ops and limits; tested at their largest
@@ -873,8 +1247,16 @@ static bool queue_job(int op, uint32_t id, const uint8_t digest[32], const ctlj_
     if (op == CTL_OP_TASKFILE_SNAPSHOT && !taskfile_arrival_ok(id)) return false;
     if ((op == CTL_OP_UNMOUNT || op == CTL_OP_DETACH) && !names_current_now(id, d, args, &ms, &has_e, &ep)) return false;
     if (ctl_job.state != CTL_JOB_EMPTY) { refuse(true, id, CTL_E_INFLIGHT, "another job is in flight", 0); return false; }
+    // A guarded request waiting for its act is in flight for
+    // taskfile.snapshot (SPEC-v1 3.5): the mailbox stays free for it.
+    if (op == CTL_OP_TASKFILE_SNAPSHOT && c.pres.waiting) {
+        refuse(true, id, CTL_E_INFLIGHT, "a guarded request waits for its act", 0);
+        return false;
+    }
     ctl_job.op = (uint8_t)op;
     ctl_job.id = id;
+    ctl_job.lease_gen = 0;
+    ctl_job.via_credit = false;
     ctl_job.expect_mount_seq = ms;
     ctl_job.has_epoch = has_e;
     ctl_job.expect_epoch = ep;
@@ -883,6 +1265,13 @@ static bool queue_job(int op, uint32_t id, const uint8_t digest[32], const ctlj_
     c.job_port_gen = c.port_gen;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);      // the request before the state
     ctl_job.state = CTL_JOB_QUEUED;
+    // The ratchet wins (SPEC-v1 3.5, 4.14): an unmount or detach that names
+    // the current mount withdraws a waiting guarded request, whether or not
+    // it will change anything (with nothing mounted, unmount changes no
+    // state and so no epoch). One naming another mount was refused above
+    // and left it alone (I-27).
+    if (op == CTL_OP_UNMOUNT || op == CTL_OP_DETACH)
+        pres_withdraw(CTL_E_STALE, CTL_BY_NONE, "an unmount or detach came while it waited", 0);
     // No answer now: it comes when the job ends or is withdrawn.
     return true;
 }
@@ -900,6 +1289,45 @@ static void answer_job(void) {
         ctlw_bool(&w, "mounted", is_mounted);
         ctlw_bool(&w, "changed", j->changed);
         ctlw_bool(&w, "native_mode_ended", j->native_ended);
+        ctlw_end_obj(&w);
+        n = finish(&w, send);
+    } else if (j->outcome == CTL_OUT_DONE && j->op == CTL_OP_SETUP_CTRLG) {
+        // The declared pair's credit (Q3): earned by a DONE set-up that asked
+        // for it, of a lease still held, from its end.
+        bool credit = j->m.then_mount && c.lease.held && c.lease.gen == j->lease_gen;
+        if (credit) {
+            c.credit.live = true;
+            c.credit.lease_gen = j->lease_gen;
+            c.credit.end_ms = j->ended_ms;
+            c.credit.epoch = j->end_epoch;
+        }
+        begin(&w, true, j->id);
+        ctlw_bool(&w, "ok", true);
+        ctlw_str(&w, "outcome", "DONE");
+        ctlw_obj(&w, "result");
+        ctlw_uint(&w, "status", j->status);
+        ctlw_str(&w, "mode", j->m.native ? "native" : "idp");
+        ctlw_str(&w, "source", j->m.native ? "API_CTRLG_NATIVE" : "API_CTRLG_IDP");
+        ctlw_str(&w, "device", j->m.dev_base == 0xB0 ? "SLAVE" : "MASTER");
+        ctlw_obj(&w, "geometry");
+        ctlw_uint(&w, "cyls", j->m.cyls);
+        ctlw_uint(&w, "heads", j->m.heads);
+        ctlw_uint(&w, "spt", j->m.spt);
+        ctlw_uint(&w, "total_sectors", (uint64_t)j->m.cyls * j->m.heads * j->m.spt);
+        ctlw_end_obj(&w);
+        ctlw_bool(&w, "mount_credit", credit);
+        ctlw_end_obj(&w);
+        n = finish(&w, send);
+    } else if (j->outcome == CTL_OUT_DONE && j->op == CTL_OP_MOUNT) {
+        begin(&w, true, j->id);
+        ctlw_bool(&w, "ok", true);
+        ctlw_str(&w, "outcome", "DONE");
+        ctlw_obj(&w, "result");
+        ctlw_bool(&w, "mounted", true);
+        ctlw_uint(&w, "mount_seq", j->mount_seq);
+        ctlw_uint(&w, "mount_log_seq", j->mount_log_seq);
+        ctlw_uint(&w, "total_sectors", j->total_sectors);
+        ctlw_bool(&w, "used_credit", j->via_credit);
         ctlw_end_obj(&w);
         n = finish(&w, send);
     } else if (j->outcome == CTL_OUT_DONE && j->op == CTL_OP_DETACH) {
@@ -933,7 +1361,8 @@ static void answer_job(void) {
     } else {
         uint8_t retry = j->outcome == CTL_OUT_NOT_EXECUTED && j->err != CTL_E_STALE ? CTL_RETRY_SAFE : CTL_RETRY_AFTER_STATUS;
         fail_detach = j->op == CTL_OP_DETACH && j->outcome == CTL_OUT_FAILED;
-        n = send_error(true, j->id, j->outcome, retry, j->err, j->msg, 0, j->field, send);
+        c.ex_by = j->by;
+        n = send_error(true, j->id, j->outcome, retry, j->err, j->msg, j->why, j->field, send);
     }
     if (j->ran) {
         c.jl_present = true;
@@ -1062,6 +1491,8 @@ static void handle_line(uint32_t len) {
             }
         }
     }
+    if (r.op == CTL_OP_SESSION_CLOSE) { session_close(r.id, slot, d, r.token); return; }
+    if (ctl_ops[r.op].tier == CTL_TIER_M) { tier_m_arrival(r.id, digest, d, &r, slot); return; }
     if (ctl_ops[r.op].job) {
         if (queue_job(r.op, r.id, digest, d, r.args)) { c.job_slot = slot; return; }
         if (slot >= 0) ctl_replay_finish(&c.replay, slot, c.resp, c.resp_len - 1);
@@ -1108,7 +1539,7 @@ static void tx_pump(uint32_t now) {
 
 static void rx_pump(uint32_t now, uint32_t since_last) {
     bool got = false, empty = true;
-    while (!c.resp_busy) {
+    while (!c.resp_busy && !c.outq_n) {
         if (!tud_cdc_n_available(CTL_ITF)) break;
         empty = false;
         uint8_t b;
@@ -1181,30 +1612,42 @@ void ctl_task(void) {
 #if ATABOY_BOARD_JUMPERS
     // The jumpers, every pass, whatever the port is doing (SPEC-v1 8.1,
     // 8.3), and before the epoch's cross-check below. A fit event is
-    // reported by the one pass that ends it and is never kept (8.3). Stage 3
-    // has no Tier M and so no presence slot: the event is counted
-    // (bj_fit_events) and approves nothing, then or later.
+    // reported by the one pass that ends it and is never kept (8.3): this
+    // pass's pres_poll gives it to the waiting request (4.14), or nothing
+    // uses it, then or later.
     bj_event_t ev;
-    (void)bj_task(now, &ev);
+    bool fit = bj_task(now, &ev);
+    uint32_t edge_ms = fit ? ev.edge_ms : 0;
+#else
+    bool fit = false;
+    uint32_t edge_ms = 0;
 #endif
     uint32_t since_last = now - c.prev_pass_ms;
     c.prev_pass_ms = now;
     bool dtr = tud_cdc_n_connected(CTL_ITF);
     if (dtr_dropped || usb_mounted || (c.dtr && !dtr)) {
+        // The lease ends with the port (6.1), before port_reset withdraws
+        // what else was queued.
+        lease_end(usb_mounted ? CTL_BY_USB_RESET : CTL_BY_PORT_CLOSED);
         dtr_dropped = false;
         usb_mounted = false;
         port_reset();
     }
     c.dtr = dtr;
+    lease_poll(now);
+    pres_poll(now, fit, edge_ms);
     epoch_poll();
     if (!dtr) {
         // Nothing is read or answered with DTR low (3.1): bytes are
         // discarded, and a DTR rise starts with an empty line.
         tud_cdc_n_read_flush(CTL_ITF);
         c.len = 0; c.overflow = false; c.quiet_ms = 0; c.resp_busy = false;
+        outq_poll();                            // owed answers kept (replay table), not sent
         job_poll(now);                          // a job still ends, and is kept as job.last
         return;
     }
+    tx_pump(now);
+    outq_poll();
     tx_pump(now);
     job_poll(now);
     tx_pump(now);

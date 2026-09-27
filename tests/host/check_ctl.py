@@ -34,6 +34,22 @@ any bus access at all, reads included (ide_read_reg, ide_read_alt_status,
 ide_pio_read, ide_pio_write): they read and set up GPIO30/31's pads only.
 Without --jumpers the ELF must not have them (a build without
 ATABOY_BOARD_JUMPERS carries no jumper code).
+Stage 4, Tier M: the jobs run_setup_ctrlg and run_mount, the menus.c parts
+they call (menus_api_ctrlg, menus_api_mount) and the TUI's presence row
+(ctl_presence_text) are entry points too. setup.ctrlg reaches the bus, and
+only through Ctrl+G's own code: ide_manual_chs and ide_manual_chs_native
+are its gateways. From ctl_core1_idle, run_setup_ctrlg and menus_api_ctrlg
+the walk stops at a gateway (it may be reached, not passed through), and
+the list above holds for everything else; from ctl_core1_idle a gateway is
+reached only through run_setup_ctrlg; and walked through the gateways too,
+no entry point may reach the settings, a sector write, firmware update, an
+IDENTIFY (ide_identify) or the TUI's queues, except that the walk stops at
+the Q7 tripwire's stop (ide_trip_stop): on core 1 it shows the trip record
+for ever (trip_screen_forever, noreturn) and never goes back to the bus.
+The mount and the presence row reach no bus access at all, reads included.
+Stage 4 entry points are required with --jumpers only: without the jumpers
+no Tier M job gets past its pickup check, the compiler drops the rest, and
+then no entry point may reach a gateway at all.
 --forbid adds a name to that list: `--forbid ide_read_reg` must fail (the
 taskfile.snapshot job reads registers), and so must `--forbid menu_unmount`
 (the unmount and detach jobs run the TUI's own unmount), which shows the
@@ -47,7 +63,16 @@ ENTRIES = ['ctl_task', 'ctl_init', 'ctl_on_usb_mount', 'tud_cdc_line_state_cb',
            'ctl_core1_idle', 'ctl_tui_busy', 'ctl_mount_noted', 'ctl_setup_noted',
            # stage 2, the ratchet, each on its own
            'op_wp_on', 'op_pipelined_off', 'op_identify_forbid', 'run_unmount', 'run_detach',
-           'menus_api_unmount', 'menus_api_detach_clear']
+           'menus_api_unmount', 'menus_api_detach_clear',
+           # stage 4, Tier M
+           'run_setup_ctrlg', 'run_mount', 'menus_api_ctrlg', 'menus_api_mount', 'ctl_presence_text']
+STAGE4_ENTRIES = ['run_setup_ctrlg', 'run_mount', 'menus_api_ctrlg', 'menus_api_mount', 'ctl_presence_text']
+GATEWAYS = ['ide_manual_chs', 'ide_manual_chs_native']
+GATEWAY_ENTRIES = ['ctl_core1_idle', 'run_setup_ctrlg', 'menus_api_ctrlg']
+NO_BUS_ENTRIES = ['run_mount', 'menus_api_mount', 'ctl_presence_text']
+# Never, not even through Ctrl+G's own code.
+FULL_FORBIDDEN = ['config_save', 'flash_range_erase', 'flash_range_program', 'ide_write_sectors',
+                  'reset_usb_boot', 'rom_reset_usb_boot', 'ide_identify', 'queue_add_blocking', 'queue_try_remove']
 JUMPER_ENTRIES = ['board_jumpers_init', 'jp1_locked', 'bj_task', 'bj_pads_ok']
 JUMPER_FORBIDDEN = ['ide_read_reg', 'ide_read_alt_status', 'ide_pio_read', 'ide_pio_write']
 FORBIDDEN = ['config_save', 'flash_range_erase', 'flash_range_program', 'ide_write_sectors',
@@ -98,7 +123,8 @@ def main():
             calls[f] |= ops
     checks = failures = 0
     entries = ENTRIES + (JUMPER_ENTRIES if jumpers else [])
-    missing = [e for e in entries if e not in calls]
+    missing = [e for e in entries if e not in calls and (jumpers or e not in STAGE4_ENTRIES)]
+    entries = [e for e in entries if e in calls or e not in STAGE4_ENTRIES]
     checks += 1
     if missing or not ops:
         failures += 1
@@ -109,25 +135,49 @@ def main():
         if present:
             failures += 1
             print(f'FAIL: jumper code in a build without --jumpers: {present}')
-    reach = {}
-    for e in entries:
+    def walk(e, stop=(), skip=()):
         seen, stack, parent = {e}, [e], {e: None}
         while stack:
             f = stack.pop()
+            if f in stop:
+                continue                    # reached, not passed through
             for g in calls.get(f, ()):
-                if g not in seen:
+                if g not in seen and g not in skip:
                     seen.add(g); parent[g] = f; stack.append(g)
-        reach[e] = (seen, parent)
+        return seen, parent
+
+    def report(e, bad, parent, how=''):
+        path, f = [], bad
+        while f:
+            path.append(f); f = parent[f]
+        print(f'FAIL: {e} reaches {bad}{how}: ' + ' > '.join(reversed(path)))
+
+    reach = {}
     for e in entries:
-        seen, parent = reach[e]
-        for bad in FORBIDDEN + (JUMPER_FORBIDDEN if e in JUMPER_ENTRIES else []):
+        gate = jumpers and e in GATEWAY_ENTRIES
+        seen, parent = walk(e, stop=GATEWAYS if gate else ())
+        reach[e] = (seen, parent)
+        forbidden = [b for b in FORBIDDEN if not (gate and b in GATEWAYS)]
+        forbidden += JUMPER_FORBIDDEN if e in JUMPER_ENTRIES or e in NO_BUS_ENTRIES else []
+        for bad in forbidden:
             checks += 1
             if bad in seen:
                 failures += 1
-                path, f = [], bad
-                while f:
-                    path.append(f); f = parent[f]
-                print(f'FAIL: {e} reaches {bad}: ' + ' > '.join(reversed(path)))
+                report(e, bad, parent)
+        full, fparent = walk(e, stop=('ide_trip_stop',))
+        for bad in FULL_FORBIDDEN:
+            checks += 1
+            if bad in full:
+                failures += 1
+                report(e, bad, fparent, ' (through the gateways)')
+    # From core 1's idle point, Ctrl+G's code only through the setup.ctrlg job.
+    if jumpers and 'ctl_core1_idle' in calls:
+        seen, parent = walk('ctl_core1_idle', stop=GATEWAYS, skip=('run_setup_ctrlg',))
+        for g in GATEWAYS:
+            checks += 1
+            if g in seen:
+                failures += 1
+                report('ctl_core1_idle', g, parent, ' not through run_setup_ctrlg')
     total = len(set().union(*(s for s, _ in reach.values())))
     nj = len(JUMPER_ENTRIES) if jumpers else 0
     print(f'API call graph: {len(entries)} entry points ({nj} of them the jumpers), '

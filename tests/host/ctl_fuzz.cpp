@@ -189,6 +189,10 @@ static void human_event() {
     }
 }
 
+// Stage 4: when each Tier M line went out, and the counts (in both builds).
+static std::map<uint32_t, uint32_t> fz_sent_ms;
+[[maybe_unused]] static uint64_t fz_tier_m_lines = 0, fz_tier_m_runs = 0, fz_credit_runs = 0, fz_late_answers = 0, fz_waited = 0;   // the runs: jumpers builds only
+
 #if ATABOY_BOARD_JUMPERS
 // Stage 3 (SPEC-v1 11.3, I-4, I-25): JP1 and JP2 timelines between lines, and
 // an oracle after every core-0 pass that works from the shunts and the pad
@@ -218,6 +222,41 @@ static struct {
     uint32_t events;
 } jo;
 static uint64_t jp_passes = 0, jp_events = 0, jp_locks = 0, jp_pad_faults = 0, jp_gaps = 0;
+// Stage 4 (I-26, Q3): the fit events seen and when each Tier M line went
+// out, so every Tier M job that starts (its API_BEGIN in the command log)
+// is matched to an act whose edge came after its line, or to a credit a
+// DONE set-up with then_mount earned within 60 s. One event, one run.
+struct FzEvent { uint32_t edge; bool used; };
+static std::vector<FzEvent> fz_events;
+static std::map<uint32_t, bool> fz_then_mount;
+static bool fz_credit = false;
+static uint32_t fz_credit_until = 0, fz_api_scanned = 1;
+static void fz_scan_api(uint32_t t) {
+    for (; fz_api_scanned < log_next; fz_api_scanned++) {
+        const obs_log_entry_t &e = log_ring[fz_api_scanned % OBS_LOG_ENTRIES];
+        if (e.seq != fz_api_scanned || e.kind != OBS_EV_API) continue;
+        if (e.value != CTL_OP_SETUP_CTRLG && e.value != CTL_OP_MOUNT) continue;
+        uint32_t id = e.tf[0] | (e.tf[1] << 8) | (e.tf[2] << 16) | ((uint32_t)e.tf[3] << 24);
+        if (e.outcome == OBS_API_BEGIN) {
+            fz_tier_m_runs++;
+            if (e.value == CTL_OP_MOUNT && ctl_job.id == id && ctl_job.via_credit) {
+                fz_credit_runs++;
+                if (!fz_credit || t > fz_credit_until) violation("a mount ran on a credit no set-up earned (Q3)", "", "");
+                fz_credit = false;
+            } else {
+                auto sent = fz_sent_ms.find(id);
+                FzEvent *pick = nullptr;
+                if (sent != fz_sent_ms.end())
+                    for (auto &ev : fz_events) if (!ev.used && ev.edge > sent->second) { pick = &ev; break; }
+                if (!pick) violation("a Tier M request ran with no act after it arrived (I-26)", "", "");
+                else pick->used = true;
+            }
+        } else if (e.value == CTL_OP_SETUP_CTRLG) {
+            fz_credit = e.outcome == OBS_API_DONE && fz_then_mount[id];
+            fz_credit_until = t + CTL_MOUNT_CREDIT_S * 1000u + 50;
+        }
+    }
+}
 static void jo_reset(uint32_t t) { jo.R = t; jo.run_n = 0; jo.open_ok = false; }
 static void jp_oracle() {
     uint32_t t = to_ms_since_boot(get_absolute_time());
@@ -252,9 +291,21 @@ static void jp_oracle() {
         if (!b) violation("a fit event without an observed OPEN of 200 ms before it (I-25)", "", "");
         jo.events = ev;
         jo.R = t; jo.open_ok = false;                           // the next event needs a new OPEN
+        fz_events.push_back({ edge, false });
     }
+    fz_scan_api(t);
 }
-static void jo_power_up() { memset(&jo, 0, sizeof jo); jo.events = bj_fit_events(); jo.R = to_ms_since_boot(get_absolute_time()); }
+// Before power_up(): the oracle as at a boot (the jumpers' events count from
+// 0 again, the log starts again).
+static void jo_boot() {
+    memset(&jo, 0, sizeof jo);
+    jo.R = to_ms_since_boot(get_absolute_time());
+    fz_events.clear(); fz_sent_ms.clear(); fz_then_mount.clear(); fz_credit = false; fz_api_scanned = 1;
+}
+static void jo_power_up() {
+    memset(&jo, 0, sizeof jo); jo.events = bj_fit_events(); jo.R = to_ms_since_boot(get_absolute_time());
+    fz_events.clear(); fz_sent_ms.clear(); fz_then_mount.clear(); fz_credit = false; fz_api_scanned = log_next;
+}
 
 // A pad set up wrong, one of the ways test_ctl's table has.
 static void pad_fault(unsigned p) {
@@ -298,16 +349,82 @@ static void jumper_event() {
     }
     // The passes that see it, and a debounced release of JP1 (20 samples
     // over 10 ms), before the next line takes its digest (I-10).
-    pump(30);
+    pump(250);                                      // a JP2 change completes, or dies, here
+    // An act may have approved a waiting request: it runs and ends here,
+    // before the next line takes its digest.
+    core1_runs = true;
+    for (int i = 0; i < 4000 && ctl_job.state != CTL_JOB_EMPTY; i++) pump(20);
 }
+
+// Stage 4: a lease and Tier M lines, mostly well formed, with the lease's
+// token, the last one's, or another; set-ups and mounts matching the state
+// or near it.
+static std::string fz_token() {
+    switch (below(6)) {
+    case 0: return c.lease.old_valid ? std::string(c.lease.old_token) : "00112233445566778899aabbccddeeff";
+    case 1: return "ffeeddccbbaa99887766554433221100";
+    default: return c.lease.held ? std::string(c.lease.token) : "00112233445566778899aabbccddeeff";
+    }
+}
+static std::string tier_m_line() {
+    uint32_t id = c.replay.max_id + 1 + below(2);
+    char b[600];
+    switch (c.lease.held || below(3) == 0 ? below(8) : 0) {         // mostly a lease first
+    case 0:
+        snprintf(b, sizeof b, "{\"v\":1,\"id\":%u,\"op\":\"session.open\",\"args\":{\"client\":\"fz\",\"tui_lock\":%s,\"idle_s\":%u}}",
+                 id, below(8) ? "false" : "true", 30 + below(400));
+        break;
+    case 1:
+        snprintf(b, sizeof b, "{\"v\":1,\"id\":%u,\"op\":\"session.close\",\"token\":\"%s\",\"args\":{}}", id, fz_token().c_str());
+        break;
+    case 2: case 3: case 4: {
+        bool tm = below(2);
+        fz_then_mount[id] = tm;
+        snprintf(b, sizeof b, "{\"v\":1,\"id\":%u,\"op\":\"setup.ctrlg\",\"token\":\"%s\",\"args\":{\"cyls\":%u,\"heads\":%u,"
+                 "\"spt\":%u,\"mode\":\"%s\",\"device\":\"%s\",\"drive_power_cycled\":true%s}}", id, fz_token().c_str(),
+                 1 + below(1200), 1 + below(17), below(64), below(4) ? "idp" : "native", below(8) ? "master" : "slave",
+                 tm ? ",\"then_mount\":true" : "");
+        break;
+    }
+    default: {
+        const char *src = ctl_setup_src < CTL_SRC_COUNT ? ctl_src_name[ctl_setup_src] : "NONE";
+        if (below(4) == 0) src = "API_CTRLG_IDP";
+        snprintf(b, sizeof b, "{\"v\":1,\"id\":%u,\"op\":\"mount\",\"token\":\"%s\",\"args\":{\"expect\":{\"source\":\"%s\","
+                 "\"mode\":\"CHS\",\"device\":\"%s\",\"cyls\":%u,\"heads\":%u,\"spt\":%u}}}", id, fz_token().c_str(), src,
+                 config.dev_base == 0xB0 ? "SLAVE" : "MASTER", (unsigned)config.cyls + (below(4) == 0), config.heads, config.spt);
+    }
+    }
+    return b;
+}
+#else
+static std::string tier_m_line() { return std::string(); }   // never chosen without the jumpers
 #endif
 
 // One line in, the answers out, the oracle applied.
 static std::map<uint32_t, std::vector<std::pair<std::string, std::string>>> answered;   // id -> (line digest, response)
+// Stage 4: Tier M requests that waited for their act, by id, with their
+// line's digest; their answer comes during some later line.
+static std::map<uint32_t, std::string> fz_deferred;
 static void one_line(std::string body, bool count_oracle) {
     for (char &ch : body) if (ch == '\n') ch = ' ';     // one line exactly
     std::string line = body + "\n";
     std::string d0 = digest();
+    bool lease_before = c.lease.held;
+    int tm_id = -1;
+    {
+        static ctlj_doc_t pd;
+        std::string st = body;
+        if (!st.empty() && st.back() == '\r') st.pop_back();
+        if (ctlj_parse(st.data(), st.size(), &pd) == CTLJ_OK) {
+            int o = ctlj_find(&pd, 0, "op"), i = ctlj_find(&pd, 0, "id");
+            if ((ctlj_str_is(&pd, o, "setup.ctrlg") || ctlj_str_is(&pd, o, "mount")) && i > 0 && pd.node[i].type == CTLJ_INT &&
+                pd.node[i].num >= 1 && pd.node[i].num <= CTL_MAX_ID) {
+                tm_id = (int)pd.node[i].num;
+                if (!fz_sent_ms.count((uint32_t)tm_id)) fz_sent_ms[(uint32_t)tm_id] = to_ms_since_boot(get_absolute_time());
+                fz_tier_m_lines++;
+            }
+        }
+    }
     host_send(line);
     lines_sent++;
     // Until the line is all read (256 bytes a pass at most) and answered.
@@ -321,6 +438,38 @@ static void one_line(std::string body, bool count_oracle) {
     std::string stripped = body;
     if (!stripped.empty() && stripped.back() == '\r') stripped.pop_back();
     bool empty = stripped.empty();
+    // Answers to earlier requests that waited for their act (stage 4) are
+    // theirs, not this line's: kept for the replay oracle and set aside.
+    {
+        std::vector<std::string> mine;
+        for (auto &r : got) {
+            J jj;
+            if (parse_response(r, jj) && jj["id"].t == J::INT && !jj.get("replayed") && fz_deferred.count((uint32_t)jj["id"].n) &&
+                true) {                                 // a resend's own answer is replayed:true
+                uint32_t did = (uint32_t)jj["id"].n;
+                if (!envelope_problem(jj).empty()) violation("envelope of a late answer", line, r);
+                answered[did].push_back({ fz_deferred[did], r });
+                fz_deferred.erase(did);
+                fz_late_answers++; responses++;
+                codes[jj["outcome"].is("DONE") ? std::string("DONE") : jj["err"]["code"].s]++;
+                continue;
+            }
+            mine.push_back(r);
+        }
+        got.swap(mine);
+    }
+    // A Tier M line that waits for its act has no answer yet (4.14).
+    if (tm_id > 0 && got.empty() && c.pres.waiting && c.pres.id == (uint32_t)tm_id) {
+        uint8_t dg0[32];
+        ctl_sha256(stripped.data(), stripped.size(), dg0);
+        fz_deferred[(uint32_t)tm_id] = std::string((const char *)dg0, 32);
+        fz_waited++;
+        empty = true;                               // no answer expected now
+    }
+    // The lease ending during the line (its idle timer, or a USB reset or
+    // DTR drop made just before it and taken at the next pass) is a state
+    // change of its own (the lease is in the epoch, 4.3).
+    bool idle_end = lease_before && !c.lease.held;
     if (count_oracle && got.size() != (empty ? 0u : 1u)) violation("not exactly one response for the line", line, got.empty() ? "" : got[0]);
     for (auto &r : got) {
         responses++;
@@ -339,7 +488,7 @@ static void one_line(std::string body, bool count_oracle) {
             }
         }
         done_n += done;
-        if (!done && digest() != d0) violation("a refused line changed the state (I-10)", line, r);
+        if (!done && !idle_end && digest() != d0) violation("a refused line changed the state (I-10)", line, r);
         uint8_t dg[32];
         ctl_sha256(stripped.data(), stripped.size(), dg);
         std::string dgs((const char *)dg, 32);
@@ -349,6 +498,13 @@ static void one_line(std::string body, bool count_oracle) {
             if (j["id"].t == J::INT)
                 for (auto &pr : answered[(uint32_t)j["id"].n])
                     if (pr.first == dgs) { found = true; same |= r == pr.second.substr(0, pr.second.size() - 1) + ",\"replayed\":true}"; }
+            // A request that waited and was withdrawn while the port was down:
+            // its answer was kept (the replay table) but never reached us.
+            if (!found && j["id"].t == J::INT && fz_deferred.count((uint32_t)j["id"].n) && fz_deferred[(uint32_t)j["id"].n] == dgs &&
+                !(c.pres.waiting && c.pres.id == (uint32_t)j["id"].n)) {
+                found = same = true;
+                fz_deferred.erase((uint32_t)j["id"].n);
+            }
             if (!found) violation("replayed for a line that was not sent before with its id (I-18)", line, r);
             else if (!same) violation("a replay that is not a response the line got before", line, r);
         } else if (j["id"].t == J::INT) {
@@ -379,13 +535,27 @@ int main(int argc, char **argv) {
     for (uint64_t it = 0; it < iters; it++) {
         uint32_t kind = below(12);
         static std::vector<std::string> history;    // earlier lines, resent byte for byte (replays)
-        std::string l = kind < 4 ? grammar_line() : kind < 9 ? byte_mutant(corpus[below((uint32_t)corpus.size())])
+#if ATABOY_BOARD_JUMPERS
+        if (kind < 4 && below(3) == 0) kind = 12;   // stage 4: a Tier M or session line
+#endif
+        std::string l = kind == 12 ? tier_m_line()
+                      : kind < 4 ? grammar_line() : kind < 9 ? byte_mutant(corpus[below((uint32_t)corpus.size())])
                       : kind < 10 ? byte_mutant(grammar_line())
                       : history.empty() ? grammar_line() : history[below((uint32_t)history.size())];
         if (history.size() < 64) history.push_back(l); else history[below(64)] = l;
         if (below(6) == 0) human_event();
 #if ATABOY_BOARD_JUMPERS
         if (below(5) == 0) jumper_event();
+        // A request waiting for its act: most of the time the act follows
+        // (JP2 open, then fitted), with JP1 off, so Tier M runs.
+        if (c.pres.waiting && below(4) != 0) {
+            if (below(4)) { mock_jumper_fitted[0] = false; pads_repair(); pump(30); }
+            mock_jumper_fitted[1] = false; pump(220 + below(100));
+            mock_jumper_fitted[1] = true; pump(220 + below(100));
+            core1_runs = true;
+            for (int i = 0; i < 4000 && ctl_job.state != CTL_JOB_EMPTY; i++) pump(20);
+            pump(5);
+        }
 #endif
         bool events = below(12) == 0;
         if (events) {
@@ -403,13 +573,11 @@ int main(int argc, char **argv) {
         one_line(l, true);
         if (it % 5000 == 4999) {
 #if ATABOY_BOARD_JUMPERS
-            after_task = nullptr;                   // power_up's own passes: a new boot, the oracle starts after it
+            // A new boot: the oracle starts again with it and watches its
+            // passes too (the firmware's first OPEN samples are taken there).
+            jo_boot();
 #endif
-            power_up(); answered.clear(); runs.clear(); runs_scanned = log_next;
-#if ATABOY_BOARD_JUMPERS
-            jo_power_up();
-            after_task = jp_oracle;
-#endif
+            power_up(); answered.clear(); runs.clear(); runs_scanned = log_next; fz_deferred.clear();
         }
     }
     printf("fuzz: seed %llu, %zu corpus lines, %llu mutants, %llu lines, %llu responses (%llu DONE, %llu replayed); codes:",
@@ -423,6 +591,9 @@ int main(int argc, char **argv) {
     printf("\njumpers: %llu passes checked (I-4, I-25), %llu fit events, %llu JP1 fits, %llu pad faults, %llu gaps",
            (unsigned long long)jp_passes, (unsigned long long)jp_events, (unsigned long long)jp_locks,
            (unsigned long long)jp_pad_faults, (unsigned long long)jp_gaps);
+    printf("\nTier M: %llu lines, %llu waited for an act, %llu ran (%llu on a credit), %llu late answers",
+           (unsigned long long)fz_tier_m_lines, (unsigned long long)fz_waited, (unsigned long long)fz_tier_m_runs,
+           (unsigned long long)fz_credit_runs, (unsigned long long)fz_late_answers);
 #endif
     printf("\n%llu checks, %d failed\n", (unsigned long long)lines_sent, violations);
     return violations > 255 ? 255 : violations;
