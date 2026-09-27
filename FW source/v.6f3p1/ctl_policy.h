@@ -69,12 +69,24 @@ int  ctl_op_find(const ctlj_doc_t *d, int str_node);   // CTL_OP_* or -1 (any op
 bool ctl_op_mutating(int op);                           // Tier S, Tier M and the session ops
 bool ctl_op_needs_token(int op);                        // Tier M and session.close
 
-// Capability states (3.4). Stage 2 has no lease and no jumpers, so a built
+// Capability states (3.4). Stage 2 has no lease and no jumpers (stage 3's
+// jumpers: ctl_op_cap_jp below), so a built
 // op is OPERATIONAL (Tier S needs neither) and an op not built yet is ABSENT with why NOT_BUILT (a
 // token of this stage: v1's list in 3.4 has no state for "in v1, not yet
 // built", and ABSENT is "not in this build").
 enum { CTL_CAP_OPERATIONAL, CTL_CAP_LOCKED, CTL_CAP_ABSENT };
 void ctl_op_cap(int op, uint8_t *state, const char **why);
+#if ATABOY_BOARD_JUMPERS
+// Stage 3, with the jumpers built (SPEC-v1 3.4, 8.1, 8.2): a Tier M op is
+// LOCKED with JP1_FITTED while JP1 is fitted or not yet released, with
+// JUMPERS_UNREADABLE while the pads read back wrong or JP1 has not been read
+// yet, and otherwise LOCKED with NO_LEASE, or OPERATIONAL while a lease is
+// held (stage 4). Tier R, Tier S and the session ops are not the jumpers'.
+// An op not built is ABSENT, NOT_BUILT, as in ctl_op_cap. jp1 is JP1's state
+// as board_jumpers.h reports it (the same values, checked in ctl.c).
+enum { CTL_JP1_UNKNOWN, CTL_JP1_OPEN, CTL_JP1_FITTED, CTL_JP1_UNREADABLE };
+void ctl_op_cap_jp(int op, bool built, uint8_t jp1, bool lease, uint8_t *state, const char **why);
+#endif
 
 // ---------------------------------------------------------------------------
 //  Errors (the closed list of SPEC-v1 3.3)

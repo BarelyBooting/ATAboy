@@ -31,6 +31,14 @@ static void *hook_memcpy(void *d, const void *s, size_t n) { hook(); return memc
 #include "config.c"
 #undef memset
 #undef memcpy
+#if ATABOY_BOARD_JUMPERS
+#include "mock_pico.h"
+#include "board_jumpers.c"
+uint64_t mock_now_ns = 0;
+uint32_t mock_gpio_out = 0;
+MockSio mock_sio;
+volatile uint32_t ctl_epoch;
+#endif
 
 #if !ATABOY_CTL
 #error "test_config_save is for the build with the Control API (ATABOY_CTL=1)"
@@ -61,6 +69,20 @@ static void wp_on_to(config_t *k) { k->drive_write_protected = true; }        //
 static void pipelined_off_to(config_t *k) { k->pipelined_reads = false; }     // ctl.c op_pipelined_off's store
 static void wp_on() { wp_on_to(&config); }
 static void pipelined_off() { pipelined_off_to(&config); }
+#if ATABOY_BOARD_JUMPERS
+// Stage 3 (palimpsest api/SPEC-v1.md 8.2, mutant X39): JP1 seen fitted forces
+// write protect on in RAM, from core 0 (bj_task) or core 1 (the TUI's
+// check). The real board_jumpers.c makes that store here, at each point:
+// its pads set up (mock_pico.h's register file), the shunt on, one read.
+static void jp1_fitted() {
+    memset(&bj, 0, sizeof bj);
+    mock_pads_reset();
+    board_jumpers_init();
+    mock_jumper_fitted[0] = true;
+    (void)jp1_locked();
+    mock_jumper_fitted[0] = false;
+}
+#endif
 
 int main() {
     // How many points config_save() has, with no store at all.
@@ -72,7 +94,11 @@ int main() {
     memcpy(&clean, programmed, sizeof clean);
     CHECK(programs == 1 && config_valid(&clean) && points >= 2, "a save with no store: %d programs, %d points", programs, points);
     struct { const char *name; void (*store)(); void (*to)(config_t *); } stores[] = {
-        { "wp.on", wp_on, wp_on_to }, { "pipelined.off", pipelined_off, pipelined_off_to } };
+        { "wp.on", wp_on, wp_on_to }, { "pipelined.off", pipelined_off, pipelined_off_to },
+#if ATABOY_BOARD_JUMPERS
+        { "JP1 fitted", jp1_fitted, wp_on_to },
+#endif
+    };
     for (auto &st : stores) {
         for (int k = 0; k < points; k++) {
             baseline();
@@ -94,7 +120,11 @@ int main() {
                   "%s stored at point %d: the sector is neither the settings before nor after it", st.name, k);
         }
     }
+#if ATABOY_BOARD_JUMPERS
+    printf("config_save with a core-0 store at each of %d points (wp.on, pipelined.off, JP1 fitted)\n", points);
+#else
     printf("config_save with a core-0 store at each of %d points (wp.on, pipelined.off)\n", points);
+#endif
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;
 }

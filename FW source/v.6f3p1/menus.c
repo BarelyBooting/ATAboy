@@ -22,6 +22,12 @@
 #include "ctl_build.h"
 #include "ctl_state.h"
 #endif
+#if ATABOY_BOARD_JUMPERS
+#include "board_jumpers.h"
+// JP1 fitted (palimpsest api/SPEC-v1.md 8.2): Features' Write Protect cannot
+// go from Enabled to Disabled. 47 of the confirm box's 50 columns.
+#define JP1_LOCKED_BOX "Write protect locked by jumper JP1. Press a key"
+#endif
 
 // ---------------------------------------------------------------------------
 //  CDC queue I/O (queues owned by ATAboy.c)
@@ -1948,10 +1954,27 @@ void core1_entry(void) {
             else if (k == KEY_DOWN && config.feat_selected < 5) config.feat_selected++;
             else if (k == KEY_ESC) current_screen = SCREEN_MAIN;
             else if (k == KEY_ENTER) {
+#if ATABOY_BOARD_JUMPERS
+                // JP1 read before wp_before: if it forces write protect on
+                // now, that change is JP1's (counted there), not the TUI's.
+                bool jp1 = config.feat_selected == 0 && jp1_locked();
+#endif
 #if ATABOY_CTL
                 bool wp_before = config.drive_write_protected, pr_before = config.pipelined_reads;
 #endif
+#if ATABOY_BOARD_JUMPERS
+                if (config.feat_selected == 0 && jp1) {
+                    draw_confirm_box(JP1_LOCKED_BOX);       // nothing changes (8.2)
+                    while (get_input() == -1) tight_loop_contents();
+                } else if (config.feat_selected == 0) {
+                    // A shunt fitted after the check and before this store
+                    // is seen by the next read of JP1 (core 0's pass, or
+                    // any write check), which forces it back on (8.2).
+                    config.drive_write_protected = !config.drive_write_protected;
+                }
+#else
                 if (config.feat_selected == 0) config.drive_write_protected = !config.drive_write_protected;
+#endif
                 else if (config.feat_selected == 1) config.auto_mount = !config.auto_mount;
                 else if (config.feat_selected == 2) features_toggle_iordy();
                 else if (config.feat_selected == 3) config.intrq_enabled = !config.intrq_enabled;

@@ -106,7 +106,8 @@ option(ATABOY_SAT_SMART_SAVES "Also allow SMART READ DATA and RETURN STATUS thro
 # second CDC port (interfaces 3 and 4) speaking one JSON object per line.
 # Stage 1: the port, the framing and parser, ids and the replay table, and
 # the read-only ops. Stage 2: the ratchet (write protect on, Pipelined Reads
-# off, forbid IDENTIFY, unmount and detach naming the mount). OFF by
+# off, forbid IDENTIFY, unmount and detach naming the mount). Stage 3, the
+# jumpers, is its own option below (ATABOY_BOARD_JUMPERS). OFF by
 # default, and an OFF build is byte for byte the image of the sources
 # without it.
 option(ATABOY_CTL "ATAboy Control API: a second CDC port, JSON lines" OFF)
@@ -117,6 +118,21 @@ if(ATABOY_CTL)
 endif()
 if(ATABOY_SAT AND ATABOY_SAT_SMART_SAVES)
     target_compile_definitions(ATAboy PRIVATE ATABOY_SAT_SMART_SAVES=1)
+endif()
+# palimpsest fork: the Control API's stage 3 (api/SPEC-v1.md section 8), the
+# physical-presence jumpers JP1 (LOCK, GPIO30) and JP2 (PERMIT, GPIO31). They
+# are the API's, so this needs ATABOY_CTL. It also makes the image an RP2350B
+# one (48 pins, boards/ataboy_rev6.h): the definition below reaches every
+# source compiled into the image, the SDK's own included, and nothing else
+# changes that count. OFF by default: the build without it is the stage 2
+# image, and with the API off too, the 0.6f3p10 one, byte for byte.
+option(ATABOY_BOARD_JUMPERS "JP1 LOCK and JP2 PERMIT on GPIO30/31 (needs ATABOY_CTL)" OFF)
+if(ATABOY_BOARD_JUMPERS)
+    if(NOT ATABOY_CTL)
+        message(FATAL_ERROR "ATABOY_BOARD_JUMPERS needs ATABOY_CTL: the jumpers are the Control API's (SPEC-v1 8)")
+    endif()
+    target_sources(ATAboy PRIVATE board_jumpers.c)
+    target_compile_definitions(ATAboy PRIVATE ATABOY_BOARD_JUMPERS=1)
 endif()
 if(ATABOY_CTL)
     # Owner decision Q5: the API build is 0.6f4, so neither picotool info nor

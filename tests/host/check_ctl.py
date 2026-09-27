@@ -26,6 +26,14 @@ run_detach, and the menus.c parts they call), no path may reach:
                                                         and detach only wait for
                                                         USB, as the TUI's unmount)
   queue_add_blocking, queue_try_remove                  the TUI's queues (I-23)
+Stage 3 (--jumpers): the jumpers' functions (board_jumpers.c) are entry
+points too, each on its own: board_jumpers_init, jp1_locked, bj_task,
+bj_pads_ok (bj_tier_m_open, stage 4's, has no caller yet and is not linked).
+Besides the list above, none of them may reach
+any bus access at all, reads included (ide_read_reg, ide_read_alt_status,
+ide_pio_read, ide_pio_write): they read and set up GPIO30/31's pads only.
+Without --jumpers the ELF must not have them (a build without
+ATABOY_BOARD_JUMPERS carries no jumper code).
 --forbid adds a name to that list: `--forbid ide_read_reg` must fail (the
 taskfile.snapshot job reads registers), and so must `--forbid menu_unmount`
 (the unmount and detach jobs run the TUI's own unmount), which shows the
@@ -40,6 +48,8 @@ ENTRIES = ['ctl_task', 'ctl_init', 'ctl_on_usb_mount', 'tud_cdc_line_state_cb',
            # stage 2, the ratchet, each on its own
            'op_wp_on', 'op_pipelined_off', 'op_identify_forbid', 'run_unmount', 'run_detach',
            'menus_api_unmount', 'menus_api_detach_clear']
+JUMPER_ENTRIES = ['board_jumpers_init', 'jp1_locked', 'bj_task', 'bj_pads_ok']
+JUMPER_FORBIDDEN = ['ide_read_reg', 'ide_read_alt_status', 'ide_pio_read', 'ide_pio_write']
 FORBIDDEN = ['config_save', 'flash_range_erase', 'flash_range_program', 'ide_write_sectors',
              'reset_usb_boot', 'rom_reset_usb_boot', 'ide_write_reg', 'ide_write_control',
              'ide_reset_drive', 'ide_probe_devices', 'ide_manual_chs', 'ide_manual_chs_native',
@@ -53,6 +63,9 @@ def base_name(n):
 
 def main():
     args = sys.argv[1:]
+    jumpers = '--jumpers' in args
+    if jumpers:
+        args.remove('--jumpers')
     while '--forbid' in args:
         i = args.index('--forbid')
         FORBIDDEN.append(args[i + 1])
@@ -84,13 +97,20 @@ def main():
         if f == 'ctl_task' or f.startswith('run_core0'):
             calls[f] |= ops
     checks = failures = 0
-    missing = [e for e in ENTRIES if e not in calls]
+    entries = ENTRIES + (JUMPER_ENTRIES if jumpers else [])
+    missing = [e for e in entries if e not in calls]
     checks += 1
     if missing or not ops:
         failures += 1
         print(f'FAIL: entry points not in the ELF: {missing}, op functions {len(ops)}')
+    if not jumpers:
+        checks += 1
+        present = [e for e in JUMPER_ENTRIES if e in calls]
+        if present:
+            failures += 1
+            print(f'FAIL: jumper code in a build without --jumpers: {present}')
     reach = {}
-    for e in ENTRIES:
+    for e in entries:
         seen, stack, parent = {e}, [e], {e: None}
         while stack:
             f = stack.pop()
@@ -98,9 +118,9 @@ def main():
                 if g not in seen:
                     seen.add(g); parent[g] = f; stack.append(g)
         reach[e] = (seen, parent)
-    for e in ENTRIES:
+    for e in entries:
         seen, parent = reach[e]
-        for bad in FORBIDDEN:
+        for bad in FORBIDDEN + (JUMPER_FORBIDDEN if e in JUMPER_ENTRIES else []):
             checks += 1
             if bad in seen:
                 failures += 1
@@ -109,7 +129,9 @@ def main():
                     path.append(f); f = parent[f]
                 print(f'FAIL: {e} reaches {bad}: ' + ' > '.join(reversed(path)))
     total = len(set().union(*(s for s, _ in reach.values())))
-    print(f'API call graph: {len(ENTRIES)} entry points, {len(ops)} op functions, {total} functions reachable')
+    nj = len(JUMPER_ENTRIES) if jumpers else 0
+    print(f'API call graph: {len(entries)} entry points ({nj} of them the jumpers), '
+          f'{len(ops)} op functions, {total} functions reachable')
     print(f'{checks} checks, {failures} failed')
     return min(failures, 255)
 

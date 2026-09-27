@@ -48,8 +48,8 @@ class ServePort:
     stdout back, read by a thread, handed out like pyserial with a 50 ms
     timeout."""
 
-    def __init__(self, exe):
-        self.p = subprocess.Popen([exe, 'serve'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    def __init__(self, exe, mode='serve'):
+        self.p = subprocess.Popen([exe, mode], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         self.q = queue.Queue()
         self.buf = bytearray()
         self.lines_out = []
@@ -95,6 +95,28 @@ class ServePort:
             self.p.kill()
 
 
+def raw_request(ctl, exe, mode, op, args, rid=90):
+    """One request the client encodes, on a fresh serve port, answered and
+    parsed by the client's own parser; for ops outside its tool allowlist
+    (selftest.status). The response, or None."""
+    port = ServePort(exe, mode)
+    line, errs = ctl.encode_request(rid, op, args, None)
+    if errs:
+        port.close()
+        return None
+    port.write(line)
+    deadline = time.time() + 10
+    raw = b''
+    while not raw.endswith(b'\n') and time.time() < deadline:
+        raw += port.read(65536)
+    port.close()
+    try:
+        resp = ctl.parse_response_line(raw)
+        return resp if ctl.envelope_errors(resp) is None else None
+    except ctl.ProtocolViolation:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('exe')
@@ -134,6 +156,7 @@ def main():
     check(r['fw']['version'] == '0.6f4-palimpsest' and r['fw']['banner'] == 'v0.6f4 (fork+api)',
           f"version {r['fw']['version']} banner {r['fw']['banner']}")
     check(r['limits']['max_mutating_id'] == 0 and c.ledger.seed_boot == c.boot, 'ids seeded from max_mutating_id')
+    jumpers = r['fw']['build_flags'].get('board_jumpers') is True
     tier_r = [op for op, v in ctl.OP_TABLE.items() if v[0] == 'R']
     tier_s = [op for op, v in ctl.OP_TABLE.items() if v[0] == 'S']
     check(sorted(tier_s) == ['detach', 'identify.forbid', 'pipelined.off', 'unmount', 'wp.on'], f'Tier S {tier_s}')
@@ -196,10 +219,46 @@ def main():
           st2['tui']['state'] == 'MAIN', 'status after detach')
     x = c.request('setup.detect', {})
     check(x.state == 'CouldNotRun', 'setup.detect')
+    sj = raw_request(ctl, a.exe, 'serve', 'selftest.status', {})
+    check(sj is not None and sj['result']['jumpers'] == ('OK' if jumpers else 'NOT_BUILT') and
+          st2['jumpers'] == ({'jp1': 'OPEN', 'jp2': 'OPEN', 'mount_credit_ms_left': 0} if jumpers else
+                             {'jp1': 'NOT_BUILT', 'jp2': 'NOT_BUILT', 'mount_credit_ms_left': 0}),
+          f"jumpers: selftest {sj and sj['result'].get('jumpers')}, status {st2['jumpers']}")
     c.close()
     v, recs = ctl.verify_transcript(tpath)
     check(v.state == 'Pass', f'transcript: {v.reason}')
     client_lines = list(ports[0].lines_out)
+
+    # Stage 3: the jumpers' real values through the client's closed schemas.
+    # JP1 fitted (serve-jp1): LOCK, write protect forced and shown forced by
+    # JP1; a pad set up wrong (serve-pads): both UNREADABLE, the lock too.
+    if jumpers:
+        for mode, want in (('serve-jp1', ('FITTED', 'OPEN', 'OK')), ('serve-pads', ('UNREADABLE', 'UNREADABLE', 'PAD_CONFIG_MISMATCH'))):
+            jports = []
+
+            def jopener(binding, mode=mode, jports=jports):
+                p = ServePort(a.exe, mode)
+                jports.append(p)
+                return p
+            jc, jres = ctl.connect(serial, os.path.join(tmp, mode + '.jsonl'), records_fn=lambda: records, opener=jopener)
+            check(jc is not None and jres.state == 'Pass', f'{mode}: hello {jres!r}')
+            if jc is None:
+                continue
+            js = jc.request('status')
+            check(js.state == 'Pass' and js.result['jumpers']['jp1'] == want[0] and js.result['jumpers']['jp2'] == want[1] and
+                  js.result['wp']['effective'] is True and js.result['wp']['config'] is True and
+                  js.result['wp']['forced_by'] == ['JP1'], f'{mode}: status {js!r}')
+            jw = jc.request('wp.on', {})
+            check(jw.state == 'Pass' and jw.result['wp']['forced_by'] == ['JP1'] and jw.result['changed'] is False,
+                  f'{mode}: wp.on {jw!r}')
+            jt = raw_request(ctl, a.exe, mode, 'selftest.status', {})
+            check(jt is not None and jt['outcome'] == 'DONE' and jt['result']['jumpers'] == want[2], f'{mode}: selftest {jt!r}')
+            for op in ('setup.ctrlg', 'mount'):
+                check(jres.result['caps'][op] == {'state': 'ABSENT', 'why': 'NOT_BUILT'}, f"{mode}: caps {op} {jres.result['caps'][op]}")
+            jc.close()
+            jv, _ = ctl.verify_transcript(os.path.join(tmp, mode + '.jsonl'))
+            check(jv.state == 'Pass', f'{mode}: transcript {jv.reason}')
+            client_lines += jports[0].lines_out
 
     # Every line the client's encoder makes, for every op in its tables, sent
     # raw; each answer through the client's own parser and envelope checks.

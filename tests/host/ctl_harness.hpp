@@ -53,6 +53,9 @@ static inline bool time_reached(absolute_time_t t) { return get_absolute_time() 
 #include "ctl_policy.c"
 #include "ctl.c"
 #include "ctl_job.c"
+#if ATABOY_BOARD_JUMPERS
+#include "board_jumpers.c"          // stage 3: JP1 and JP2 against mock_pico.h's pad register file
+#endif
 
 bool core1_stack_intact(void) { return true; }
 void fault_stop(uint32_t code) { printf("FAIL: fault_stop(%08X) reached\n", (unsigned)code); exit(250); }
@@ -152,11 +155,13 @@ static uint8_t core1_screen = CTL_TUI_MAIN;     // what core 1 is showing at its
 static bool core1_runs = true;                  // false: core 1 is inside a dialog, never at its top
 static uint64_t task_max_ns = 0;                // the longest ctl_task() pass, in modelled time
 
+static void (*after_task)() = nullptr;      // ctl_fuzz: its oracle, after every pass
 static void one_task() {
     port.calls_this_task = 0;
     port.rx_now = port.rx.size() < port.rx_cap ? (uint32_t)port.rx.size() : port.rx_cap;   // tud_task() filled the FIFO
     uint64_t t0 = mock_now_ns;
     ctl_task();
+    if (after_task) after_task();
     if (mock_now_ns - t0 > task_max_ns) task_max_ns = mock_now_ns - t0;
     if (port.reading) { port.got += port.fifo; port.fifo.clear(); }
 }
@@ -193,6 +198,9 @@ static std::vector<std::string> host_lines() {
     return out;
 }
 
+#if ATABOY_BOARD_JUMPERS
+static bool power_up_fitted[2];             // shunts already on at power-up (JP1, JP2)
+#endif
 // Back to power-up: the API's state, the drive, the menus, the log.
 static void power_up() {
     sim = SimDrive();
@@ -229,10 +237,27 @@ static void power_up() {
     memset(ctl_test_op, 0, sizeof ctl_test_op);
     port = CtlPort();
     sim_reset_hook = nullptr;
+#if ATABOY_BOARD_JUMPERS
+    // The pads at their reset state, both shunts off, then set up as main()
+    // does before tusb_init() (ATAboy.c).
+    mock_pads_reset();
+    mock_gpio_oe &= ~((1u << 30) | (1u << 31));
+    mock_jumper_fitted[0] = power_up_fitted[0];
+    mock_jumper_fitted[1] = power_up_fitted[1];
+    mock_floating_high = false;
+    mock_jumper_let_low = 0;
+    memset(&bj, 0, sizeof bj);
+    board_jumpers_init();
+#endif
     tty.clear(); rx.clear(); rxi = 0;
     core1_screen = CTL_TUI_MAIN; core1_runs = true;
     ctl_init();
     pump(2);
+#if ATABOY_BOARD_JUMPERS
+    // JP1 read OPEN 20 times over 10 ms: released (UNKNOWN to OPEN, one
+    // epoch count), as a few ms after every power-up on the unit.
+    pump(25);
+#endif
 }
 
 // ---- a strict reader for the responses (SPEC-v1 3.1's response grammar) ----

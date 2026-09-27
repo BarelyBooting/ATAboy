@@ -19,6 +19,10 @@ defs=$(echo "$defs" | sed 's/-DATABOY_SAT_SMART_SAVES=1//')
 # ATABOY_CTL (the ATAboy Control API) is OFF by default in CMake, but this
 # branch is its build, so the suite runs with it ON unless CTL=0 is set.
 if [ "${CTL:-1}" = 0 ]; then defs=$(echo "$defs" | sed 's/-DATABOY_CTL=1//'); fi
+# ATABOY_BOARD_JUMPERS (stage 3: JP1 LOCK and JP2 PERMIT) is OFF by default in
+# CMake too, and the API image of this branch has it, so the suite runs with
+# it ON unless JUMPERS=0 is set; never without the API, which it needs.
+if [ "${JUMPERS:-1}" = 0 ] || [ "${CTL:-1}" = 0 ]; then defs=$(echo "$defs" | sed 's/-DATABOY_BOARD_JUMPERS=1//'); fi
 echo "firmware defines: $defs"
 # test_read runs twice with SAT on. The full suite is built with SMART READ
 # DATA and RETURN STATUS opted in (ATABOY_SAT_SMART_SAVES=1), because the
@@ -110,7 +114,7 @@ if echo "$defs" | grep -q -- '-DATABOY_CTL=1'; then
     "$out/test_ctl" core1-tui
     # config_save() with core 0 storing into config at each point before the
     # lockout (SPEC-v1 5.5, R-API-1 finding 15): the copy first, the CRC over it.
-    ${CXX:-g++} -std=c++17 -O1 -g -Wall $defs -I "$here/config_mock" -I "$src"         -o "$out/test_config_save" "$here/test_config_save.cpp"
+    ${CXX:-g++} -std=c++17 -O1 -g -Wall $defs -I "$here/config_mock" -I "$here/mock" -I "$src"         -o "$out/test_config_save" "$here/test_config_save.cpp"
     "$out/test_config_save"
     ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation $defs \
         -fsanitize=undefined -fsanitize-undefined-trap-on-error -fstack-protector-all -D_GLIBCXX_ASSERTIONS \

@@ -38,6 +38,12 @@
 #include "config.h"
 #include "fault.h"
 #include <string.h>
+#if ATABOY_BOARD_JUMPERS
+#include "board_jumpers.h"
+_Static_assert((int)CTL_JP1_UNKNOWN == (int)BJ_UNKNOWN && (int)CTL_JP1_OPEN == (int)BJ_OPEN &&
+               (int)CTL_JP1_FITTED == (int)BJ_FITTED && (int)CTL_JP1_UNREADABLE == (int)BJ_UNREADABLE,
+               "ctl_policy.h's JP1 states are board_jumpers.h's");
+#endif
 
 extern volatile bool is_mounted;
 extern volatile bool cdc_connected;         // the TUI's port, interface 0 (ATAboy.c)
@@ -56,6 +62,9 @@ extern bool usb_msc_ide_busy(void);         // usb.c
 typedef struct {
     uint8_t  mounted, lba, wp, pipelined, dev_base, no_identify, native_active, native_declared;
     uint8_t  forbidden, manual_chs, idp, setup_src;
+#if ATABOY_BOARD_JUMPERS
+    uint8_t  jp1;                   // JP1's lock state (stage 3); JP2's level is not in the epoch (4.3)
+#endif
     uint16_t cyls;
     uint8_t  heads, spt;
     uint64_t lba_sectors;
@@ -134,6 +143,9 @@ static void fingerprint(ctl_fp_t *f) {
     f->manual_chs = ide_manual_chs_active();
     f->idp = ide_idp_sent_since_boot();
     f->setup_src = ctl_setup_src;
+#if ATABOY_BOARD_JUMPERS
+    f->jp1 = bj_jp1();
+#endif
     f->cyls = config.cyls;
     f->heads = config.heads;
     f->spt = config.spt;
@@ -270,7 +282,11 @@ static int op_hello(ctlw_t *w, const ctlj_doc_t *d, int args) {
     ctlw_bool(w, "strict_media_bounds", false);
 #endif
     ctlw_bool(w, "ctl", true);
-    ctlw_bool(w, "board_jumpers", false);       // stage 3
+#if ATABOY_BOARD_JUMPERS
+    ctlw_bool(w, "board_jumpers", true);        // stage 3: JP1 and JP2 (SPEC-v1 8)
+#else
+    ctlw_bool(w, "board_jumpers", false);
+#endif
 #ifdef IDE_FAULT_TRIPWIRE
     ctlw_bool(w, "tripwire", true);
 #else
@@ -286,7 +302,15 @@ static int op_hello(ctlw_t *w, const ctlj_doc_t *d, int args) {
     ctlw_obj(w, "caps");
     for (int op = 0; op < CTL_OP_COUNT; op++) {
         uint8_t st; const char *why;
+#if ATABOY_BOARD_JUMPERS
+        bool built = ctl_ops[op].built;
+#if ATABOY_HOST_TEST
+        built = built || ctl_test_op[op];       // the host tests' stand-ins for stage 4's ops
+#endif
+        ctl_op_cap_jp(op, built, bj_jp1(), false, &st, &why);    // stage 4: the lease
+#else
         ctl_op_cap(op, &st, &why);
+#endif
         ctlw_obj(w, ctl_ops[op].name);
         ctlw_str(w, "state", st == CTL_CAP_OPERATIONAL ? "OPERATIONAL" : st == CTL_CAP_LOCKED ? "LOCKED" : "ABSENT");
         if (why) ctlw_str(w, "why", why);
@@ -331,14 +355,23 @@ static const char *const setup_name[CTL_SRC_COUNT] = {
     "TUI_CTRLG_IDP", "TUI_CTRLG_NATIVE", "API_CTRLG_IDP", "API_CTRLG_NATIVE", "AUTO_MOUNT",
 };
 static const char *const wp_last_name[] = { "BOOT", "TUI", "API" };
+#if ATABOY_BOARD_JUMPERS
+static const char *const jumper_name[] = { "UNKNOWN", "OPEN", "FITTED", "UNREADABLE" };    // BJ_*
+#endif
 
 // The wp object of status and of wp.on's result (SPEC-v1 4.3, 4.12).
 static void write_wp(ctlw_t *w) {
+#if ATABOY_BOARD_JUMPERS
+    bool jp1 = jp1_locked();                    // read live (8.2), and so forced before config is shown
+#endif
     ctlw_obj(w, "wp");
     ctlw_bool(w, "effective", ide_write_protected());
     ctlw_bool(w, "config", config.drive_write_protected);
     ctlw_arr(w, "forced_by");
     if (ide_mchs_no_identify()) ctlw_str(w, 0, "CTRLG");     // review C, C-4 (ide.c)
+#if ATABOY_BOARD_JUMPERS
+    if (jp1) ctlw_str(w, 0, "JP1");
+#endif
     ctlw_end_arr(w);
     uint8_t wl = ctl_wp_last;
     ctlw_str(w, "last_change", wl <= CTL_WP_API ? wp_last_name[wl] : "UNKNOWN");
@@ -393,9 +426,16 @@ static void write_status(ctlw_t *w) {
     ctlw_str(w, "state", ts <= CTL_TUI_MODAL ? tui_name[ts] : "UNKNOWN");
     ctlw_bool(w, "locked", false);              // stage 4 (the TUI lock)
     ctlw_end_obj(w);
-    ctlw_obj(w, "jumpers");                     // stage 3: no jumper support in this build
+#if ATABOY_BOARD_JUMPERS
+    uint8_t j1 = bj_jp1(), j2 = bj_jp2();
+    ctlw_obj(w, "jumpers");                     // stage 3 (SPEC-v1 8): JP1's lock state, JP2's level
+    ctlw_str(w, "jp1", j1 <= BJ_UNREADABLE ? jumper_name[j1] : "UNKNOWN");
+    ctlw_str(w, "jp2", j2 <= BJ_UNREADABLE ? jumper_name[j2] : "UNKNOWN");
+#else
+    ctlw_obj(w, "jumpers");                     // no jumper support in this build
     ctlw_str(w, "jp1", "NOT_BUILT");
     ctlw_str(w, "jp2", "NOT_BUILT");
+#endif
     ctlw_uint(w, "mount_credit_ms_left", 0);
     ctlw_end_obj(w);
     ctlw_obj(w, "presence");                    // stage 4: no Tier M, nothing ever waits
@@ -652,7 +692,11 @@ static int op_selftest_status(ctlw_t *w, const ctlj_doc_t *d, int args) {
     else ctlw_null(w, "fault_before_boot");
     ctlw_str(w, "config", config_loaded_from_flash() ? "FLASH" : "DEFAULTS");
     ctlw_str(w, "image_sha256", "NOT_COMPUTED");     // ATABOY_CTL_SELFHASH is not built (4.10)
+#if ATABOY_BOARD_JUMPERS
+    ctlw_str(w, "jumpers", bj_pads_ok() ? "OK" : "PAD_CONFIG_MISMATCH");     // 4.10: read back now
+#else
     ctlw_str(w, "jumpers", "NOT_BUILT");
+#endif
     return CTL_E_NONE;
 }
 
@@ -1138,6 +1182,15 @@ void ctl_init(void) {
 
 void ctl_task(void) {
     uint32_t now = now_ms();
+#if ATABOY_BOARD_JUMPERS
+    // The jumpers, every pass, whatever the port is doing (SPEC-v1 8.1,
+    // 8.3), and before the epoch's cross-check below. A fit event is
+    // reported by the one pass that ends it and is never kept (8.3). Stage 3
+    // has no Tier M and so no presence slot: the event is counted
+    // (bj_fit_events) and approves nothing, then or later.
+    bj_event_t ev;
+    (void)bj_task(now, &ev);
+#endif
     uint32_t since_last = now - c.prev_pass_ms;
     c.prev_pass_ms = now;
     bool dtr = tud_cdc_n_connected(CTL_ITF);

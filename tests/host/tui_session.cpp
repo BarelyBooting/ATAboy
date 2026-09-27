@@ -54,6 +54,7 @@ static inline bool time_reached(absolute_time_t t) { return get_absolute_time() 
 #include "ctl_policy.c"
 #include "ctl.c"
 #include "ctl_job.c"
+#include "jumpers_boot.h"           // ATABOY_BOARD_JUMPERS: the jumpers, both open
 // The Control port, closed: no host (the API idle).
 bool tud_cdc_n_connected(uint8_t) { return false; }
 uint32_t tud_cdc_n_available(uint8_t) { return 0; }

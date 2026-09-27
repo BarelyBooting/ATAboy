@@ -15,6 +15,9 @@
 #if ATABOY_CTL
 #include "ctl.h"
 #endif
+#if ATABOY_BOARD_JUMPERS
+#include "board_jumpers.h"
+#endif
 
 // Holistic review (the guide's L1): nothing may drive a board LED, UART,
 // I2C, SPI or power-sense pin: on this board those pin numbers are the IDE
@@ -135,6 +138,13 @@ int main(void) {
     // Init CDC queues
     queue_init(&cdc_tx_queue, sizeof(char), CDC_TX_QUEUE_SIZE);
     queue_init(&cdc_rx_queue, sizeof(char), CDC_RX_QUEUE_SIZE);
+
+#if ATABOY_BOARD_JUMPERS
+    // JP1 and JP2's pads (palimpsest api/SPEC-v1.md 8.1): set up before
+    // TinyUSB (no WRITE(10) can arrive before JP1 can be read) and before
+    // core 1 (the TUI's Write Protect toggle reads JP1 too).
+    board_jumpers_init();
+#endif
 
     // Init TinyUSB
     tusb_init();

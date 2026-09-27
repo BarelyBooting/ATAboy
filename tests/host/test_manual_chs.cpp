@@ -56,6 +56,7 @@ static inline bool time_reached(absolute_time_t t) { return get_absolute_time() 
 
 #include "menus.c"
 #include "ctl_stubs.h"              // ATABOY_CTL: the API's hooks in menus.c
+#include "jumpers_boot.h"           // ATABOY_BOARD_JUMPERS: JP1 (the WP toggle, ide_write_protected)
 
 // Holistic review: core 1's stack canary lives in ATAboy.c and the fault
 // stop in fault.c, neither built here (fault.c is Arm assembly).

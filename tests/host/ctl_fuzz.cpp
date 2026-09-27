@@ -179,11 +179,128 @@ static void human_event() {
         strcpy(hdd_model_raw, "FUZZ"); sync_to_config(); ctl_setup_noted(CTL_SRC_TUI_DETECT_NORMAL);
         log_mount(OBS_EV_MOUNT, OBS_MNT_MENU); is_mounted = true; current_screen = SCREEN_MOUNTED; CTL_EPOCH_BUMP();
         break;
-    case 1: config.drive_write_protected = false; ctl_wp_last = CTL_WP_TUI; CTL_EPOCH_BUMP(); break;
+    case 1:                                         // Features, Write Protect to Disabled
+#if ATABOY_BOARD_JUMPERS
+        if (jp1_locked()) break;                    // refused while JP1 is fitted (menus.c)
+#endif
+        config.drive_write_protected = false; ctl_wp_last = CTL_WP_TUI; CTL_EPOCH_BUMP(); break;
     case 2: config.pipelined_reads = true; CTL_EPOCH_BUMP(); break;
     case 3: if (is_mounted) { menu_unmount(); current_screen = SCREEN_MAIN; } break;
     }
 }
+
+#if ATABOY_BOARD_JUMPERS
+// Stage 3 (SPEC-v1 11.3, I-4, I-25): JP1 and JP2 timelines between lines, and
+// an oracle after every core-0 pass that works from the shunts and the pad
+// registers themselves, not from board_jumpers.c's own state.
+//  - I-4: while JP1 is fitted or a pad is set up wrong, write protect is on
+//    (ide_write_protected, and config.drive_write_protected after the pass).
+//  - I-25: a fit event only after an OPEN of 20 equal samples over 10 ms or
+//    more, starting at least 200 ms before the event's edge, with no gap over
+//    50 ms, no pad set up wrong, no debounced FITTED and no earlier event
+//    since; and the edge the first sample of an unbroken FITTED run of at
+//    least 200 ms up to the event.
+static const unsigned jp_pins[2] = { 30, 31 };
+static bool phys_pads_ok() {
+    for (unsigned p : jp_pins) {
+        uint32_t pad = mock_pads.io[p], ctrl = mock_io.io[p].ctrl;
+        if (!(pad & 0x8u) || (pad & 0x4u) || !(pad & 0x40u) || (pad & 0x100u)) return false;
+        if ((ctrl & 0x1Fu) != 5u || (ctrl & 0x3F000u)) return false;
+        if (mock_gpio_oe & (1u << p)) return false;
+    }
+    return true;
+}
+static struct {
+    bool have;
+    uint32_t last, R;               // the last pass; since when an OPEN may count
+    bool run_fit; uint32_t run_start, run_n;
+    bool open_ok; uint32_t open_start;
+    uint32_t events;
+} jo;
+static uint64_t jp_passes = 0, jp_events = 0, jp_locks = 0, jp_pad_faults = 0, jp_gaps = 0;
+static void jo_reset(uint32_t t) { jo.R = t; jo.run_n = 0; jo.open_ok = false; }
+static void jp_oracle() {
+    uint32_t t = to_ms_since_boot(get_absolute_time());
+    jp_passes++;
+    bool ok = phys_pads_ok();
+    // I-4
+    if ((mock_jumper_fitted[0] || !ok) && (!config.drive_write_protected || !ide_write_protected())) {
+        violation("JP1 fitted or a pad wrong, and write protect off (I-4)", "", "");
+    }
+    if (jo.have && t - jo.last > 50) { jo_reset(t); jp_gaps++; }
+    jo.have = true;
+    jo.last = t;
+    if (!ok) { jo_reset(t); }
+    else {
+        bool fit = mock_jumper_fitted[1];
+        if (jo.run_n && jo.run_fit == fit) jo.run_n++;
+        else {
+            if (jo.run_n && jo.run_fit && jo.run_n >= 20) jo_reset(t);     // a debounced FITTED ended
+            jo.run_fit = fit; jo.run_start = t; jo.run_n = 1;
+        }
+        if (!fit && !jo.open_ok && jo.run_n >= 20 && t - jo.run_start >= 10 && jo.run_start >= jo.R) {
+            jo.open_ok = true; jo.open_start = jo.run_start;
+        }
+    }
+    uint32_t ev = bj_fit_events();
+    if (ev != jo.events) {
+        jp_events += ev - jo.events;
+        uint32_t edge = bj.edge;
+        bool a = ev == jo.events + 1 && ok && jo.run_fit && jo.run_start == edge && t - edge >= 200;
+        bool b = jo.open_ok && jo.open_start >= jo.R && edge - jo.open_start >= 200;
+        if (!a) violation("a fit event without an unbroken FITTED of 200 ms from its edge (I-25)", "", "");
+        if (!b) violation("a fit event without an observed OPEN of 200 ms before it (I-25)", "", "");
+        jo.events = ev;
+        jo.R = t; jo.open_ok = false;                           // the next event needs a new OPEN
+    }
+}
+static void jo_power_up() { memset(&jo, 0, sizeof jo); jo.events = bj_fit_events(); jo.R = to_ms_since_boot(get_absolute_time()); }
+
+// A pad set up wrong, one of the ways test_ctl's table has.
+static void pad_fault(unsigned p) {
+    switch (below(8)) {
+    case 0: mock_pads.io[p] = MOCK_PAD_RESET; mock_io.io[p].ctrl = MOCK_CTRL_RESET; break;
+    case 1: mock_pads.io[p] = (mock_pads.io[p] & ~0x8u) | 0x4u; break;
+    case 2: mock_pads.io[p] &= ~0x40u; break;
+    case 3: mock_pads.io[p] |= 0x100u; break;
+    case 4: mock_io.io[p].ctrl = (mock_io.io[p].ctrl & ~0x1Fu) | 6u; break;
+    case 5: mock_io.io[p].ctrl |= (1u + below(3)) << (12 + 2 * below(3)); break;
+    case 6: mock_gpio_out &= ~(1u << p); mock_gpio_oe |= 1u << p; break;
+    case 7: mock_pads.io[p] &= ~0xCu; break;
+    }
+}
+static void pads_repair() {
+    for (unsigned p : jp_pins) { mock_gpio_oe &= ~(1u << p); gpio_pull_up(p); gpio_init(p); }
+}
+static void jumper_event() {
+    switch (below(9)) {
+    case 0: mock_jumper_fitted[1] = !mock_jumper_fitted[1]; break;
+    case 1:                                         // an act, of random lengths either side of 200 ms
+        mock_jumper_fitted[1] = false; pump(150 + below(150));
+        mock_jumper_fitted[1] = true; pump(150 + below(150));
+        break;
+    case 2:                                         // bounce
+        for (int i = 0, n = 1 + (int)below(6); i < n; i++) { mock_jumper_fitted[1] = !mock_jumper_fitted[1]; pump(1 + below(8)); }
+        break;
+    case 3: mock_jumper_fitted[0] = !mock_jumper_fitted[0]; if (mock_jumper_fitted[0]) jp_locks++; break;
+    case 4: pad_fault(jp_pins[below(2)]); jp_pad_faults++; break;
+    case 5: pads_repair(); break;
+    case 6:                                         // JP1 on and off between two passes, read live by core 1
+        mock_jumper_fitted[0] = true; mock_core_num = 1; (void)jp1_locked(); mock_core_num = 0;
+        mock_jumper_fitted[0] = false; jp_locks++;
+        break;
+    case 7:                                         // core 0 away, JP2 moved meanwhile
+        mock_now_ns += (uint64_t)(20 + below(80)) * 1000000ull;
+        mock_jumper_fitted[1] = !mock_jumper_fitted[1];
+        mock_now_ns += (uint64_t)(below(80)) * 1000000ull;
+        break;
+    case 8: mock_jumper_fitted[1] = false; pump(200 + below(400)); break;
+    }
+    // The passes that see it, and a debounced release of JP1 (20 samples
+    // over 10 ms), before the next line takes its digest (I-10).
+    pump(30);
+}
+#endif
 
 // One line in, the answers out, the oracle applied.
 static std::map<uint32_t, std::vector<std::pair<std::string, std::string>>> answered;   // id -> (line digest, response)
@@ -252,6 +369,10 @@ int main(int argc, char **argv) {
     if (corpus.empty()) { printf("COULD NOT RUN: no corpus in %s\n", dir); return 98; }
     power_up();
     runs_scanned = log_next;
+#if ATABOY_BOARD_JUMPERS
+    after_task = jp_oracle;
+    jo_power_up();
+#endif
     // 1. The corpus as it is: the count oracle holds for every line.
     for (auto &l : corpus) one_line(l, true);
     // 2. Mutants, with events between them.
@@ -263,6 +384,9 @@ int main(int argc, char **argv) {
                       : history.empty() ? grammar_line() : history[below((uint32_t)history.size())];
         if (history.size() < 64) history.push_back(l); else history[below(64)] = l;
         if (below(6) == 0) human_event();
+#if ATABOY_BOARD_JUMPERS
+        if (below(5) == 0) jumper_event();
+#endif
         bool events = below(12) == 0;
         if (events) {
             switch (below(5)) {
@@ -277,7 +401,16 @@ int main(int argc, char **argv) {
         core1_runs = true;
         if (below(50) == 0) pump(1000);             // the rate window empties now and then
         one_line(l, true);
-        if (it % 5000 == 4999) { power_up(); answered.clear(); runs.clear(); runs_scanned = log_next; }
+        if (it % 5000 == 4999) {
+#if ATABOY_BOARD_JUMPERS
+            after_task = nullptr;                   // power_up's own passes: a new boot, the oracle starts after it
+#endif
+            power_up(); answered.clear(); runs.clear(); runs_scanned = log_next;
+#if ATABOY_BOARD_JUMPERS
+            jo_power_up();
+            after_task = jp_oracle;
+#endif
+        }
     }
     printf("fuzz: seed %llu, %zu corpus lines, %llu mutants, %llu lines, %llu responses (%llu DONE, %llu replayed); codes:",
            (unsigned long long)(argc > 3 ? strtoull(argv[3], 0, 10) : 1), corpus.size(), (unsigned long long)iters,
@@ -286,6 +419,11 @@ int main(int argc, char **argv) {
     for (auto &kv : codes) printf(" %s=%d", kv.first.c_str(), kv.second);
     printf("; ratchet DONE:");
     for (auto &kv : done_ops) printf(" %s=%d", kv.first.c_str(), kv.second);
+#if ATABOY_BOARD_JUMPERS
+    printf("\njumpers: %llu passes checked (I-4, I-25), %llu fit events, %llu JP1 fits, %llu pad faults, %llu gaps",
+           (unsigned long long)jp_passes, (unsigned long long)jp_events, (unsigned long long)jp_locks,
+           (unsigned long long)jp_pad_faults, (unsigned long long)jp_gaps);
+#endif
     printf("\n%llu checks, %d failed\n", (unsigned long long)lines_sent, violations);
     return violations > 255 ? 255 : violations;
 }

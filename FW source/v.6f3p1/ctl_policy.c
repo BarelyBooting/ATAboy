@@ -80,6 +80,25 @@ void ctl_op_cap(int op, uint8_t *state, const char **why) {
     }
 }
 
+#if ATABOY_BOARD_JUMPERS
+void ctl_op_cap_jp(int op, bool built, uint8_t jp1, bool lease, uint8_t *state, const char **why) {
+    *why = 0;
+    if (op < 0 || op >= CTL_OP_COUNT || !built) {
+        *state = CTL_CAP_ABSENT; *why = "NOT_BUILT";
+    } else if (ctl_ops[op].tier != CTL_TIER_M) {
+        *state = CTL_CAP_OPERATIONAL;
+    } else if (jp1 == CTL_JP1_FITTED) {
+        *state = CTL_CAP_LOCKED; *why = "JP1_FITTED";               // LOCK wins (8.2)
+    } else if (jp1 != CTL_JP1_OPEN) {
+        *state = CTL_CAP_LOCKED; *why = "JUMPERS_UNREADABLE";       // fail closed (8.1)
+    } else if (!lease) {
+        *state = CTL_CAP_LOCKED; *why = "NO_LEASE";
+    } else {
+        *state = CTL_CAP_OPERATIONAL;
+    }
+}
+#endif
+
 // ---------------------------------------------------------------------------
 //  Arguments, per op (SPEC-v1 4.x)
 // ---------------------------------------------------------------------------

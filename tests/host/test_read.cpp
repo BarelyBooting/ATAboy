@@ -23,6 +23,7 @@
 #include "ide.c"
 #include "usb.c"
 #include "ctl_stubs.h"              // ATABOY_CTL: usb.c tells the API of a USB reset
+#include "jumpers_boot.h"           // ATABOY_BOARD_JUMPERS: JP1 in ide_write_protected
 #if ATABOY_SAT
 #include "sat_policy.c"
 #include "sat.c"
@@ -509,6 +510,64 @@ static void test_writes() {
     CHECK(h.ok && memcmp(h.data.data(), buf.data(), 4096) == 0, "read back");
     CHECK(sim.srst == 0 && sim.violations == 0, "srst %d violations %d", sim.srst, sim.violations);
 }
+
+#if ATABOY_BOARD_JUMPERS
+// Stage 3 (palimpsest api/SPEC-v1.md 8.2, I-4): JP1 fitted refuses WRITE(10)
+// at usb.c's check and ide_write_sectors at its own, before anything reaches
+// the drive, whatever Features says; so does a pad that reads back wrong.
+// Taking the shunt off does not bring "Disabled" back: the human sets it.
+// (The release is core 0's pass, bj_task, driven here by hand: this program
+// has no Control API loop.)
+static void jp1_passes(int n) {
+    bj_event_t ev;
+    for (int i = 0; i < n; i++) { mock_now_ns += 1000000; (void)bj_task(to_ms_since_boot(get_absolute_time()), &ev); }
+}
+// Left out of the transcript (as test_api_ratchet_mid_command's are): the
+// transcripts of every other test must stay those of the build without the
+// jumpers, which runs.sh and the stage's identity log compare.
+static void test_jp1_writes() {
+    FILE *keep = transcript;
+    transcript = nullptr;
+    setup("JP1 LOCK: WRITE(10) and ide_write_sectors refused", LBA);
+    jp1_passes(30);
+    config.drive_write_protected = false;
+    std::vector<uint8_t> w(512, 0x5A);
+    int32_t r = host_write10(700, w.data(), 1);
+    CHECK(r == 512 && tud_msc_is_writable_cb(0), "JP1 open, WP Disabled: WRITE(10) %d", r);
+    size_t written = sim.written.size();
+    int n30 = sim.cmd_count[0x30], n34 = sim.cmd_count[0x34], cmds = sim.commands;
+    mock_jumper_fitted[0] = true;                   // no core-0 pass in between: read live (finding 12)
+    CHECK(!tud_msc_is_writable_cb(0) && config.drive_write_protected, "JP1 fitted: still writable");
+    r = host_write10(701, w.data(), 1);
+    CHECK(r < 0, "JP1 fitted: WRITE(10) returned %d", r);
+    r = ide_write_sectors(702, 1, w.data());
+    CHECK(r < 0, "JP1 fitted: ide_write_sectors returned %d", r);
+    CHECK(sim.written.size() == written && sim.cmd_count[0x30] == n30 && sim.cmd_count[0x34] == n34 && sim.commands == cmds,
+          "JP1 fitted: the drive saw %d commands", sim.commands - cmds);
+    // Off: still locked until the debounced OPEN, then write protect stays on.
+    mock_jumper_fitted[0] = false;
+    jp1_passes(5);
+    CHECK(jp1_locked() && ide_write_sectors(703, 1, w.data()) < 0, "released after 5 samples: jp1 %u n %u first %u last %u", bj_jp1(), bj.r1.n, (unsigned)bj.r1.first, (unsigned)bj.r1.last);
+    jp1_passes(25);
+    CHECK(bj_jp1() == BJ_OPEN && !jp1_locked(), "not released after 30 samples");
+    r = host_write10(704, w.data(), 1);
+    CHECK(r < 0 && config.drive_write_protected && sim.written.size() == written, "JP1 off: \"Disabled\" came back (r %d)", r);
+    config.drive_write_protected = false;           // the human, in Features
+    r = host_write10(705, w.data(), 1);
+    CHECK(r == 512 && sim.written.size() == written + 1, "JP1 off, WP Disabled again: WRITE(10) %d", r);
+    // A pad set up wrong: UNREADABLE, the same lock.
+    written = sim.written.size();
+    mock_pads.io[30] = MOCK_PAD_RESET;
+    config.drive_write_protected = false;
+    r = host_write10(706, w.data(), 1);
+    CHECK(r < 0 && config.drive_write_protected && bj_jp1() == BJ_UNREADABLE && sim.written.size() == written,
+          "a pad at its reset state: WRITE(10) %d, jp1 %u", r, bj_jp1());
+    gpio_pull_up(30); gpio_init(30);
+    jp1_passes(30);
+    CHECK(bj_jp1() == BJ_OPEN, "pad set up again: jp1 %u", bj_jp1());
+    transcript = keep;
+}
+#endif
 
 static void test_not_ready() {
     setup("drive not ready", LBA);
@@ -4887,6 +4946,9 @@ int main() {
     test_marginal();
     test_two_bad();
     test_writes();
+#if ATABOY_BOARD_JUMPERS
+    test_jp1_writes();
+#endif
     test_not_ready();
     test_stale_drq(LBA);
     test_stale_drq(CHS);

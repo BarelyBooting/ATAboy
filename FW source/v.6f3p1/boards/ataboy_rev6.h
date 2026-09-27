@@ -20,7 +20,22 @@
 pico_board_cmake_set(PICO_PLATFORM, rp2350)
 
 #define ATABOY_REV6
+// The pin count. GPIO30 and GPIO31 (JP1, JP2) and GPIO32 (the Err LED) exist
+// in the B package only (RP2354B, QFN-80). Every other pin this board uses is
+// below 30, and the builds without the jumpers keep the A-package count they
+// were proven with, byte for byte (palimpsest api/SPEC-v1.md 1.3, 8.1). With
+// ATABOY_BOARD_JUMPERS (CMakeLists.txt, which defines it for every source of
+// the image, the SDK's included) the count is the true one, 48, and the PIO
+// keeps the code it has always had: no GPIO base handling (every PIO pin is
+// 0 to 29, and GPIOBASE is left at its reset value, 0, as in every build
+// before; the SDK's default for 48 pins would change pio_sm_config and the
+// SM set-up code for no pin this board has on a PIO).
+#if ATABOY_BOARD_JUMPERS
+#define PICO_RP2350A 0
+#define PICO_PIO_USE_GPIO_BASE 0
+#else
 #define PICO_RP2350A 1
+#endif
 
 #define PICO_BOOT_STAGE2_CHOOSE_W25Q080 1
 #ifndef PICO_FLASH_SPI_CLKDIV

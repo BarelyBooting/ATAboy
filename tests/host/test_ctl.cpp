@@ -257,7 +257,12 @@ static void test_hello() {
           "version %s banner %s", res["fw"]["version"].s.c_str(), res["fw"]["banner"].s.c_str());
     CHECK(res["fw"]["git"].s.size() == 40 && res["fw"]["dirty"].t == J::BOOL, "git or dirty");
     const J &bf = res["fw"]["build_flags"];
+#if ATABOY_BOARD_JUMPERS
+    CHECK(bf["ctl"].b && bf["sat"].t == J::BOOL && bf["tripwire"].b && bf["board_jumpers"].t == J::BOOL &&
+          bf["board_jumpers"].b && bf.obj.size() == 6, "build flags");
+#else
     CHECK(bf["ctl"].b && bf["sat"].t == J::BOOL && bf["tripwire"].b && !bf["board_jumpers"].b && bf.obj.size() == 6, "build flags");
+#endif
     const J &caps = res["caps"];
     CHECK(caps.obj.size() == CTL_OP_COUNT + CTL_HUMAN_ONLY_COUNT + CTL_NOT_IN_V1_COUNT, "%zu caps", caps.obj.size());
     for (int i = 0; i < CTL_OP_COUNT; i++) {
@@ -637,7 +642,12 @@ static void test_status() {
           all_keys(r["counters"], { "unwitnessed_blocks", "self_resets", "tx_abandoned", "parse_errors" }), "sub-objects");
     CHECK(!r["mounted"].b && r["mount_seq"].n == 0 && r["mount_log_seq"].t == J::NUL && r["device"].is("MASTER") &&
           r["wp"]["effective"].b && r["wp"]["last_change"].is("BOOT") && r["wp"]["forced_by"].arr.empty() &&
-          r["tui"]["state"].is("MAIN") && r["jumpers"]["jp1"].is("NOT_BUILT") && !r["presence"]["waiting"].b &&
+          r["tui"]["state"].is("MAIN") && !r["presence"]["waiting"].b &&
+#if ATABOY_BOARD_JUMPERS
+          r["jumpers"]["jp1"].is("OPEN") && r["jumpers"]["jp2"].is("OPEN") &&
+#else
+          r["jumpers"]["jp1"].is("NOT_BUILT") && r["jumpers"]["jp2"].is("NOT_BUILT") &&
+#endif
           r["presence"]["op"].is("NONE") && !r["lease"]["held"].b && r["job"]["running"].is("NONE") &&
           r["job"]["id"].t == J::NUL && r["setup"]["source"].is("NONE") && r["setup"]["at_ms"].n == 0 &&
           r["hashes"]["engine"].is("SOFTWARE") && !r["rules"]["identify_forbidden"].b && !r["rules"]["identify_barred"].b &&
@@ -785,7 +795,12 @@ static void test_debug_e_selftest_chip() {
                                                               "image_sha256", "jumpers" }) &&
           r["result"]["hash_engine"].is("SOFTWARE") && r["result"]["core1_canary"].is("INTACT") &&
           r["result"]["fault_before_boot"].t == J::NUL && r["result"]["image_sha256"].is("NOT_COMPUTED") &&
-          r["result"]["jumpers"].is("NOT_BUILT") && r["result"]["config"].is("FLASH"), "selftest.status");
+#if ATABOY_BOARD_JUMPERS
+          r["result"]["jumpers"].is("OK") &&
+#else
+          r["result"]["jumpers"].is("NOT_BUILT") &&
+#endif
+          r["result"]["config"].is("FLASH"), "selftest.status");
     r = ask1(req(4, "chip.info"));
     CHECK(all_keys(r["result"], { "die", "stepping", "unique_id", "package" }) && r["result"]["unique_id"].is(board_serial) &&
           r["result"]["stepping"].n == 4, "chip.info");
@@ -1579,6 +1594,428 @@ static void test_setup_source() {
     CHECK(s["result"]["setup"]["source"].is("NONE"), "after a failed Ctrl+G: %s", s["result"]["setup"]["source"].s.c_str());
 }
 
+#if ATABOY_BOARD_JUMPERS
+// ---- 18. stage 3: JP1 LOCK and JP2 PERMIT (SPEC-v1 8; I-4, I-25; R-API-1 findings 5, 12, 13) ----
+// board_jumpers.c against mock_pico.h's register file: the pads of GPIO30
+// and GPIO31 as the RP2350 has them (reset value 0x116: pull-down, isolated,
+// input off), set up by the SDK calls board_jumpers_init() makes, and the
+// shunts (mock_jumper_fitted) tying a pin to GND. One core-0 pass a ms
+// (pump); away() is core 0 inside a USB callback, with no pass at all.
+static void jp1_fit(bool f) { mock_jumper_fitted[0] = f; }
+static void jp2_fit(bool f) { mock_jumper_fitted[1] = f; }
+static void hold2(bool f, uint32_t ms) { jp2_fit(f); pump(ms); }
+static void away(uint32_t ms) { mock_now_ns += (uint64_t)ms * 1000000ull; }
+static uint32_t t_ms() { return to_ms_since_boot(get_absolute_time()); }
+static J status_now(uint32_t id) { return ask1(req(id, "status"), nullptr, 10); }
+static std::string jstate(const J &s, const char *which) { return s["result"]["jumpers"][which].s; }
+
+// The pads, and the start (8.1).
+static void test_jp_pads_boot() {
+    fresh("stage 3: the pads at power-up");
+    CHECK(bj_pads_ok() && mock_jumper_let_low == 0, "pads ok %d, let go low %d times", bj_pads_ok(), mock_jumper_let_low);
+    for (unsigned p = 30; p < 32; p++)
+        CHECK((mock_pads.io[p] & 0x1CCu) == 0x48u && (mock_io.io[p].ctrl & 0x3F01Fu) == 5 && !(mock_gpio_oe & (1u << p)),
+              "GPIO%u: pad %03X ctrl %05X", p, (unsigned)mock_pads.io[p], (unsigned)mock_io.io[p].ctrl);
+    J s = status_now(1);
+    CHECK(jstate(s, "jp1") == "OPEN" && jstate(s, "jp2") == "OPEN" && s["result"]["jumpers"]["mount_credit_ms_left"].n == 0 &&
+          s["result"]["wp"]["forced_by"].arr.empty(), "status.jumpers %s %s", jstate(s, "jp1").c_str(), jstate(s, "jp2").c_str());
+    J t = ask1(req(2, "selftest.status"));
+    CHECK(t["result"]["jumpers"].is("OK"), "selftest.status.jumpers %s", t["result"]["jumpers"].s.c_str());
+    // The first passes after power-up: JP1 UNKNOWN until 20 OPEN samples over
+    // 10 ms, then OPEN, counted once; JP1 read open is no lock meanwhile.
+    human_wp(false);
+    pump(2);
+    memset(&bj, 0, sizeof bj);
+    mock_pads_reset();
+    fingerprint(&c.fp); c.fp_epoch = ctl_epoch;     // JP1's state reset by the test itself, not a change to count
+    uint32_t e0 = ctl_epoch;
+    CHECK(jp1_locked() && !config.drive_write_protected && ctl_epoch == e0,
+          "before board_jumpers_init: locked, nothing forced or counted");
+    board_jumpers_init();
+    CHECK(bj_jp1() == BJ_UNKNOWN && bj_jp2() == BJ_UNKNOWN && !jp1_locked() && !bj_tier_m_open(), "just set up");
+    pump(10);
+    CHECK(bj_jp1() == BJ_UNKNOWN && ctl_epoch == e0 && !config.drive_write_protected, "10 samples: still UNKNOWN");
+    pump(15);
+    CHECK(bj_jp1() == BJ_OPEN && bj_jp2() == BJ_OPEN && ctl_epoch == e0 + 1 && bj_tier_m_open() &&
+          !config.drive_write_protected, "25 samples: jp1 %u jp2 %u epoch +%u", bj_jp1(), bj_jp2(), (unsigned)(ctl_epoch - e0));
+    // Both ways for the order of set-up: the pull-up after gpio_init lets
+    // the pin go to its pull-down for a moment (the mock counts it).
+    mock_pads_reset();
+    gpio_init(31); gpio_pull_up(31);
+    CHECK(mock_jumper_let_low == 1, "gpio_init first: let go low %d times", mock_jumper_let_low);
+    mock_jumper_let_low = 0;
+}
+
+// Every way a pad can be set up wrong (finding 13): each makes both jumpers
+// UNREADABLE, which is LOCK (write protect forced on) and no PERMIT.
+struct PadFault { const char *name; void (*make)(unsigned pin); };
+static const PadFault pad_faults[] = {
+    { "reset state (pull-down, isolated, input off, no function)",
+      [](unsigned p) { mock_pads.io[p] = MOCK_PAD_RESET; mock_io.io[p].ctrl = MOCK_CTRL_RESET; } },
+    { "pull-down, no pull-up", [](unsigned p) { mock_pads.io[p] = (mock_pads.io[p] & ~0x8u) | 0x4u; } },
+    { "both pulls", [](unsigned p) { mock_pads.io[p] |= 0x4u; } },
+    { "no pull", [](unsigned p) { mock_pads.io[p] &= ~0xCu; } },
+    { "input off", [](unsigned p) { mock_pads.io[p] &= ~0x40u; } },
+    { "isolated", [](unsigned p) { mock_pads.io[p] |= 0x100u; } },
+    { "function PIO0", [](unsigned p) { mock_io.io[p].ctrl = (mock_io.io[p].ctrl & ~0x1Fu) | 6u; } },
+    { "no function", [](unsigned p) { mock_io.io[p].ctrl |= 0x1Fu; } },
+    { "OE override: invert", [](unsigned p) { mock_io.io[p].ctrl |= 1u << 14; } },
+    { "OE override: disable", [](unsigned p) { mock_io.io[p].ctrl |= 2u << 14; } },
+    { "OE override: enable", [](unsigned p) { mock_io.io[p].ctrl |= 3u << 14; } },
+    { "OUT override: invert", [](unsigned p) { mock_io.io[p].ctrl |= 1u << 12; } },
+    { "OUT override: low", [](unsigned p) { mock_io.io[p].ctrl |= 2u << 12; } },
+    { "OUT override: high", [](unsigned p) { mock_io.io[p].ctrl |= 3u << 12; } },
+    { "IN override: invert", [](unsigned p) { mock_io.io[p].ctrl |= 1u << 16; } },
+    { "IN override: low", [](unsigned p) { mock_io.io[p].ctrl |= 2u << 16; } },
+    { "IN override: high", [](unsigned p) { mock_io.io[p].ctrl |= 3u << 16; } },
+    { "SIO output enabled, driving low", [](unsigned p) { mock_gpio_out &= ~(1u << p); mock_gpio_oe |= 1u << p; } },
+    { "SIO output enabled, driving high", [](unsigned p) { mock_gpio_out |= 1u << p; mock_gpio_oe |= 1u << p; } },
+};
+static void test_jp_pad_faults() {
+    int faked_fitted = 0, cases = 0;
+    for (unsigned pin = 30; pin < 32; pin++) {
+        for (const PadFault &f : pad_faults) {
+            fresh("stage 3: a pad set up wrong");
+            human_wp(false);
+            pump(2);
+            uint32_t e0 = ctl_epoch, ev0 = bj_fit_events();
+            f.make(pin);
+            cases++;
+            if (!mock_pin_level(pin)) faked_fitted++;     // what a read without the read-back would take for a shunt
+            bool live = jp1_locked();
+            CHECK(live && config.drive_write_protected && bj_jp1() == BJ_UNREADABLE && ide_write_protected() && !bj_pads_ok() &&
+                  !bj_tier_m_open(), "GPIO%u %s: live lock %d, wp %d, jp1 %u", pin, f.name, live, config.drive_write_protected, bj_jp1());
+            CHECK(ctl_epoch == e0 + 1, "GPIO%u %s: epoch +%u (the forcing and the state, counted once)", pin, f.name,
+                  (unsigned)(ctl_epoch - e0));
+            // 400 ms of it, then: status, selftest, and no fit event (JP2 had
+            // been open for over 200 ms: a pad that reads low would look like
+            // a fit).
+            pump(400);
+            J s = status_now(1);
+            J t = ask1(req(2, "selftest.status"), nullptr, 10);
+            CHECK(jstate(s, "jp1") == "UNREADABLE" && jstate(s, "jp2") == "UNREADABLE" && s["result"]["wp"]["effective"].b &&
+                  s["result"]["wp"]["config"].b && s["result"]["wp"]["forced_by"].arr.size() == 1 &&
+                  s["result"]["wp"]["forced_by"].arr[0]->is("JP1") && t["result"]["jumpers"].is("PAD_CONFIG_MISMATCH") &&
+                  bj_fit_events() == ev0, "GPIO%u %s: status %s/%s selftest %s events +%u", pin, f.name, jstate(s, "jp1").c_str(),
+                  jstate(s, "jp2").c_str(), t["result"]["jumpers"].s.c_str(), (unsigned)(bj_fit_events() - ev0));
+            // Set up right again: released after a debounced OPEN; write
+            // protect stays on (8.2), and JP2 needs a new observed OPEN.
+            mock_gpio_oe &= ~(1u << pin);
+            gpio_pull_up(pin); gpio_init(pin);
+            pump(5);
+            CHECK(bj_jp1() == BJ_UNREADABLE && jp1_locked(), "GPIO%u %s: released before 20 samples", pin, f.name);
+            pump(25);
+            J s2 = status_now(3);
+            CHECK(jstate(s2, "jp1") == "OPEN" && jstate(s2, "jp2") == "OPEN" && s2["result"]["wp"]["config"].b &&
+                  s2["result"]["wp"]["forced_by"].arr.empty() && !jp1_locked(), "GPIO%u %s: after the repair %s/%s wp %d", pin,
+                  f.name, jstate(s2, "jp1").c_str(), jstate(s2, "jp2").c_str(), (int)config.drive_write_protected);
+        }
+    }
+    // The fixture drives the danger both ways: most of these read low on the
+    // pin, which is "fitted" to a read that does not check the pad.
+    CHECK(faked_fitted >= 20, "%d of %d wrong set-ups read low", faked_fitted, cases);
+    printf("stage 3 pads: %d wrong set-ups (%zu per pin), %d of them read low (a fake shunt) without the read-back\n",
+           cases, sizeof pad_faults / sizeof pad_faults[0], faked_fitted);
+}
+
+// JP1: LOCK (8.2, I-4, finding 12).
+static void test_jp1_lock() {
+    fresh("stage 3: JP1 fitted");
+    human_wp(false);
+    pump(2);
+    uint32_t e0 = ctl_epoch;
+    jp1_fit(true);
+    pump(1);
+    CHECK(bj_jp1() == BJ_FITTED && config.drive_write_protected && ctl_epoch == e0 + 1 && !bj_tier_m_open(),
+          "one pass: jp1 %u wp %d epoch +%u", bj_jp1(), config.drive_write_protected, (unsigned)(ctl_epoch - e0));
+    J s = status_now(1);
+    const J &wp = s["result"]["wp"];
+    CHECK(jstate(s, "jp1") == "FITTED" && wp["effective"].b && wp["config"].b && wp["forced_by"].arr.size() == 1 &&
+          wp["forced_by"].arr[0]->is("JP1") && wp["last_change"].is("TUI"), "status while JP1 is fitted");
+    // Tier S is not the jumpers' (8.2): wp.on still DONE (nothing to change).
+    J w = ask1(req(2, "wp.on"));
+    CHECK(w["outcome"].is("DONE") && !w["result"]["changed"].b && w["result"]["wp"]["forced_by"].arr.size() == 1, "wp.on under JP1");
+    J h = ask1(req(3, "hello"));
+    CHECK(h["result"]["caps"]["wp.on"]["state"].is("OPERATIONAL") && h["result"]["caps"]["unmount"]["state"].is("OPERATIONAL") &&
+          h["result"]["caps"]["setup.ctrlg"]["state"].is("ABSENT") && h["result"]["caps"]["setup.ctrlg"]["why"].is("NOT_BUILT"),
+          "caps under JP1 (stage 3 builds no Tier M)");
+    // Taken off: still locked until 20 OPEN samples over 10 ms (8.1), and
+    // write protect stays on: the "Disabled" of before does not come back.
+    e0 = ctl_epoch;
+    jp1_fit(false);
+    pump(5);
+    CHECK(bj_jp1() == BJ_FITTED && jp1_locked() && ctl_epoch == e0, "released after 5 samples");
+    pump(25);
+    J s2 = status_now(4);
+    CHECK(jstate(s2, "jp1") == "OPEN" && ctl_epoch == e0 + 1 && s2["result"]["wp"]["config"].b && s2["result"]["wp"]["effective"].b &&
+          s2["result"]["wp"]["forced_by"].arr.empty() && !jp1_locked() && bj_tier_m_open(), "after removal: %s, wp %d, epoch +%u",
+          jstate(s2, "jp1").c_str(), config.drive_write_protected, (unsigned)(ctl_epoch - e0));
+    // A shunt that keeps touching (a low sample every 15 ms) is never released.
+    jp1_fit(true); pump(1);
+    for (int i = 0; i < 20; i++) { jp1_fit(false); pump(14); jp1_fit(true); pump(1); }
+    jp1_fit(false);
+    CHECK(bj_jp1() == BJ_FITTED && jp1_locked(), "released while it bounced");
+    pump(25);
+    CHECK(bj_jp1() == BJ_OPEN, "not released after it stopped");
+
+    // Read live (finding 12): core 0 in a 20 s callback, no pass; the shunt
+    // goes on; core 1 (the TUI) and the write check see it at once.
+    fresh("stage 3: JP1 fitted while core 0 is away");
+    human_wp(false);
+    pump(2);
+    e0 = ctl_epoch;
+    away(5000);
+    jp1_fit(true);
+    mock_core_num = 1;
+    bool locked = jp1_locked();
+    mock_core_num = 0;
+    CHECK(locked && config.drive_write_protected && bj_jp1() == BJ_FITTED && ctl_epoch == e0 + 1 && ide_write_protected(),
+          "live read: locked %d wp %d", locked, config.drive_write_protected);
+    away(15000);
+    pump(2);
+    CHECK(bj_jp1() == BJ_FITTED && ctl_epoch == e0 + 1, "after the callback");
+    // A store of false racing the lock (the TUI's toggle between its check
+    // and its store) is undone by the next read while still locked.
+    jp1_fit(false);
+    config.drive_write_protected = false;
+    e0 = ctl_epoch;
+    CHECK(jp1_locked() && config.drive_write_protected && ctl_epoch == e0 + 1, "a racing false not undone");
+    pump(30);
+}
+
+// JP2: the fit event (8.3, I-25, finding 5), timelines both ways.
+static uint32_t ev_base;
+static uint32_t evs() { return bj_fit_events() - ev_base; }
+static void jp2_start(const char *name, bool fitted_at_power_up = false) {
+    power_up_fitted[1] = fitted_at_power_up;
+    fresh(name);
+    power_up_fitted[1] = false;
+    ev_base = bj_fit_events();
+}
+static void test_jp2_events() {
+    // A clean act: OPEN 1 s, then FITTED; the event at edge + 200 ms, once.
+    jp2_start("stage 3: JP2, a clean act");
+    hold2(false, 1000);
+    uint32_t t0 = t_ms();
+    hold2(true, 200);
+    CHECK(evs() == 0, "event before the FITTED 200 ms");
+    pump(1);
+    CHECK(evs() == 1 && bj.edge == t0 + 1, "one event, edge %u (fitted at %u)", (unsigned)bj.edge, (unsigned)t0);
+    hold2(true, 10000);
+    CHECK(evs() == 1, "a shunt left on made %u events", evs());
+    J s = status_now(1);
+    CHECK(jstate(s, "jp2") == "FITTED" && jstate(s, "jp1") == "OPEN", "status.jumpers %s", jstate(s, "jp2").c_str());
+
+    // The OPEN before it: 199 ms is not enough, 200 is (from a standing fit).
+    for (uint32_t open_ms : { 199u, 200u }) {
+        jp2_start("stage 3: JP2, the OPEN's length", true);
+        hold2(true, 1000);
+        CHECK(evs() == 0 && bj_jp2() == BJ_FITTED, "a shunt on at power-up: %u events", evs());
+        hold2(false, open_ms);
+        hold2(true, 400);
+        CHECK(evs() == (open_ms >= 200 ? 1u : 0u), "OPEN %u ms: %u events", open_ms, evs());
+    }
+    // The FITTED: 200 passes are not enough, 201 (edge + 200 ms) are.
+    for (uint32_t fit_ms : { 200u, 201u }) {
+        jp2_start("stage 3: JP2, the FITTED's length");
+        hold2(false, 1000);
+        hold2(true, fit_ms);
+        hold2(false, 1000);
+        CHECK(evs() == (fit_ms > 200 ? 1u : 0u), "FITTED %u ms: %u events", fit_ms, evs());
+    }
+    // Bounce as the shunt goes on: the debounced OPEN goes on through it and
+    // the edge is the first sample of the steady FITTED run.
+    jp2_start("stage 3: JP2, bounce going on");
+    hold2(false, 1000);
+    for (int i = 0; i < 3; i++) { hold2(true, 2); hold2(false, 2); }
+    uint32_t t1 = t_ms();
+    hold2(true, 400);
+    CHECK(evs() == 1 && bj.edge == t1 + 1, "bounce: %u events, edge %u, steady from %u", evs(), (unsigned)bj.edge, (unsigned)t1 + 1);
+    // A FITTED blip (5 ms) in a long OPEN: not a fit, and the OPEN stands.
+    jp2_start("stage 3: JP2, a blip while open");
+    hold2(false, 1000);
+    hold2(true, 5);
+    hold2(false, 100);
+    hold2(true, 400);
+    CHECK(evs() == 1, "a blip then a fit: %u events", evs());
+    // An OPEN sample inside the FITTED 200 ms: no event; the human refits.
+    jp2_start("stage 3: JP2, a gap in the FITTED");
+    hold2(false, 1000);
+    hold2(true, 100);
+    hold2(false, 1);
+    hold2(true, 1000);
+    CHECK(evs() == 0, "a break in the FITTED made %u events", evs());
+    hold2(false, 300);
+    hold2(true, 300);
+    CHECK(evs() == 1, "the refit made %u events", evs());
+    // Fit then remove inside the 200 ms, many times: nothing.
+    jp2_start("stage 3: JP2, taps");
+    hold2(false, 1000);
+    for (int i = 0; i < 20; i++) { hold2(true, 150); hold2(false, 250); }
+    CHECK(evs() == 0, "taps made %u events", evs());
+    // Three proper acts: three events.
+    for (int i = 0; i < 3; i++) { hold2(false, 300); hold2(true, 300); }
+    CHECK(evs() == 3, "three acts made %u events", evs());
+
+    // Gaps between passes (a USB callback): 49 ms away keeps the OPEN, 50
+    // (a 51 ms gap between passes) forgets it.
+    for (uint32_t gap : { 49u, 50u }) {
+        jp2_start("stage 3: JP2, a gap");
+        hold2(false, 1000);
+        jp2_fit(true);
+        away(gap);
+        hold2(true, 400);
+        CHECK(evs() == (gap < 50 ? 1u : 0u), "core 0 away %u ms, fitted meanwhile: %u events", gap, evs());
+    }
+    // A fit during a 20 s MSC callback: never counted; after it, a refit is.
+    jp2_start("stage 3: JP2, fitted inside a 20 s callback");
+    hold2(false, 1000);
+    uint32_t gaps0 = bj.gaps;
+    away(5000); jp2_fit(true); away(15000);
+    pump(1);
+    CHECK(bj.gaps == gaps0 + 1 && bj_jp2() == BJ_UNKNOWN, "after the callback: gaps +%u, jp2 %u", (unsigned)(bj.gaps - gaps0), bj_jp2());
+    J s3 = status_now(2);
+    CHECK(jstate(s3, "jp2") == "UNKNOWN", "status.jumpers.jp2 %s right after the gap", jstate(s3, "jp2").c_str());
+    hold2(true, 2000);
+    CHECK(evs() == 0, "the act inside the callback made %u events", evs());
+    hold2(false, 300); hold2(true, 300);
+    CHECK(evs() == 1, "the refit after it made %u events", evs());
+    // Open and fitted both inside one callback: nothing either.
+    jp2_start("stage 3: JP2, a whole act inside a callback");
+    hold2(false, 1000);
+    away(3000); jp2_fit(true); away(3000);
+    hold2(true, 400);
+    CHECK(evs() == 0, "%u events", evs());
+
+    // The pads unreadable for 5 ms in the OPEN: the OPEN is forgotten.
+    jp2_start("stage 3: JP2, pads unreadable in the OPEN");
+    hold2(false, 1000);
+    mock_pads.io[31] |= 0x4u;                       // both pulls: UNREADABLE
+    pump(5);
+    gpio_pull_up(31);
+    hold2(false, 50);
+    hold2(true, 400);
+    CHECK(evs() == 0, "OPEN before the pads went wrong counted: %u events", evs());
+    hold2(false, 300); hold2(true, 300);
+    CHECK(evs() == 1, "%u events after a new OPEN", evs());
+    // The pad at its reset state (reads low) or driven low, after a long
+    // OPEN (findings 13, X7 and X54): never an event.
+    jp2_start("stage 3: JP2, a pad at reset reads low");
+    hold2(false, 1000);
+    mock_pads.io[31] = MOCK_PAD_RESET; mock_io.io[31].ctrl = MOCK_CTRL_RESET;
+    CHECK(!mock_pin_level(31), "the reset state does not read low");
+    pump(1000);
+    CHECK(evs() == 0, "a pad at its reset state made %u events", evs());
+    jp2_start("stage 3: JP2, GPIO31 driven low");
+    hold2(false, 1000);
+    mock_gpio_out &= ~(1u << 31); mock_gpio_oe |= 1u << 31;
+    CHECK(!mock_pin_level(31), "driven low does not read low");
+    pump(1000);
+    mock_gpio_oe &= ~(1u << 31);
+    CHECK(evs() == 0, "an output driving low made %u events", evs());
+
+    // What bj_task hands back (stage 4 compares its edge with the waiting
+    // request's arrival): the edge, the first FITTED sample, and the pass
+    // that ended the 200 ms; only from that one pass. Driven by hand, one
+    // pass a ms, with no ctl_task in between.
+    jp2_start("stage 3: JP2, the event's record");
+    bj_event_t ev = { 0, 0 };
+    int reported = 0;
+    uint32_t t = t_ms(), fit_at = 0, rep_edge = 0, rep_at = 0, rep_pass = 0;
+    for (uint32_t i = 1; i <= 1500; i++) {
+        if (i == 600) { jp2_fit(true); fit_at = t + i; }
+        if (bj_task(t + i, &ev)) { reported++; rep_edge = ev.edge_ms; rep_at = ev.at_ms; rep_pass = t + i; }
+    }
+    mock_now_ns = (uint64_t)(t + 1500) * 1000000ull;
+    CHECK(reported == 1 && rep_edge == fit_at && rep_at == fit_at + 200 && rep_pass == rep_at,
+          "event record: %d reported, edge %u (fitted %u), at %u, pass %u", reported, (unsigned)rep_edge,
+          (unsigned)fit_at, (unsigned)rep_at, (unsigned)rep_pass);
+}
+
+// A shunt fitted and taken off between two of core 0's passes, seen only by
+// a live read (the TUI's, on core 1): the release still needs 20 OPEN
+// samples over 10 ms after it (R-API-1 finding 12).
+static void test_jp1_between_passes() {
+    fresh("stage 3: JP1 seen between two passes");
+    pump(30);
+    jp1_fit(true);
+    mock_core_num = 1;
+    bool locked = jp1_locked();
+    mock_core_num = 0;
+    jp1_fit(false);
+    CHECK(locked && bj_jp1() == BJ_FITTED, "the live read: %d", locked);
+    pump(5);
+    CHECK(bj_jp1() == BJ_FITTED && jp1_locked(), "released 5 samples after a live-only lock");
+    pump(25);
+    CHECK(bj_jp1() == BJ_OPEN && !jp1_locked(), "not released after 30 samples");
+}
+
+// An event with no lease (stage 3 has none): counted, and nothing else
+// happens (8.3: an event with no request waiting approves nothing); JP2's
+// level is not part of the epoch (4.3).
+static void test_jp2_changes_nothing() {
+    jp2_start("stage 3: JP2 changes nothing");
+    hold2(false, 1000);
+    std::string d0 = state2();
+    uint32_t e0 = ctl_epoch;
+    J before = status_now(1);
+    hold2(true, 400);
+    CHECK(evs() == 1 && ctl_epoch == e0 && state2() == d0, "an event moved the state (epoch +%u)", (unsigned)(ctl_epoch - e0));
+    J after = status_now(2);
+    CHECK(after["result"]["presence"]["op"].is("NONE") && !after["result"]["presence"]["waiting"].b &&
+          !after["result"]["lease"]["held"].b && jstate(after, "jp2") == "FITTED" && jstate(before, "jp2") == "OPEN" &&
+          after["result"]["epoch"].n == before["result"]["epoch"].n, "status after an event");
+    hold2(false, 400);
+    CHECK(ctl_epoch == e0 && state2() == d0, "JP2 taken off moved the state");
+    // The request's expect_epoch taken before the act still holds after it.
+    J w = ask1(req(3, "wp.on", eargs("expect_epoch", e0).c_str()));
+    CHECK(w["outcome"].is("DONE"), "expect_epoch from before the act: %s", w["outcome"].s.c_str());
+}
+
+// Tier M's capability (3.4) from the jumpers: the function, and hello with
+// stand-ins for stage 4's two Tier M ops.
+static int stand_in(ctlw_t *, const ctlj_doc_t *, int) { return CTL_E_NONE; }
+static void test_tier_m_caps() {
+    fresh("stage 3: Tier M's capability");
+    struct { uint8_t jp1; bool lease; uint8_t st; const char *why; } t[] = {
+        { CTL_JP1_OPEN, false, CTL_CAP_LOCKED, "NO_LEASE" }, { CTL_JP1_OPEN, true, CTL_CAP_OPERATIONAL, nullptr },
+        { CTL_JP1_FITTED, false, CTL_CAP_LOCKED, "JP1_FITTED" }, { CTL_JP1_FITTED, true, CTL_CAP_LOCKED, "JP1_FITTED" },
+        { CTL_JP1_UNREADABLE, true, CTL_CAP_LOCKED, "JUMPERS_UNREADABLE" }, { CTL_JP1_UNKNOWN, true, CTL_CAP_LOCKED, "JUMPERS_UNREADABLE" },
+    };
+    for (auto &x : t)
+        for (int op : { CTL_OP_SETUP_CTRLG, CTL_OP_MOUNT }) {
+            uint8_t st; const char *why;
+            ctl_op_cap_jp(op, true, x.jp1, x.lease, &st, &why);
+            CHECK(st == x.st && ((!why && !x.why) || (why && x.why && !strcmp(why, x.why))), "%s jp1 %u lease %d: %u %s",
+                  ctl_ops[op].name, x.jp1, x.lease, st, why ? why : "-");
+            ctl_op_cap_jp(op, false, x.jp1, x.lease, &st, &why);
+            CHECK(st == CTL_CAP_ABSENT && why && !strcmp(why, "NOT_BUILT"), "%s not built", ctl_ops[op].name);
+        }
+    for (int op = 0; op < CTL_OP_COUNT; op++) {
+        if (ctl_ops[op].tier == CTL_TIER_M) continue;
+        for (uint8_t j : { CTL_JP1_FITTED, CTL_JP1_UNREADABLE, CTL_JP1_UNKNOWN }) {
+            uint8_t st; const char *why;
+            ctl_op_cap_jp(op, true, j, false, &st, &why);
+            CHECK(st == CTL_CAP_OPERATIONAL && !why, "%s under jp1 %u: %u", ctl_ops[op].name, j, st);
+        }
+    }
+    ctl_test_op[CTL_OP_SETUP_CTRLG] = stand_in;
+    ctl_test_op[CTL_OP_MOUNT] = stand_in;
+    J h = ask1(req(1, "hello"));
+    CHECK(h["result"]["caps"]["setup.ctrlg"]["why"].is("NO_LEASE") && h["result"]["caps"]["mount"]["why"].is("NO_LEASE") &&
+          h["result"]["caps"]["mount"]["state"].is("LOCKED"), "hello, JP1 open: %s", h["result"]["caps"]["mount"]["why"].s.c_str());
+    jp1_fit(true); pump(1);
+    h = ask1(req(2, "hello"));
+    CHECK(h["result"]["caps"]["setup.ctrlg"]["why"].is("JP1_FITTED") && h["result"]["caps"]["mount"]["state"].is("LOCKED"),
+          "hello, JP1 fitted: %s", h["result"]["caps"]["setup.ctrlg"]["why"].s.c_str());
+    jp1_fit(false); pump(30);
+    mock_pads.io[30] &= ~0x40u;
+    h = ask1(req(3, "hello"));
+    CHECK(h["result"]["caps"]["mount"]["why"].is("JUMPERS_UNREADABLE"), "hello, pads wrong: %s", h["result"]["caps"]["mount"]["why"].s.c_str());
+    memset(ctl_test_op, 0, sizeof ctl_test_op);
+}
+#endif
+
 // ---- 17. core 1's real loop with keys (its own run: test_ctl core1-tui) -----
 // The hooks inside core1_entry's key handling (the Features toggles,
 // confirm-3), the F: Force refusal after identify.forbid, and an API
@@ -1712,14 +2149,68 @@ static void test_core1_tui() {
               "API unmount from the MOUNTED screen: %s, screen %d", r["outcome"].s.c_str(), current_screen);
         CHECK(ctl_tui_state == CTL_TUI_MAIN, "published state %u", ctl_tui_state);
     });
+#if ATABOY_BOARD_JUMPERS
+    // 8. Stage 3, JP1 and the TUI's Write Protect toggle (SPEC-v1 8.2): open,
+    // the toggle works both ways; fitted, Enter shows the box and changes
+    // nothing; taken off, "Disabled" does not come back by itself; fitted
+    // while core 0 is in a long callback, the TUI still sees it (finding 12).
+    key_at(B(24.0), "\x1b[A\x1b[C");               // Mount -> Auto Detect -> Features
+    key_at(B(24.3), "\r");
+    at(B(24.8), [] {
+        CHECK(current_screen == SCREEN_FEATURES && config.feat_selected == 0 && config.drive_write_protected,
+              "JP1: not on Features' Write Protect (screen %d row %u)", current_screen, config.feat_selected);
+    });
+    key_at(B(25.0), "\r");                          // Enabled -> Disabled, JP1 open
+    at(B(25.4), [] {
+        CHECK(!config.drive_write_protected && ctl_wp_last == CTL_WP_TUI, "JP1 open: the toggle did not work");
+        mark_e = ctl_epoch;
+        mock_jumper_fitted[0] = true;                   // the owner fits JP1
+    });
+    at(B(25.8), [] {
+        CHECK(config.drive_write_protected && bj_jp1() == BJ_FITTED && ctl_epoch == mark_e + 1,
+              "JP1 fitted: wp %d jp1 %u epoch +%u", config.drive_write_protected, bj_jp1(), (unsigned)(ctl_epoch - mark_e));
+        mark_91 = (int)tty.size(); mark_e = ctl_epoch;
+    });
+    key_at(B(26.0), "\r");                          // Enabled -> Disabled: refused
+    at(B(26.4), [] {
+        CHECK(tty.find(JP1_LOCKED_BOX, (size_t)mark_91) != std::string::npos && config.drive_write_protected && ctl_epoch == mark_e,
+              "JP1 fitted: toggle not refused (wp %d, box %d)", config.drive_write_protected,
+              tty.find(JP1_LOCKED_BOX, (size_t)mark_91) != std::string::npos);
+    });
+    key_at(B(26.5), " ");                           // the box's key
+    at(B(27.0), [] { mock_jumper_fitted[0] = false; });
+    at(B(27.5), [] {
+        CHECK(bj_jp1() == BJ_OPEN && config.drive_write_protected && current_screen == SCREEN_FEATURES,
+              "JP1 off: jp1 %u, wp %d (Disabled came back)", bj_jp1(), config.drive_write_protected);
+    });
+    key_at(B(28.0), "\r");                          // the human can now
+    at(B(28.4), [] {
+        CHECK(!config.drive_write_protected, "JP1 off: the toggle refused");
+        core0_hold = true;                              // core 0 in a long USB callback
+        mock_jumper_fitted[0] = true;
+        mark_91 = (int)tty.size();
+    });
+    key_at(B(29.0), "\r");
+    at(B(29.4), [] {
+        CHECK(tty.find(JP1_LOCKED_BOX, (size_t)mark_91) != std::string::npos && config.drive_write_protected &&
+              bj_jp1() == BJ_FITTED, "JP1 fitted with core 0 away: the TUI did not see it (wp %d)", config.drive_write_protected);
+    });
+    key_at(B(29.5), " ");
+    at(B(30.0), [] { core0_hold = false; mock_jumper_fitted[0] = false; });
+    at(B(31.0), [] { CHECK(bj_jp1() == BJ_OPEN && config.drive_write_protected, "JP1 off again"); });
+    idle_after_ns = (base + T(32.0)) * 1000;
+#else
     idle_after_ns = (base + T(25.0)) * 1000;
+#endif
     on_idle = core1_tui_done;
     core0_in_loop = true;
     core1_entry();
 }
 
 // ---- serve: the Control port on stdin/stdout, for ctl_e2e.py ------------------
-static void serve() {
+// jp (stage 3, ctl_e2e.py): 1, JP1 fitted after the mount; 2, GPIO31's pad
+// set up wrong (both pulls on) after it.
+static void serve(int jp = 0) {
 #ifdef _WIN32
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
@@ -1736,6 +2227,12 @@ static void serve() {
     tui_setup_chs(980, 10, 17);
     tui_mount();
     pump(2);
+#if ATABOY_BOARD_JUMPERS
+    if (jp == 1) { mock_jumper_fitted[0] = true; pump(2); }
+    if (jp == 2) { mock_pads.io[31] |= 0x4u; pump(2); }
+#else
+    (void)jp;
+#endif
     static char buf[4096];
     for (;;) {
         size_t n = fread(buf, 1, 1, stdin);        // one byte at a time: never waits for more than the host sent
@@ -1750,6 +2247,8 @@ static void serve() {
 int main(int argc, char **argv) {
     ide_hw_init();
     if (argc > 1 && !strcmp(argv[1], "serve")) { serve(); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "serve-jp1")) { serve(1); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "serve-pads")) { serve(2); return 0; }
     if (argc > 1 && !strcmp(argv[1], "core1")) test_core1_loop();          // does not return
     if (argc > 1 && !strcmp(argv[1], "core1-confirm")) test_core1_confirm(); // does not return
     if (argc > 1 && !strcmp(argv[1], "core1-tui")) test_core1_tui();       // does not return
@@ -1783,6 +2282,15 @@ int main(int argc, char **argv) {
     test_epoch_hooks();
     test_epoch_inside_ctrlg();
     test_setup_source();
+#if ATABOY_BOARD_JUMPERS
+    test_jp_pads_boot();
+    test_jp_pad_faults();
+    test_jp1_lock();
+    test_jp1_between_passes();
+    test_jp2_events();
+    test_jp2_changes_nothing();
+    test_tier_m_caps();
+#endif
     fresh("end");                                   // the last test's epoch cross-check
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;

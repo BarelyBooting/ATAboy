@@ -4,7 +4,8 @@
 // status.epoch (SPEC-v1 4.3) counts changes of: is_mounted, the geometry and
 // its setup source, write protect, Pipelined Reads, the device, the
 // no-IDENTIFY rules (Ctrl+G's and identify.forbid), the native mode, and
-// (later stages) the lease, the jumpers and the TUI lock. Stage 2 counts
+// from stage 3 JP1's state (board_jumpers.c; JP2's level is not counted,
+// SPEC-v1 4.3), and (stage 4) the lease and the TUI lock. Stage 2 counts
 // them where they happen: every place that stores one of them bumps the
 // counter right after the store (CTL_EPOCH_BUMP), on whichever core it runs.
 // Stage 1 compared a snapshot at each pass of ctl_task() instead, which

@@ -12,6 +12,9 @@
 #if ATABOY_CTL
 #include "ctl_state.h"
 #endif
+#if ATABOY_BOARD_JUMPERS
+#include "board_jumpers.h"
+#endif
 
 static uint8_t dev_base = 0xA0;   // 0xA0 = master, 0xB0 = slave
 
@@ -103,7 +106,18 @@ static struct {
     uint32_t idp_zero;          // ide_set_geometry with 0 heads or 0 sectors
 } refused;
 bool ide_mchs_no_identify(void) { return mchs_no_identify; }
+#if ATABOY_BOARD_JUMPERS
+// JP1, LOCK (palimpsest api/SPEC-v1.md 8.2, I-4): read live here, first, so
+// every check (WRITE(10) and MODE SENSE in usb.c, the top of
+// ide_write_sectors) sees a shunt fitted since the last one, and so the RAM
+// setting is forced on as soon as anything looks.
+bool ide_write_protected(void) {
+    bool jp1 = jp1_locked();
+    return jp1 || config.drive_write_protected || mchs_no_identify;
+}
+#else
 bool ide_write_protected(void) { return config.drive_write_protected || mchs_no_identify; }
+#endif
 
 #if ATABOY_CTL
 // identify.forbid (palimpsest api/SPEC-v1.md 4.12): a second no-IDENTIFY

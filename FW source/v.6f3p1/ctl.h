@@ -12,8 +12,10 @@
 // Stages 1 and 2 of the build (SPEC-v1 12.1): the descriptor, the transport
 // and framing, the parser, the envelope with ids and the replay table, the
 // Tier R ops, and Tier S, the ratchet (wp.on, pipelined.off and
-// identify.forbid on core 0; unmount and detach as jobs). The jumpers, the
-// lease and Tier M are later stages; hello lists them ABSENT (ctl_policy.h).
+// identify.forbid on core 0; unmount and detach as jobs). Stage 3, with
+// ATABOY_BOARD_JUMPERS: JP1 LOCK and JP2 PERMIT (board_jumpers.h), sampled
+// from ctl_task(). The lease and Tier M are stage 4; hello lists them ABSENT
+// (ctl_policy.h).
 #ifndef CTL_H
 #define CTL_H
 
