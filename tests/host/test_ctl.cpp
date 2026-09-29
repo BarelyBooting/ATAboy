@@ -2186,6 +2186,41 @@ static void test_lease() {
           "hello with a lease: %s", h["result"]["caps"]["mount"]["state"].s.c_str());
 }
 
+// The lease token is 128 bits, both halves, in order (review C HIGH-1). The
+// mock's RNG normally counts up, which makes "the token differs" true of any
+// token at all; here it is pinned to a known sequence instead, so a token built
+// from one half twice, or from 32 bits, or with a digit out of place, is wrong.
+static std::string token_of(uint64_t r0, uint64_t r1) {
+    char b[40];
+    snprintf(b, sizeof b, "%016llx%016llx", (unsigned long long)r0, (unsigned long long)r1);
+    return b;
+}
+static void test_token_entropy() {
+    fresh("stage 4: the token is the RNG's 128 bits, in order");
+    const uint64_t A = 0x0123456789abcdefull, B = 0xfedcba9876543210ull;
+    uint32_t id = 1;
+    rand_script = { A, B };
+    J r = open_lease(id++);
+    CHECK(r["outcome"].is("DONE") && lease_token == "0123456789abcdeffedcba9876543210" && rand_script.empty(),
+          "pinned draws A then B gave token %s", lease_token.c_str());
+    // Every one of the 32 digits follows its own nibble: flip that nibble in
+    // the draw, and exactly that digit of the token changes.
+    int wrong = 0;
+    for (int i = 0; i < 32; i++) {
+        J cl = ask1(reqt(id++, "session.close", lease_token, "{}"));
+        uint64_t r0 = A, r1 = B;
+        if (i < 16) r0 ^= 0xFull << (60 - 4 * i); else r1 ^= 0xFull << (60 - 4 * (i - 16));
+        rand_script = { r0, r1 };
+        J o = open_lease(id++);
+        std::string want = token_of(r0, r1);
+        if (!cl["outcome"].is("DONE") || !o["outcome"].is("DONE") || lease_token != want) {
+            wrong++;
+            printf("  digit %d: token %s, wanted %s\n", i, lease_token.c_str(), want.c_str());
+        }
+    }
+    CHECK(wrong == 0, "%d of 32 digit positions did not follow their nibble", wrong);
+}
+
 // The request first, then the act (4.14; owner, R-API-1 finding 3; I-26).
 static void test_presence() {
     fresh("stage 4: request first, then the act");
@@ -3483,6 +3518,7 @@ int main(int argc, char **argv) {
 #endif
 #if ATABOY_BOARD_JUMPERS
     test_lease();
+    test_token_entropy();
     test_presence();
     test_withdrawal();
     test_tier_m_arrival();

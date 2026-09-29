@@ -107,7 +107,13 @@ bool config_loaded_from_flash(void) { return loaded_from_flash_stub; }
 
 static uint64_t rand_value = 0x7c1e2a90d4b3f001ull;
 static uint64_t rand_calls = 0;     // the first call (dev.boot) is rand_value; each later one differs (lease tokens)
-uint64_t get_rand_64(void) { return rand_value + 0x9E3779B97F4A7C15ull * rand_calls++; }
+// A test that must pin the token to a known sequence queues the next draws
+// here (review C HIGH-1); they are used first, in order, then the counter.
+static std::deque<uint64_t> rand_script;
+uint64_t get_rand_64(void) {
+    if (!rand_script.empty()) { uint64_t v = rand_script.front(); rand_script.pop_front(); return v; }
+    return rand_value + 0x9E3779B97F4A7C15ull * rand_calls++;
+}
 static const char *board_serial = "E6614103E7A1B22C";
 void pico_get_unique_board_id_string(char *id_out, unsigned len) {
     snprintf(id_out, len, "%s", board_serial);
@@ -241,6 +247,7 @@ static void power_up() {
     obs_test_reset(0, 0);
     memset(&c, 0, sizeof c);
     rand_calls = 0;
+    rand_script.clear();
     pres_text[0] = 0; ctl_lease_gen = 0; ctl_lease_by = 0;
     job_tui_io = 0;
     memset(&ctl_job, 0, sizeof ctl_job);
