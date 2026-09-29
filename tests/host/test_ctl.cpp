@@ -2308,6 +2308,8 @@ static void test_token_near_miss() {
     rand_script = { 0x0123456789abcdefull, 0xfedcba9876543210ull };
     open_lease(1);
     std::string good = lease_token;
+    CHECK(good.size() == 32, "no token to take near misses of (%zu characters)", good.size());
+    if (good.size() != 32) return;              // a build that cannot open a session fails here, not by an exception
     std::vector<const char *> tier_m;
     for (int op = 0; op < CTL_OP_COUNT; op++) if (ctl_ops[op].tier == CTL_TIER_M) tier_m.push_back(ctl_ops[op].name);
     std::vector<std::pair<std::string, std::string>> nm = near_misses(good);
