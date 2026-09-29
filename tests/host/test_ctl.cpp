@@ -2393,6 +2393,35 @@ static void test_session_open_bounds() {
     CHECK(wrong == 0, "%d idle_s values handled wrongly", wrong);
 }
 
+// What the presence row says a JP2 act approves (review A MED-3): a
+// setup.ctrlg sent with then_mount also lets a mount follow without a second
+// act, so its row says "ctrlg+mount", not "setup.ctrlg". Same width, so the
+// row still fits its 37 cells at the longest id (presence_rows.py).
+static void test_presence_label() {
+    struct Case { const char *op; std::string args; const char *label; } cases[] = {
+        { "setup.ctrlg", ctrlg_args(), "setup.ctrlg" },
+        { "setup.ctrlg", ctrlg_args(980, 10, 17, "idp", "master", ",\"then_mount\":true"), "ctrlg+mount" },
+        { "setup.ctrlg", ctrlg_args(980, 10, 17, "idp", "master", ",\"then_mount\":false"), "setup.ctrlg" },
+        { "mount", "", "mount" },
+    };
+    for (auto &k : cases) {
+        fresh("stage 4: the presence row's label");
+        power_drive();
+        open_lease(1);
+        hold2(false, 400);
+        std::string args = k.args;
+        if (!strcmp(k.op, "mount")) { tui_setup_chs(980, 10, 17); args = mount_args("TUI_DETECT_NORMAL"); }
+        const uint32_t id = CTL_MAX_ID;                  // the longest id: the row at its widest
+        std::string line = reqt(id, k.op, lease_token, args);
+        send_only(line);
+        char t[CTL_PRESENCE_TEXT];
+        char want[64];
+        snprintf(want, sizeof want, "JP2? %s #%u %.8s", k.label, (unsigned)id, sha_hex(line).c_str());
+        bool shown = ctl_presence_text(t, sizeof t);
+        CHECK(c.pres.waiting && shown && !strcmp(t, want) && strlen(t) <= 37, "the row for %s: '%s' wanted '%s'", k.op, t, want);
+    }
+}
+
 // The request first, then the act (4.14; owner, R-API-1 finding 3; I-26).
 static void test_presence() {
     fresh("stage 4: request first, then the act");
@@ -3762,6 +3791,7 @@ int main(int argc, char **argv) {
     test_token_entropy();
     test_token_near_miss();
     test_session_open_bounds();
+    test_presence_label();
     test_presence();
     test_withdrawal();
     test_tier_m_arrival();

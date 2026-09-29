@@ -2130,6 +2130,11 @@ MUTANTS = [
      '    if (!ide_write_protected()) { *why = "WP_OFF"; return CTL_E_PRECONDITION; }\n', ''),
     ('API S4: the mount\'s write protect read from Features alone, not ide_write_protected()', 'ctl_job.c',
      'if (!ide_write_protected()) { *why = "WP_OFF"', 'if (!config.drive_write_protected) { *why = "WP_OFF"'),
+    # The presence row's label for a setup.ctrlg that lets a mount follow (review A MED-3).
+    ('API S4: the presence row does not say ctrlg+mount', 'ctl.c',
+     'c.pres.op == CTL_OP_SETUP_CTRLG && c.pres.m.then_mount ? "ctrlg+mount"', 'c.pres.op == CTL_OP_SETUP_CTRLG && 0 ? "ctrlg+mount"'),
+    ('API S4: the presence row says ctrlg+mount without then_mount', 'ctl.c',
+     'c.pres.op == CTL_OP_SETUP_CTRLG && c.pres.m.then_mount ? "ctrlg+mount"', 'c.pres.op == CTL_OP_SETUP_CTRLG ? "ctrlg+mount"'),
     # The API build without the jumpers (CMake's default). These edit code that
     # is compiled only there (the #else branches), so only run.sh's
     # test_ctl_nojumpers can kill them (review C MED-5).

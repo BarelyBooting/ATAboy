@@ -999,7 +999,11 @@ static void presence_publish(void) {
         char h8[9];
         for (int i = 0; i < 4; i++) { h8[2 * i] = hx[c.pres.digest[i] >> 4]; h8[2 * i + 1] = hx[c.pres.digest[i] & 15]; }
         h8[8] = 0;
-        snprintf(pres_text, sizeof pres_text, "JP2? %s #%lu %s", ctl_ops[c.pres.op].name, (unsigned long)c.pres.id, h8);
+        // A setup.ctrlg sent with then_mount approves a mount as well (one act,
+        // 4.14): the row says so, in the same 11 characters, so the longest
+        // text still fits its 37 cells (review A MED-3).
+        const char *label = c.pres.op == CTL_OP_SETUP_CTRLG && c.pres.m.then_mount ? "ctrlg+mount" : ctl_ops[c.pres.op].name;
+        snprintf(pres_text, sizeof pres_text, "JP2? %s #%lu %s", label, (unsigned long)c.pres.id, h8);
     } else {
         pres_text[0] = 0;
     }
