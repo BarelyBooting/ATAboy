@@ -1245,9 +1245,39 @@ static bool names_current_now(uint32_t id, const ctlj_doc_t *d, int args, uint32
     return true;
 }
 
+// detach's lease rule (owner ruling 2026-09-29 on review A MED-2, the
+// minimum): a token is asked for only while a lease is held and a set-up is
+// in place, the state a stranger's detach would destroy. A token that is
+// sent is checked as everywhere else (the last lease's is E_LEASE_REVOKED,
+// none held is E_NO_LEASE). unmount takes none: it stays the emergency
+// stop. Checked at arrival only, like the mount it names is compared again
+// at pickup but the lease is not: a detach queued before a lease opened
+// still runs. Refusals change nothing; the replay table keeps them.
+static bool detach_lease_ok(uint32_t id, const ctlj_doc_t *d) {
+    int t = ctlj_find(d, 0, "token");
+    if (t > 0) {
+        uint8_t by;
+        int e = lease_check(d, t, &by);
+        if (e == CTL_E_NONE) return true;
+        c.ex_by = by;
+        send_error(true, id, CTL_OUT_NOT_EXECUTED, CTL_RETRY_SAFE, (uint8_t)e,
+                   e == CTL_E_LEASE_REVOKED ? "that lease has ended" :
+                   e == CTL_E_NO_LEASE ? "no lease is held" : "not the lease's token", 0, "token", true);
+        return false;
+    }
+    if (!c.lease.held || ctl_setup_src == CTL_SRC_NONE) return true;
+    c.ex_client = c.lease.client;
+    c.ex_idle = true;
+    c.ex_idle_ms = lease_idle_left(now_ms());
+    send_error(true, id, CTL_OUT_NOT_EXECUTED, CTL_RETRY_SAFE, CTL_E_LEASE_HELD,
+               "another client holds the lease and a set-up is in place: detach needs its token", 0, "token", true);
+    return false;
+}
+
 static bool queue_job(int op, uint32_t id, const uint8_t digest[32], const ctlj_doc_t *d, int args) {
     uint32_t ms = 0, ep = 0;
     bool has_e = false;
+    if (op == CTL_OP_DETACH && !detach_lease_ok(id, d)) return false;
     if (op == CTL_OP_TASKFILE_SNAPSHOT && !taskfile_arrival_ok(id)) return false;
     if ((op == CTL_OP_UNMOUNT || op == CTL_OP_DETACH) && !names_current_now(id, d, args, &ms, &has_e, &ep)) return false;
     if (ctl_job.state != CTL_JOB_EMPTY) { refuse(true, id, CTL_E_INFLIGHT, "another job is in flight", 0); return false; }

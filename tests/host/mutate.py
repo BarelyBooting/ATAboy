@@ -2202,6 +2202,30 @@ MUTANTS = [
      '    ctlw_str(w, "jp1", "NOT_BUILT");', '    ctlw_str(w, "jp1", "OPEN");'),
     ('API nojumpers: selftest says the jumpers are OK', 'ctl.c',
      '    ctlw_str(w, "jumpers", "NOT_BUILT");', '    ctlw_str(w, "jumpers", "OK");'),
+    # detach needs the lease token while a lease is held and a set-up is in
+    # place (owner ruling 2026-09-29, review A MED-2).
+    ('API S4: detach needs no token under a held lease', 'ctl.c',
+     '    if (!c.lease.held || ctl_setup_src == CTL_SRC_NONE) return true;\n',
+     '    if (1) return true;\n'),
+    ('API S4: detach asks for the token with no set-up in place', 'ctl.c',
+     '    if (!c.lease.held || ctl_setup_src == CTL_SRC_NONE) return true;\n',
+     '    if (!c.lease.held) return true;\n'),
+    ('API S4: detach asks for the token with no lease held', 'ctl.c',
+     '    if (!c.lease.held || ctl_setup_src == CTL_SRC_NONE) return true;\n',
+     '    if (ctl_setup_src == CTL_SRC_NONE) return true;\n'),
+    ('API S4: detach takes a wrong token', 'ctl.c',
+     '        if (e == CTL_E_NONE) return true;\n        c.ex_by = by;\n',
+     '        if (e == CTL_E_NONE || e == CTL_E_LEASE_INVALID) return true;\n        c.ex_by = by;\n'),
+    ('API S4: unmount needs the token too', 'ctl.c',
+     '    if (op == CTL_OP_DETACH && !detach_lease_ok(id, d)) return false;\n',
+     '    if ((op == CTL_OP_DETACH || op == CTL_OP_UNMOUNT) && !detach_lease_ok(id, d)) return false;\n'),
+    ('API S4: detach is not asked for its token at all', 'ctl.c',
+     '    if (op == CTL_OP_DETACH && !detach_lease_ok(id, d)) return false;\n', ''),
+    ('API S4: every op may carry a token', 'ctl_policy.c',
+     '    bool optional = r->op == CTL_OP_DETACH;\n', '    bool optional = true;\n'),
+    ('API S4: a token sent with detach is not checked', 'ctl.c',
+     '    int t = ctlj_find(d, 0, "token");\n    if (t > 0) {\n        uint8_t by;',
+     '    int t = ctlj_find(d, 0, "token");\n    if (t > 0) return true;\n    if (t > 0) {\n        uint8_t by;'),
 ]
 
 

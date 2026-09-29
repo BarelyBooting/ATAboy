@@ -2173,6 +2173,83 @@ static J one_answer(bool *ok = nullptr) {
 static J status4(uint32_t id) { return ask1(req(id, "status"), nullptr, 10); }
 static void power_drive() { sim.nsect = 980u * 10 * 17; }
 
+// detach needs the lease token while someone else's lease is held and a
+// set-up is in place (owner ruling 2026-09-29 on review A MED-2, option "A's
+// minimum"); unmount stays tokenless, the emergency stop. Both builds.
+static void test_detach_lease() {
+    fresh("stage 4: detach under a held lease");
+    tui_setup_chs(980, 10, 17);
+    open_lease(1);
+    const std::string T = lease_token;
+    CHECK(c.lease.held && ctl_setup_src != CTL_SRC_NONE, "the lease and the set-up are in place");
+    std::string d0 = state2();
+    // Tokenless: refused, the lease holder's name and idle time given, nothing changed, nothing queued.
+    J r = ask1(req(2, "detach", named(0).c_str()));
+    CHECK(is_refusal(r, "E_LEASE_HELD") && r["retry"].is("SAFE") && r["err"]["client"].is("test") &&
+          r["err"]["idle_ms_left"].n > 0 && r["err"]["field"].is("token") && r["err"]["msg"].s.size() > 0,
+          "tokenless detach: %s outcome %s", r["err"]["code"].s.c_str(), r["outcome"].s.c_str());
+    CHECK(state2() == d0 && config.cyls == 980 && ctl_setup_src == CTL_SRC_TUI_DETECT_NORMAL && ctl_job.state == CTL_JOB_EMPTY &&
+          c.lease.held, "the refused detach changed something");
+    // The refusal is what the replay table keeps.
+    std::vector<std::string> rr = ask(req(2, "detach", named(0).c_str()));
+    J rj;
+    CHECK(rr.size() == 1 && parse_response(rr[0], rj) && rj["replayed"].b && rj["err"]["code"].is("E_LEASE_HELD") &&
+          config.cyls == 980, "the resent refusal");
+    // A wrong token, a token one digit short, and a token where unmount takes none.
+    std::string bad = T;
+    bad[31] = bad[31] == '0' ? '1' : '0';
+    r = ask1(reqt(3, "detach", bad, named(0)));
+    CHECK(is_refusal(r, "E_LEASE_INVALID") && config.cyls == 980, "a wrong token: %s", r["err"]["code"].s.c_str());
+    r = ask1(reqt(4, "detach", T.substr(0, 31), named(0)));
+    CHECK(is_refusal(r, "E_LEASE_INVALID") && config.cyls == 980, "a short token: %s", r["err"]["code"].s.c_str());
+    r = ask1(reqt(5, "unmount", T, named(0)));
+    CHECK(is_refusal(r, "E_SCHEMA") && r["err"]["field"].is("token"), "unmount takes no token: %s", r["err"]["code"].s.c_str());
+    // The token still names the mount: a stale one is E_STALE, not a clear.
+    r = ask1(reqt(6, "detach", T, named(9)));
+    CHECK(is_refusal(r, "E_STALE") && config.cyls == 980, "a right token, a wrong mount: %s", r["err"]["code"].s.c_str());
+    // The holder's own detach, with the token.
+    r = ask1(reqt(7, "detach", T, named(0)));
+    CHECK(r["outcome"].is("DONE") && r["result"]["detached"].b && config.cyls == 0 && ctl_setup_src == CTL_SRC_NONE,
+          "detach with the token: %s %s", r["outcome"].s.c_str(), r["err"]["code"].s.c_str());
+    // unmount stays tokenless (the emergency stop), lease held, mounted.
+    fresh("stage 4: unmount under a held lease");
+    tui_setup_chs(980, 10, 17);
+    tui_mount();
+    open_lease(1);
+    r = ask1(req(2, "unmount", named(1).c_str()));
+    CHECK(r["outcome"].is("DONE") && !is_mounted && c.lease.held, "tokenless unmount: %s %s", r["outcome"].s.c_str(),
+          r["err"]["code"].s.c_str());
+    // A mounted set-up is a set-up in place: detach is refused tokenless there too.
+    fresh("stage 4: detach, mounted, under a held lease");
+    tui_setup_chs(980, 10, 17);
+    tui_mount();
+    open_lease(1);
+    r = ask1(req(2, "detach", named(1).c_str()));
+    CHECK(is_refusal(r, "E_LEASE_HELD") && is_mounted && config.cyls == 980, "mounted, tokenless detach: %s", r["err"]["code"].s.c_str());
+    // No set-up in place: nothing for detach to clear, so no token is asked for.
+    fresh("stage 4: detach, lease held, no set-up");
+    open_lease(1);
+    CHECK(c.lease.held && ctl_setup_src == CTL_SRC_NONE, "the lease, no set-up");
+    r = ask1(req(2, "detach", named(0).c_str()));
+    CHECK(r["outcome"].is("DONE"), "detach with nothing set up: %s %s", r["outcome"].s.c_str(), r["err"]["code"].s.c_str());
+    // No lease: as before, tokenless. A token when none is held is E_NO_LEASE; the ended lease's is E_LEASE_REVOKED.
+    fresh("stage 4: detach, no lease");
+    tui_setup_chs(980, 10, 17);
+    r = ask1(req(2, "detach", named(0).c_str()));
+    CHECK(r["outcome"].is("DONE") && config.cyls == 0, "tokenless detach, no lease: %s %s", r["outcome"].s.c_str(), r["err"]["code"].s.c_str());
+    tui_setup_chs(980, 10, 17);
+    open_lease(3);
+    const std::string T2 = lease_token;
+    ask1(reqt(4, "session.close", T2, "{}"));
+    CHECK(!c.lease.held, "the lease is closed");
+    r = ask1(reqt(5, "detach", T2, named(0)));
+    CHECK(is_refusal(r, "E_LEASE_REVOKED") && config.cyls == 980, "the ended lease's token: %s", r["err"]["code"].s.c_str());
+    r = ask1(reqt(6, "detach", std::string(32, 'a'), named(0)));
+    CHECK(is_refusal(r, "E_NO_LEASE") && config.cyls == 980, "a token, no lease: %s", r["err"]["code"].s.c_str());
+    r = ask1(req(7, "detach", named(0).c_str()));
+    CHECK(r["outcome"].is("DONE") && config.cyls == 0, "tokenless detach after the lease ended: %s", r["err"]["code"].s.c_str());
+}
+
 #if ATABOY_BOARD_JUMPERS
 // The lease (4.13, 6.1), both ways.
 static void test_lease() {
@@ -2971,7 +3048,8 @@ static void test_pair() {
     CHECK(is_refusal(other, "E_STALE") && !is_mounted && credit_live(now_ms()), "another geometry: %s", other["err"]["code"].s.c_str());
     // An unmount or detach naming another mount changes nothing (I-27): the credit stays (X68).
     J u1 = ask1(req(4, "unmount", named(ctl_mount_seq + 1).c_str()));
-    J d1 = ask1(req(5, "detach", named(ctl_mount_seq + 2).c_str()));
+    // (detach carries the lease's token here: a tokenless one is refused for the lease first, test_detach_lease.)
+    J d1 = ask1(reqt(5, "detach", lease_token, named(ctl_mount_seq + 2)));
     CHECK(is_refusal(u1, "E_STALE") && is_refusal(d1, "E_STALE") && credit_live(now_ms()), "a mount-name mismatch: %s %s, credit %d",
           u1["err"]["code"].s.c_str(), d1["err"]["code"].s.c_str(), (int)credit_live(now_ms()));
 }
@@ -3974,6 +4052,7 @@ int main(int argc, char **argv) {
 #else
     test_tier_m_no_jumpers();
 #endif
+    test_detach_lease();
     fresh("end");                                   // the last test's epoch cross-check
     printf("%d checks, %d failed\n", checks, failures);
     return failures > 255 ? 255 : failures;

@@ -293,7 +293,12 @@ int ctl_check_request(const ctlj_doc_t *d, ctl_req_t *r) {
 int ctl_check_args(const ctlj_doc_t *d, ctl_req_t *r) {
     int token = ctlj_find(d, 0, "token");
     // A token only where one is needed, so it is never sent anywhere else (3.3).
-    if (ctl_op_needs_token(r->op) != (token > 0)) { r->field = "token"; return CTL_E_SCHEMA; }
+    // The one op that may carry one without needing one is detach (owner
+    // ruling 2026-09-29, review A MED-2): the token of the lease it is under.
+    // Its presence is not the schema's to decide; ctl.c (detach_lease_ok)
+    // asks for it exactly while it matters.
+    bool optional = r->op == CTL_OP_DETACH;
+    if (!optional && ctl_op_needs_token(r->op) != (token > 0)) { r->field = "token"; return CTL_E_SCHEMA; }
     if (token > 0) {
         if (d->node[token].type != CTLJ_STR) { r->field = "token"; return CTL_E_SCHEMA; }
         r->token = token;
