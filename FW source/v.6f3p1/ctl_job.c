@@ -201,6 +201,12 @@ int ctl_mreq_check(uint8_t op, const ctl_mreq_t *m, const char **field, const ch
     if ((src == CTL_SRC_TUI_CTRLG_NATIVE || src == CTL_SRC_API_CTRLG_NATIVE) && !ide_manual_chs_native_active()) {
         *why = "MCHS_NEEDED"; return CTL_E_PRECONDITION;                            // the TUI's MCHS_NEEDED
     }
+    // A recovery drive is never host-writable through the API (review A
+    // MED-1): the mount needs write protect effective (ide_write_protected:
+    // JP1, Features' setting, or a Ctrl+G drive), at arrival and again at
+    // pickup. Only ever refuses more. A writable mount is the human's, at
+    // the setup screen.
+    if (!ide_write_protected()) { *why = "WP_OFF"; return CTL_E_PRECONDITION; }
     // The expect, compared and set (4.14): any difference is stale.
     *field = "expect";
     if (m->src != src || m->lba != config.use_lba_mode || m->dev_base != config.dev_base) return CTL_E_STALE;

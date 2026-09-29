@@ -2958,6 +2958,62 @@ static void test_tier_m_no_terminal() {
     cdc_connected = false;
 }
 
+// mount refuses while write protect is off (review A MED-1): a recovery drive
+// is never host-writable through the API. Arrival and pickup, both ways; the
+// pair's mount goes through because a Ctrl+G drive is write protected whatever
+// Features says (ide_write_protected).
+static void test_mount_wp_off() {
+    fresh("stage 4: mount with write protect off, at arrival");
+    power_drive();
+    open_lease(1);
+    tui_setup_chs(980, 10, 17);
+    hold2(false, 400);
+    human_wp(false);
+    pump(2);
+    J r = ask1(reqt(2, "mount", lease_token, mount_args("TUI_DETECT_NORMAL")));
+    CHECK(is_refusal(r, "E_PRECONDITION") && r["err"]["why"].is("WP_OFF") && !c.pres.waiting && !is_mounted &&
+          ctl_job.state == CTL_JOB_EMPTY, "WP off at arrival: %s %s", r["err"]["code"].s.c_str(), r["err"]["why"].s.c_str());
+    // Write protect on: the same request waits for its act and mounts.
+    human_wp(true);
+    pump(2);
+    send_only(reqt(3, "mount", lease_token, mount_args("TUI_DETECT_NORMAL")));
+    CHECK(c.pres.waiting && c.pres.op == CTL_OP_MOUNT, "WP on: the mount waits");
+    hold2(true, 250);
+    J ok = one_answer();
+    CHECK(ok["outcome"].is("DONE") && is_mounted && ide_write_protected(), "WP on: mounted, %s", ok["err"]["code"].s.c_str());
+
+    // Turned off after the request was approved, before its pickup.
+    fresh("stage 4: mount with write protect off, at pickup");
+    power_drive();
+    open_lease(1);
+    tui_setup_chs(980, 10, 17);
+    hold2(false, 400);
+    send_only(reqt(2, "mount", lease_token, mount_args("TUI_DETECT_NORMAL")));
+    core1_runs = false;
+    hold2(true, 250);
+    CHECK(ctl_job.state == CTL_JOB_QUEUED, "the mount not queued");
+    human_wp(false);
+    pump(3);
+    core1_runs = true;
+    pump(20);
+    J p = one_answer();
+    CHECK(is_refusal(p, "E_PRECONDITION") && p["err"]["why"].is("WP_OFF") && !is_mounted && ctl_job.state == CTL_JOB_EMPTY,
+          "WP off at pickup: %s %s", p["err"]["code"].s.c_str(), p["err"]["why"].s.c_str());
+
+    // The pair with Features' write protect off: the Ctrl+G drive is protected anyway.
+    fresh("stage 4: the pair with write protect off in Features");
+    open_lease(1);
+    human_wp(false);
+    pump(2);
+    pair_setup(2);
+    J a = one_answer();
+    CHECK(a["outcome"].is("DONE") && a["result"]["mount_credit"].b && !config.drive_write_protected && ide_write_protected(),
+          "the set-up: %s", a["outcome"].s.c_str());
+    J m = ask1(reqt(3, "mount", lease_token, mount_args()), nullptr, 20);
+    CHECK(m["outcome"].is("DONE") && m["result"]["used_credit"].b && is_mounted && ide_write_protected(), "the pair's mount: %s %s",
+          m["outcome"].s.c_str(), m["err"]["why"].s.c_str());
+}
+
 // The lease ends while its set-up runs (Q3, X51): the set-up still ends
 // (a running job is not cancelled, 6.1), and earns no credit.
 static void test_credit_lease_ends_during_setup() {
@@ -3726,6 +3782,7 @@ int main(int argc, char **argv) {
     test_lease_end_at_pickup();
     test_presence_wrap();
     test_credit_mount_only();
+    test_mount_wp_off();
     test_ctrlg_layers();
 #else
     test_tier_m_no_jumpers();

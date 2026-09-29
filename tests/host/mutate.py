@@ -2125,6 +2125,11 @@ MUTANTS = [
      '        m->then_mount = n > 0 && d->node[n].num;', '        m->then_mount = false;'),
     ('API S4: setup.ctrlg device slave read as master', 'ctl_policy.c',
      '        m->dev_base = one_of(d, args, "device", dev_names, 2) == 1 ? 0xB0 : 0xA0;', '        m->dev_base = 0xA0;'),
+    # mount needs write protect in effect (review A MED-1).
+    ('API S4: mount allowed with write protect off', 'ctl_job.c',
+     '    if (!ide_write_protected()) { *why = "WP_OFF"; return CTL_E_PRECONDITION; }\n', ''),
+    ('API S4: the mount\'s write protect read from Features alone, not ide_write_protected()', 'ctl_job.c',
+     'if (!ide_write_protected()) { *why = "WP_OFF"', 'if (!config.drive_write_protected) { *why = "WP_OFF"'),
     # The API build without the jumpers (CMake's default). These edit code that
     # is compiled only there (the #else branches), so only run.sh's
     # test_ctl_nojumpers can kill them (review C MED-5).
