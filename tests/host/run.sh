@@ -48,6 +48,23 @@ else
     echo "transcripts Off and On: 1 checks, 1 failed"
     exit 1
 fi
+# ...and against the transcript the tree before the Control API made (6bb7da4),
+# kept as a hash (review B M-1): "the same READ(10) and WRITE(10) as before" was
+# asserted only Off against On of the same build. A change that is meant to
+# alter what the tests send the drive has to replace golden-transcript.sha256
+# (check_identity.sh prints the new hash and compares the images too). Only
+# with SAT on, which is the transcript the hash is of.
+if [ -n "$smart" ] && [ -f "$here/golden-transcript.sha256" ]; then
+    want=$(cut -d' ' -f1 "$here/golden-transcript.sha256")
+    got=$(sha256sum "$out/transcript-off.txt" | cut -d' ' -f1)
+    if [ "$got" = "$want" ]; then
+        echo "transcript against the golden of 6bb7da4: 1 checks, 0 failed"
+    else
+        echo "the transcript is $got, the golden of 6bb7da4 is $want"
+        echo "transcript against the golden of 6bb7da4: 1 checks, 1 failed"
+        exit 1
+    fi
+fi
 if [ -n "$smart" ]; then
     ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function $defs \
         -I "$here/mock" -I "$here" -I "$src" \

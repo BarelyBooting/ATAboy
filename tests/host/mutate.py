@@ -2216,7 +2216,7 @@ MUTANTS = [
 # "core1", "core1-confirm", "core1-tui"), test_config_save, ctl_fuzz, and
 # ctl_e2e.py, which runs test_ctl, presence_rows.py, and test_ctl built without
 # the jumpers (test_ctl_nojumpers, the last).
-PROGRAMS = ['test_read', 'test_read_pipelined', 'transcripts', 'test_read_shipping', 'test_fwupdate', 'test_fwupdate_smart', 'test_manual_chs',
+PROGRAMS = ['test_read', 'test_read_pipelined', 'transcripts', 'transcript_golden', 'test_read_shipping', 'test_fwupdate', 'test_fwupdate_smart', 'test_manual_chs',
             'test_manual_chs', 'test_usb_desc', 'test_pio_timing', 'test_usb_layout0', 'test_usb_layout1',
             'test_ctl', 'test_ctl', 'test_ctl', 'test_ctl', 'test_config_save', 'ctl_fuzz', 'test_ctl', 'presence_rows',
             'test_ctl_nojumpers']
