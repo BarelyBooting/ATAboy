@@ -1480,7 +1480,7 @@ static void handle_line(uint32_t len) {
                        "this id was used for another request", 0, "id", true);
             return;
         case CTL_RPV_STALE:
-            refuse(true, r.id, CTL_E_STALE_ID, "id not above max_mutating_id", "id");
+            refuse(true, r.id, CTL_E_STALE_ID, "id not above max_mutating_id; an earlier send of it may have run: read status, do not resend under a new id", "id");
             return;
         case CTL_RPV_LOST:
             send_error(true, r.id, CTL_OUT_NOT_EXECUTED, CTL_RETRY_AFTER_STATUS, CTL_E_BUSY_STATE,
