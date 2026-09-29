@@ -2129,17 +2129,9 @@ MUTANTS = [
     # is compiled only there (the #else branches), so only run.sh's
     # test_ctl_nojumpers can kill them (review C MED-5).
     ('API nojumpers: Tier M not refused for the missing jumpers', 'ctl.c',
-     '#else
-    *why = "JUMPERS_UNSUPPORTED";
-#endif
-    return true;', '#else
-    return false;
-#endif
-    return true;'),
+     '#else\n    *why = "JUMPERS_UNSUPPORTED";\n#endif\n    return true;', '#else\n    return false;\n#endif\n    return true;'),
     ('API nojumpers: hello says a Tier M op is OPERATIONAL', 'ctl_policy.c',
-     '        *state = CTL_CAP_LOCKED; *why = "JUMPERS_UNSUPPORTED";
-    } else {', '        *state = CTL_CAP_OPERATIONAL;
-    } else {'),
+     '        *state = CTL_CAP_LOCKED; *why = "JUMPERS_UNSUPPORTED";\n    } else {', '        *state = CTL_CAP_OPERATIONAL;\n    } else {'),
     ('API nojumpers: status shows JP1 as OPEN', 'ctl.c',
      '    ctlw_str(w, "jp1", "NOT_BUILT");', '    ctlw_str(w, "jp1", "OPEN");'),
     ('API nojumpers: selftest says the jumpers are OK', 'ctl.c',
