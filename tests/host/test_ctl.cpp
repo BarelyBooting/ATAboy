@@ -2221,6 +2221,75 @@ static void test_token_entropy() {
     CHECK(wrong == 0, "%d of 32 digit positions did not follow their nibble", wrong);
 }
 
+// A token that is nearly the token is not the token (review C HIGH-2): the last
+// digit, the first, one in the middle, a prefix, a length of 31 or 33, and
+// upper case, each to session.close and to every Tier M op, and against the
+// last lease's token after it ended. All refused, the lease untouched, nothing
+// queued and nothing sent to the drive.
+static std::vector<std::pair<std::string, std::string>> near_misses(const std::string &tk) {
+    auto other = [](char ch) { return ch == '0' ? '1' : '0'; };
+    std::vector<std::pair<std::string, std::string>> v;
+    std::string s = tk;
+    s[31] = other(s[31]); v.push_back({ "last digit changed", s });
+    s = tk; s[0] = other(s[0]); v.push_back({ "first digit changed", s });
+    s = tk; s[16] = other(s[16]); v.push_back({ "digit 16 changed", s });
+    v.push_back({ "length 31", tk.substr(0, 31) });
+    v.push_back({ "length 33", tk + "0" });
+    v.push_back({ "first 8 chars", tk.substr(0, 8) });
+    v.push_back({ "first 16 chars", tk.substr(0, 16) });
+    v.push_back({ "last 16 chars", tk.substr(16) });
+    std::string up = tk;
+    for (char &ch : up) if (ch >= 'a' && ch <= 'f') ch = (char)(ch - 32);
+    if (up != tk) v.push_back({ "upper case", up });
+    return v;
+}
+static std::string tier_m_args(const char *op) {
+    return !strcmp(op, "setup.ctrlg") ? ctrlg_args() : !strcmp(op, "mount") ? mount_args() : "{}";
+}
+static void test_token_near_miss() {
+    fresh("stage 4: a near-miss token");
+    power_drive();
+    rand_script = { 0x0123456789abcdefull, 0xfedcba9876543210ull };
+    open_lease(1);
+    std::string good = lease_token;
+    std::vector<const char *> tier_m;
+    for (int op = 0; op < CTL_OP_COUNT; op++) if (ctl_ops[op].tier == CTL_TIER_M) tier_m.push_back(ctl_ops[op].name);
+    std::vector<std::pair<std::string, std::string>> nm = near_misses(good);
+    CHECK(tier_m.size() >= 2 && nm.size() >= 9, "population: %zu Tier M ops, %zu near-misses", tier_m.size(), nm.size());
+    uint32_t id = 10;
+    int sent = sim.commands;
+    int bad = 0;
+    auto expect = [&](const char *what, const std::string &tok, const char *op, const char *code) {
+        J r = ask1(reqt(id++, op, tok, !strcmp(op, "session.close") ? "{}" : tier_m_args(op)));
+        bool ok = is_refusal(r, code) && !c.pres.waiting && ctl_job.state == CTL_JOB_EMPTY && sim.commands == sent;
+        if (!ok) { bad++; printf("  %s to %s: %s %s\n", what, op, r["outcome"].s.c_str(), r["err"]["code"].s.c_str()); }
+    };
+    for (auto &m : nm) {
+        expect(m.first.c_str(), m.second, "session.close", "E_LEASE_INVALID");
+        for (const char *op : tier_m) expect(m.first.c_str(), m.second, op, "E_LEASE_INVALID");
+    }
+    CHECK(bad == 0 && c.lease.held, "%d near-miss refusals wrong (or the lease was lost)", bad);
+    // The real token still works, so the refusals above were the token's, not another gate's.
+    J ok = ask1(reqt(id++, "session.close", good, "{}"));
+    CHECK(ok["outcome"].is("DONE"), "the real token: %s", ok["err"]["code"].s.c_str());
+    // Against the old token: with no lease held (E_NO_LEASE), then with a new
+    // one (E_LEASE_INVALID). Never E_LEASE_REVOKED, which is the old token's alone.
+    bad = 0;
+    for (auto &m : nm) {
+        expect(m.first.c_str(), m.second, "session.close", "E_NO_LEASE");
+        for (const char *op : tier_m) expect(m.first.c_str(), m.second, op, "E_NO_LEASE");
+    }
+    CHECK(bad == 0, "%d near-misses of the old token wrong with no lease", bad);
+    rand_script = { 0x1122334455667788ull, 0x99aabbccddeeff00ull };
+    open_lease(id++);
+    CHECK(lease_token != good, "the new lease has another token");
+    for (auto &m : nm) {
+        expect(m.first.c_str(), m.second, "session.close", "E_LEASE_INVALID");
+        for (const char *op : tier_m) expect(m.first.c_str(), m.second, op, "E_LEASE_INVALID");
+    }
+    CHECK(bad == 0 && c.lease.held, "%d near-misses of the old token wrong under a new lease", bad);
+}
+
 // The request first, then the act (4.14; owner, R-API-1 finding 3; I-26).
 static void test_presence() {
     fresh("stage 4: request first, then the act");
@@ -3519,6 +3588,7 @@ int main(int argc, char **argv) {
 #if ATABOY_BOARD_JUMPERS
     test_lease();
     test_token_entropy();
+    test_token_near_miss();
     test_presence();
     test_withdrawal();
     test_tier_m_arrival();
