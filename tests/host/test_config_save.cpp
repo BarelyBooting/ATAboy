@@ -65,6 +65,20 @@ static void baseline() {
     config.cyls = 980; config.heads = 10; config.spt = 17; config.lba_sectors = 166600;
     config.dev_base = 0xA0; config.pipelined_reads = true;
 }
+// Every field but magic and crc, one by one. This used to be a memcmp of the
+// whole struct, which also compared its padding bytes (after use_lba_mode,
+// before lba_sectors, at the end): copies of a struct need not carry them, so
+// with -O1 on g++ 16.2 the same test failed 6 checks at unchanged firmware
+// (-O0 passed). The static_assert is here so that a field added to config_t
+// is added to this list too.
+static_assert(sizeof(config_t) == 32, "config_t changed: add the new field to same_settings()");
+static bool same_settings(const config_t &x, const config_t &y) {
+    return x.main_selected == y.main_selected && x.feat_selected == y.feat_selected &&
+           x.drive_write_protected == y.drive_write_protected && x.auto_mount == y.auto_mount &&
+           x.iordy_enabled == y.iordy_enabled && x.intrq_enabled == y.intrq_enabled &&
+           x.use_lba_mode == y.use_lba_mode && x.cyls == y.cyls && x.heads == y.heads && x.spt == y.spt &&
+           x.lba_sectors == y.lba_sectors && x.dev_base == y.dev_base && x.pipelined_reads == y.pipelined_reads;
+}
 static void wp_on_to(config_t *k) { k->drive_write_protected = true; }        // ctl.c op_wp_on's store
 static void pipelined_off_to(config_t *k) { k->pipelined_reads = false; }     // ctl.c op_pipelined_off's store
 static void wp_on() { wp_on_to(&config); }
@@ -113,10 +127,7 @@ int main() {
             // The value before or after the store, and nothing else changed.
             config_t after = before;
             st.to(&after);
-            config_t sv = saved; sv.magic = 0; sv.crc = 0;
-            config_t b = before, a = after;
-            b.magic = a.magic = 0; b.crc = a.crc = 0;
-            CHECK(memcmp(&sv, &b, sizeof sv) == 0 || memcmp(&sv, &a, sizeof sv) == 0,
+            CHECK(same_settings(saved, before) || same_settings(saved, after),
                   "%s stored at point %d: the sector is neither the settings before nor after it", st.name, k);
         }
     }
