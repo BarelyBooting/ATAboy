@@ -3803,7 +3803,34 @@ static void test_core1_tui() {
         is_mounted = false; hooked();
         current_screen = SCREEN_MAIN; needs_full_redraw = true;
     });
-    idle_after_ns = (base + T(t10 + 2.5)) * 1000;
+    // 11. Every Debug key on the Debug screen with a drive mounted, through
+    // the real loop (review B M-2): the one place the API build's setup screen
+    // differs from the old one on a key the old one ran (README items 33, 34,
+    // 36). A drive can be mounted under an open Debug screen only by a race
+    // (an API mount leaves the screen on MOUNTED), so the state is set here,
+    // as in part 10. Each key says so and sends nothing.
+    static int cmds11, hw11, regs11;
+    static size_t mark11;
+    at(B(t10 + 2.2), [] {
+        is_mounted = true; hooked();
+        current_screen = SCREEN_DEBUG; needs_full_redraw = true;
+        cmds11 = sim.commands; hw11 = sim.hw_resets; regs11 = sim.reg_writes; mark11 = tty.size();
+    });
+    key_at(B(t10 + 2.6), "r");
+    key_at(B(t10 + 3.0), "i");
+    key_at(B(t10 + 3.4), "t");
+    key_at(B(t10 + 3.8), "e");
+    key_at(B(t10 + 4.2), "s");
+    at(B(t10 + 4.6), [] {
+        int shown = 0;
+        for (size_t p = tty.find(API_MOUNTED_TEXT, mark11); p != std::string::npos; p = tty.find(API_MOUNTED_TEXT, p + 1)) shown++;
+        CHECK(shown == 5 && sim.commands == cmds11 && sim.hw_resets == hw11 && sim.reg_writes == regs11 && current_screen == SCREEN_DEBUG &&
+              is_mounted, "Debug keys while mounted: refusal shown %d times, %d commands, %d resets, %d register writes, screen %d", shown,
+              sim.commands - cmds11, sim.hw_resets - hw11, sim.reg_writes - regs11, current_screen);
+        is_mounted = false; hooked();
+        current_screen = SCREEN_MAIN; needs_full_redraw = true;
+    });
+    idle_after_ns = (base + T(t10 + 5.0)) * 1000;
     on_idle = core1_tui_done;
     core0_in_loop = true;
     core1_entry();
