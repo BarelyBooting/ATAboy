@@ -9,6 +9,14 @@ reported as such and makes the run fail, so it is never counted as killed.
 
     python tests/host/mutate.py            (CXX picks the compiler, default g++)
     python tests/host/mutate.py WORD ...   only the mutants whose name contains a WORD
+    --shard i/n                            every n-th chosen mutant from i
+    --timeout SECONDS                      per run of run.sh (default 900)
+
+Three results are kept apart and never added together: KILLED (a check
+failed, or a program crashed after building), SURVIVED, and the two states
+that prove nothing, TIMEOUT (run.sh did not finish in time; a hang is not a
+detection, review C MED-2) and NOT RUN (text not found, build failure, a wrong
+number of summary lines). TIMEOUT and NOT RUN each make the exit code non-zero.
 """
 import os, shutil, subprocess, sys, tempfile
 
@@ -2135,17 +2143,45 @@ PROGRAMS = ['test_read', 'test_read_pipelined', 'transcripts', 'test_read_shippi
             'test_ctl', 'test_ctl', 'test_ctl', 'test_ctl', 'test_config_save', 'ctl_fuzz', 'test_ctl', 'presence_rows']
 
 
+TIMEOUT_S = 900
+
+
 def run_tests(srcdir, outdir):
+    """run.sh on srcdir; None if it did not finish within TIMEOUT_S.
+
+    On Windows subprocess.run kills only the direct child (sh) on a timeout,
+    and the test program sh started keeps the output pipes open, so the
+    following communicate() waited for it, for ever if it hung (review C
+    MED-1, reproduced: 40 s for a 3 s timeout). So: Popen, and on a timeout
+    kill the whole tree (taskkill /F /T on Windows, the process group
+    elsewhere), then reap.
+    """
     env = dict(os.environ, OUT=outdir)
+    posix = os.name != 'nt'
+    p = subprocess.Popen(['sh', os.path.join(HERE, 'run.sh'), srcdir], env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         encoding='utf-8', errors='replace',    # the TUI's box characters are UTF-8
+                         start_new_session=posix)
     try:
-        return subprocess.run(['sh', os.path.join(HERE, 'run.sh'), srcdir], env=env,
-                              capture_output=True, text=True, timeout=900,
-                              encoding='utf-8', errors='replace')   # the TUI's box characters are UTF-8
+        out, err = p.communicate(timeout=TIMEOUT_S)
     except subprocess.TimeoutExpired:
+        if posix:
+            import signal
+            try: os.killpg(p.pid, signal.SIGKILL)
+            except OSError: p.kill()
+        else:
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(p.pid)], capture_output=True)   # sh AND what it started
+        p.communicate()         # the pipes are closed now, so this returns
         return None
+    return subprocess.CompletedProcess(p.args, p.returncode, out, err)
 
 
 def main():
+    global TIMEOUT_S
+    args = sys.argv[1:]
+    if '--timeout' in args:
+        i = args.index('--timeout'); TIMEOUT_S = int(args[i + 1]); del args[i:i + 2]
+    sys.argv[1:] = args
     base = run_tests(SRC, tempfile.mkdtemp(prefix='ataboy-host-'))
     if base is None:
         print('the unmutated sources timed out'); return 2
@@ -2153,7 +2189,12 @@ def main():
     print(f'unmutated: rc={base.returncode}  {last}')
     if base.returncode != 0:
         print('the unmutated sources must pass first'); return 2
-    bad_setup, survived, killed, crashed = [], [], [], []
+    nsum = sum(1 for l in base.stdout.splitlines() if 'checks,' in l)
+    if nsum != len(PROGRAMS):
+        # PROGRAMS is indexed by the summary lines seen; a program added to
+        # run.sh without it would mislabel a crash (review C LOW-3).
+        print(f'run.sh printed {nsum} summary lines but PROGRAMS names {len(PROGRAMS)}: edit PROGRAMS'); return 2
+    bad_setup, survived, killed, crashed, timed_out = [], [], [], [], []
     words = sys.argv[1:]
     shard = None
     if len(words) >= 2 and words[0] == '--shard':       # --shard i/n: every n-th chosen mutant from i
@@ -2174,10 +2215,10 @@ def main():
         open(path, 'wb').write(text.replace(old, new).encode('utf-8'))
         p = run_tests(src, os.path.join(tmp, 'out'))
         if p is None:
-            # A test that never finishes did not pass: the mutant is caught.
-            killed.append(name)
-            crashed.append(name)
-            print(f'KILLED       {name}\n             timed out after 900 s')
+            # A hang is not a detection (review C MED-2): its own bucket, never
+            # in "killed". Rerun it alone; it counts only if a check then fails.
+            timed_out.append(name)
+            print(f'TIMEOUT      {name}\n             no result after {TIMEOUT_S} s (not counted as killed)')
             shutil.rmtree(tmp, ignore_errors=True); continue
         out = p.stdout.strip().splitlines()
         sums = [l for l in out if 'checks,' in l]
@@ -2210,7 +2251,7 @@ def main():
             survived.append(name)
             print(f'SURVIVED     {name}  ({summary})')
         shutil.rmtree(tmp, ignore_errors=True)
-    print(f'\n{len(killed)} killed, {len(survived)} survived, {len(bad_setup)} not run, of {len(chosen)}'
+    print(f'\n{len(killed)} killed, {len(survived)} survived, {len(timed_out)} timed out (not kills), {len(bad_setup)} not run, of {len(chosen)}'
           + (f' (filtered from {len(MUTANTS)})' if words or shard else '')
           + (f', shard {shard[0]}/{shard[1]}' if shard else ''))
     # A kill by a crash or a timeout (no summary line) is a kill, but not by a
@@ -2218,9 +2259,11 @@ def main():
     print(f'{len(killed) - len(crashed)} killed by a failed check, {len(crashed)} crash-only')
     for n in crashed:
         print(f'  crash-only: {n}')
+    for n in timed_out:
+        print(f'  timeout: {n}')
     for n, why in bad_setup:
         print(f'  not run: {n}: {why}')
-    return 0 if not survived and not bad_setup else 1
+    return 0 if not survived and not bad_setup and not timed_out else 1
 
 
 if __name__ == '__main__':
