@@ -2290,6 +2290,61 @@ static void test_token_near_miss() {
     CHECK(bad == 0 && c.lease.held, "%d near-misses of the old token wrong under a new lease", bad);
 }
 
+// session.open's arguments at their bounds (review C HIGH-3). client is copied
+// into a 17-byte array and idle_s is multiplied by 1000 in 32 bits, so the
+// schema's limits are all that stand between a request and a smashed lease.
+static void test_session_open_bounds() {
+    fresh("stage 4: session.open at its bounds");
+    uint32_t id = 1;
+    auto open_with = [&](const std::string &client, const std::string &idle) {
+        char b[200];
+        snprintf(b, sizeof b, "{\"client\":\"%s\",\"tui_lock\":false,\"idle_s\":%s}", client.c_str(), idle.c_str());
+        J r = ask1(req(id++, "session.open", b));
+        if (r["outcome"].is("DONE")) lease_token = r["result"]["token"].s;
+        return r;
+    };
+    auto close_it = [&] { ask1(reqt(id++, "session.close", lease_token, "{}")); };
+    // client: 1 and 16 characters open and are reported back; 0, 17 and 64 are refused.
+    struct { size_t len; bool ok; } cl[] = { { 0, false }, { 1, true }, { 16, true }, { 17, false }, { 64, false } };
+    int wrong = 0;
+    for (auto &k : cl) {
+        std::string name(k.len, 'c');
+        if (k.len >= 2) name[k.len - 1] = 'z';                    // the last byte is the one an overrun would cost
+        char before[sizeof c.lease];
+        memcpy(before, &c.lease, sizeof before);
+        J r = open_with(name, "300");
+        bool held = c.lease.held;
+        bool good = k.ok ? (r["outcome"].is("DONE") && held && !strcmp(c.lease.client, name.c_str()) &&
+                            c.lease.idle_ms == 300000u && strlen(c.lease.token) == 32 && r["result"]["idle_s"].n == 300)
+                         : (is_refusal(r, "E_RANGE") && !held && !memcmp(before, &c.lease, sizeof before));
+        if (good && k.ok) {
+            J s = status4(id++);
+            good = s["result"]["lease"]["client"].is(name.c_str());
+        }
+        if (!good) { wrong++; printf("  client of %zu chars: %s %s\n", k.len, r["outcome"].s.c_str(), r["err"]["code"].s.c_str()); }
+        if (held) close_it();
+    }
+    CHECK(wrong == 0, "%d client lengths handled wrongly", wrong);
+    // idle_s: 30 and 600 open and come back as given; 0, 29, 601 and the
+    // values that wrap in 32 bits are refused, with nothing changed.
+    struct { const char *v; bool ok; uint32_t s; } id_s[] = {
+        { "0", false, 0 }, { "29", false, 0 }, { "30", true, 30 }, { "31", true, 31 }, { "599", true, 599 }, { "600", true, 600 },
+        { "601", false, 0 }, { "4294967", false, 0 }, { "4294968", false, 0 }, { "4294967296", false, 0 },
+        { "9007199254740991", false, 0 } };
+    wrong = 0;
+    for (auto &k : id_s) {
+        char before[sizeof c.lease];
+        memcpy(before, &c.lease, sizeof before);
+        J r = open_with("bounds", k.v);
+        bool held = c.lease.held;
+        bool good = k.ok ? (r["outcome"].is("DONE") && held && r["result"]["idle_s"].n == k.s && c.lease.idle_ms == k.s * 1000u)
+                         : (is_refusal(r, "E_RANGE") && r["err"]["field"].is("idle_s") && !held && !memcmp(before, &c.lease, sizeof before));
+        if (!good) { wrong++; printf("  idle_s %s: %s %s\n", k.v, r["outcome"].s.c_str(), r["err"]["code"].s.c_str()); }
+        if (held) close_it();
+    }
+    CHECK(wrong == 0, "%d idle_s values handled wrongly", wrong);
+}
+
 // The request first, then the act (4.14; owner, R-API-1 finding 3; I-26).
 static void test_presence() {
     fresh("stage 4: request first, then the act");
@@ -3589,6 +3644,7 @@ int main(int argc, char **argv) {
     test_lease();
     test_token_entropy();
     test_token_near_miss();
+    test_session_open_bounds();
     test_presence();
     test_withdrawal();
     test_tier_m_arrival();
