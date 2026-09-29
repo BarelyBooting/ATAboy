@@ -69,14 +69,14 @@ transcript() {   # <tree root> <name> <defs>
 bdefs=$(defs_of "$out/base/$rel")
 hdefs=$(defs_of "$out/head/$rel")
 if transcript "$out/base" base $bdefs; then
-    want=$(sha256sum "$out/tr-base.txt" | cut -d' ' -f1); n=$(wc -l < "$out/tr-base.txt")
+    want=$(sha256sum < "$out/tr-base.txt" | cut -d' ' -f1); n=$(wc -l < "$out/tr-base.txt")
     if [ "$n" -lt 1000 ]; then bad "transcripts: the base transcript has only $n lines (an empty population is a refusal)"; else
         for cfg in "off:$(echo "$hdefs" | sed 's/-DATABOY_CTL=1//; s/-DATABOY_BOARD_JUMPERS=1//')" \
                    "ctl:$(echo "$hdefs" | sed 's/-DATABOY_BOARD_JUMPERS=1//')" \
                    "ctl+jumpers:$hdefs"; do
             name=${cfg%%:*}; d=${cfg#*:}
             if transcript "$out/head" "$name" $d; then
-                got=$(sha256sum "$out/tr-$name.txt" | cut -d' ' -f1)
+                got=$(sha256sum < "$out/tr-$name.txt" | cut -d' ' -f1)
                 if [ "$got" = "$want" ]; then ok "transcripts, API $name: $n commands identical to $base ($want)"
                 else bad "transcripts, API $name: differs from $base (line $(cmp "$out/tr-base.txt" "$out/tr-$name.txt" | sed 's/.*line //'))"; fi
             else bad "transcripts, API $name: test_read did not build or did not pass (see $out/tr-$name.err, .log)"; fi
@@ -116,7 +116,7 @@ else
     export PATH="$tc/bin:$PATH"
     if build "$out/base" base && build "$out/head" off; then
         for f in ATAboy.uf2 ATAboy.bin; do
-            a=$(sha256sum "$out/b-base/$f" | cut -d' ' -f1); b=$(sha256sum "$out/b-off/$f" | cut -d' ' -f1)
+            a=$(sha256sum < "$out/b-base/$f" | cut -d' ' -f1); b=$(sha256sum < "$out/b-off/$f" | cut -d' ' -f1)
             if [ "$a" = "$b" ]; then ok "default image, $f identical to $base ($a)"; else bad "default image, $f differs from $base ($a, $b)"; fi
         done
     else bad "default image: the base or this tree did not build (see $out/b-*.build.log)"; fi

@@ -56,7 +56,7 @@ fi
 # with SAT on, which is the transcript the hash is of.
 if [ -n "$smart" ] && [ -f "$here/golden-transcript.sha256" ]; then
     want=$(cut -d' ' -f1 "$here/golden-transcript.sha256")
-    got=$(sha256sum "$out/transcript-off.txt" | cut -d' ' -f1)
+    got=$(sha256sum < "$out/transcript-off.txt" | cut -d' ' -f1)
     if [ "$got" = "$want" ]; then
         echo "transcript against the golden of 6bb7da4: 1 checks, 0 failed"
     else
