@@ -1806,6 +1806,54 @@ static void test_jp1_lock() {
     pump(30);
 }
 
+// The debounce (SPEC-v1 8.1, README item 35): a level counts only after 20
+// samples in a row over at least 10 ms (review C MED-4). Both bounds are driven
+// on their own, with the other one satisfied: 19 samples over a long time and
+// 20 over a short one are not enough, 20 over 10 ms is. Core 0's passes are
+// placed on the millisecond clock, n of them, the first now and the last
+// span_ms later (a 1 ms cadence would satisfy the time bound for any n).
+static void samples_over(unsigned n, unsigned span_ms) {
+    uint64_t t0 = mock_now_ns;
+    for (unsigned i = 0; i < n; i++) {
+        mock_now_ns = t0 + (uint64_t)(n > 1 ? (i * span_ms) / (n - 1) : 0) * 1000000ull;
+        one_task();
+    }
+    mock_now_ns += 1000000ull;
+}
+static void test_debounce() {
+    struct Case { unsigned n, span; bool settles; };
+    const Case cases[] = { { 19, 40, false }, { 19, 10, false }, { 20, 9, false }, { 20, 10, true }, { 20, 19, true }, { 21, 30, true },
+                           { 1, 0, false } };
+    size_t ran = 0;
+    for (const Case &k : cases) {
+        char nm[80];
+        // JP1's release: locked at once, released only by the debounced OPEN.
+        snprintf(nm, sizeof nm, "stage 3: JP1 release after %u samples over %u ms", k.n, k.span);
+        fresh(nm);
+        pump(30);
+        jp1_fit(true); pump(1);
+        CHECK(bj_jp1() == BJ_FITTED, "JP1 fitted");
+        jp1_fit(false);
+        samples_over(k.n, k.span);
+        CHECK(k.settles ? (bj_jp1() == BJ_OPEN && !jp1_locked()) : (bj_jp1() == BJ_FITTED && jp1_locked()),
+              "JP1 %u samples over %u ms: state %u (released: %d, wanted %d)", k.n, k.span, bj_jp1(), bj_jp1() == BJ_OPEN, k.settles);
+        // JP2's level (8.3), both levels: UNKNOWN after a gap until the run settles.
+        for (int fitted = 0; fitted < 2; fitted++) {
+            snprintf(nm, sizeof nm, "stage 3: JP2 %s level after %u samples over %u ms", fitted ? "FITTED" : "OPEN", k.n, k.span);
+            fresh(nm);
+            pump(30);
+            jp2_fit(fitted != 0);
+            away(60);                                       // a gap: JP2 is UNKNOWN again, its run starts over
+            samples_over(k.n, k.span);
+            uint8_t want = k.settles ? (fitted ? BJ_FITTED : BJ_OPEN) : BJ_UNKNOWN;
+            CHECK(bj_jp2() == want, "JP2 %s, %u samples over %u ms: state %u, wanted %u", fitted ? "fitted" : "open", k.n, k.span,
+                  bj_jp2(), want);
+        }
+        ran++;
+    }
+    CHECK(ran == sizeof cases / sizeof cases[0] && ran >= 6, "the debounce table ran %zu cases", ran);
+}
+
 // JP2: the fit event (8.3, I-25, finding 5), timelines both ways.
 static uint32_t ev_base;
 static uint32_t evs() { return bj_fit_events() - ev_base; }
@@ -3635,6 +3683,7 @@ int main(int argc, char **argv) {
     test_jp_pads_boot();
     test_jp_pad_faults();
     test_jp1_lock();
+    test_debounce();
     test_jp1_between_passes();
     test_jp2_events();
     test_jp2_changes_nothing();
