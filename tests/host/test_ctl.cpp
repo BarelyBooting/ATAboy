@@ -3328,6 +3328,18 @@ static void test_tier_m_no_jumpers() {
     tui_setup_chs(980, 10, 17);
     J m = ask1(reqt(3, "mount", lease_token, mount_args("TUI_DETECT_NORMAL")));
     CHECK(is_refusal(m, "E_LOCKED") && !is_mounted, "mount: %s", m["err"]["code"].s.c_str());
+    // hello says the same: every Tier M op LOCKED for the missing jumpers, with a lease held.
+    J h = ask1(req(4, "hello"), nullptr, 20);
+    int seen = 0, wrong = 0;
+    for (int op = 0; op < CTL_OP_COUNT; op++) {
+        if (ctl_ops[op].tier != CTL_TIER_M) continue;
+        seen++;
+        const J &cp = h["result"]["caps"][ctl_ops[op].name];
+        if (!cp["state"].is("LOCKED") || !cp["why"].is("JUMPERS_UNSUPPORTED")) wrong++;
+    }
+    CHECK(seen >= 2 && wrong == 0, "hello without jumpers: %d Tier M ops, %d not LOCKED for JUMPERS_UNSUPPORTED", seen, wrong);
+    // Nothing waited, nothing was queued, nothing reached the drive.
+    CHECK(!c.pres.waiting && ctl_job.state == CTL_JOB_EMPTY && sim.cmd_count[0x91] == 0 && sim.hw_resets == 0, "nothing sent");
 }
 #endif
 

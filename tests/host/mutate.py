@@ -2125,6 +2125,25 @@ MUTANTS = [
      '        m->then_mount = n > 0 && d->node[n].num;', '        m->then_mount = false;'),
     ('API S4: setup.ctrlg device slave read as master', 'ctl_policy.c',
      '        m->dev_base = one_of(d, args, "device", dev_names, 2) == 1 ? 0xB0 : 0xA0;', '        m->dev_base = 0xA0;'),
+    # The API build without the jumpers (CMake's default). These edit code that
+    # is compiled only there (the #else branches), so only run.sh's
+    # test_ctl_nojumpers can kill them (review C MED-5).
+    ('API nojumpers: Tier M not refused for the missing jumpers', 'ctl.c',
+     '#else
+    *why = "JUMPERS_UNSUPPORTED";
+#endif
+    return true;', '#else
+    return false;
+#endif
+    return true;'),
+    ('API nojumpers: hello says a Tier M op is OPERATIONAL', 'ctl_policy.c',
+     '        *state = CTL_CAP_LOCKED; *why = "JUMPERS_UNSUPPORTED";
+    } else {', '        *state = CTL_CAP_OPERATIONAL;
+    } else {'),
+    ('API nojumpers: status shows JP1 as OPEN', 'ctl.c',
+     '    ctlw_str(w, "jp1", "NOT_BUILT");', '    ctlw_str(w, "jp1", "OPEN");'),
+    ('API nojumpers: selftest says the jumpers are OK', 'ctl.c',
+     '    ctlw_str(w, "jumpers", "NOT_BUILT");', '    ctlw_str(w, "jumpers", "OK");'),
 ]
 
 
@@ -2137,10 +2156,12 @@ MUTANTS = [
 # Then the descriptor layout twice (the Control API off and on), and, in a
 # build with the API (run.sh's default), test_ctl four times (its tests,
 # "core1", "core1-confirm", "core1-tui"), test_config_save, ctl_fuzz, and
-# ctl_e2e.py, which runs test_ctl.
+# ctl_e2e.py, which runs test_ctl, presence_rows.py, and test_ctl built without
+# the jumpers (test_ctl_nojumpers, the last).
 PROGRAMS = ['test_read', 'test_read_pipelined', 'transcripts', 'test_read_shipping', 'test_fwupdate', 'test_fwupdate_smart', 'test_manual_chs',
             'test_manual_chs', 'test_usb_desc', 'test_pio_timing', 'test_usb_layout0', 'test_usb_layout1',
-            'test_ctl', 'test_ctl', 'test_ctl', 'test_ctl', 'test_config_save', 'ctl_fuzz', 'test_ctl', 'presence_rows']
+            'test_ctl', 'test_ctl', 'test_ctl', 'test_ctl', 'test_config_save', 'ctl_fuzz', 'test_ctl', 'presence_rows',
+            'test_ctl_nojumpers']
 
 
 TIMEOUT_S = 900

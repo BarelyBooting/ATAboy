@@ -123,4 +123,14 @@ if echo "$defs" | grep -q -- '-DATABOY_CTL=1'; then
     ${PYTHON:-python} "$here/ctl_e2e.py" "$out/test_ctl"
     # Stage 4: the presence row takes no cell any screen uses (pyte).
     ${PYTHON:-python} "$here/presence_rows.py" "$src" $defs
+    # The API build WITHOUT the jumpers, which is what CMake builds by default:
+    # every guarded op refused, hello and status saying why (review C MED-5).
+    # Its test (test_tier_m_no_jumpers) exists only in that build, so this is
+    # a second test_ctl, run in the standard pass and under mutate.py; never
+    # left to whoever remembers JUMPERS=0. Skipped only when the first one
+    # already was that build.
+    if echo "$defs" | grep -q -- '-DATABOY_BOARD_JUMPERS=1'; then
+        ${CXX:-g++} -std=c++17 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation             $(echo "$defs" | sed 's/-DATABOY_BOARD_JUMPERS=1//')             -I "$here/mock" -I "$here" -I "$src" -o "$out/test_ctl_nojumpers" "$here/test_ctl.cpp"
+        "$out/test_ctl_nojumpers"
+    fi
 fi
