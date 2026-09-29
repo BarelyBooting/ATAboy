@@ -2146,6 +2146,8 @@ MUTANTS = [
      'return op >= 0 && op < CTL_OP_COUNT && ctl_ops[op].tier != CTL_TIER_R && op != CTL_OP_SESSION_OPEN;'),
     ('API: E_STALE_ID does not say the id may have run', 'ctl.c',
      '"id not above max_mutating_id; an earlier send of it may have run: read status, do not resend under a new id"', '"id not above max_mutating_id"'),
+    ('API: ctlw_raw writes a key with no value for nothing', 'ctl_json.c',
+     '    if (n == 0) { ctlw_null(w, key); return; }      // never a key with no value (review A LOW-5)\n', ''),
     # The API build without the jumpers (CMake's default). These edit code that
     # is compiled only there (the #else branches), so only run.sh's
     # test_ctl_nojumpers can kill them (review C MED-5).

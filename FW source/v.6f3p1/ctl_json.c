@@ -229,6 +229,7 @@ void ctlw_hex(ctlw_t *w, const char *key, const uint8_t *p, size_t n) {
 }
 
 void ctlw_raw(ctlw_t *w, const char *key, const char *p, size_t n) {
+    if (n == 0) { ctlw_null(w, key); return; }      // never a key with no value (review A LOW-5)
     member(w, key);
     for (size_t i = 0; i < n; i++) put(w, p[i]);
 }

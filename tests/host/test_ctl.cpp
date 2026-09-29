@@ -183,6 +183,12 @@ static void test_writer_sha() {
     std::string got(buf, w.len);
     CHECK(!w.overflow && got == "{\"s\":\"a\\\"b\\\\c??\",\"n\":9007199254740991,\"a\":[0,true,null],\"h\":\"00abff\"}",
           "wrote %s", got.c_str());
+    // ctlw_raw with nothing to write leaves a value, not a bare key (review A LOW-5):
+    // job.last's response when the job's answer was over its 1,024 bytes.
+    ctlw_init(&w, buf, sizeof buf);
+    ctlw_obj(&w, 0); ctlw_raw(&w, "response", "", 0); ctlw_raw(&w, "r", "{\"a\":1}", 7); ctlw_end_obj(&w);
+    CHECK(!w.overflow && std::string(buf, w.len) == "{\"response\":null,\"r\":{\"a\":1}}", "ctlw_raw wrote %s",
+          std::string(buf, w.len).c_str());
     ctlw_init(&w, buf, 10);
     ctlw_obj(&w, 0); ctlw_str(&w, "key", "a long value");
     CHECK(w.overflow && w.len <= 10, "overflow not caught (%u bytes)", w.len);
@@ -2395,6 +2401,20 @@ static void test_session_open_bounds() {
     CHECK(wrong == 0, "%d idle_s values handled wrongly", wrong);
 }
 
+// job.last when the job's own answer was too long to keep (jl_len 0): valid
+// JSON with a null response, not `"response":` and nothing (review A LOW-5).
+static void test_job_last_no_response() {
+    fresh("stage 4: job.last with no kept response");
+    c.jl_present = true; c.jl_op = CTL_OP_UNMOUNT; c.jl_id = 5; c.jl_len = 0;
+    std::vector<std::string> raw = ask(req(1, "job.last"), 20);
+    J r;
+    std::string why;
+    bool parsed = raw.size() == 1 && parse_response(raw[0], r, &why);
+    CHECK(parsed && r["outcome"].is("DONE") && r["result"]["present"].b && r["result"]["response"].t == J::NUL,
+          "job.last: %s (%s)", raw.empty() ? "no answer" : raw[0].c_str(), why.c_str());
+    c.jl_present = false;
+}
+
 // The token appears in session.open's answer, and in nothing else (README item
 // 36; review C LOW-2): every Tier R op (with no arguments and with valid ones),
 // the refusals a token can be in the way of, a job's answer, job.last, the log
@@ -3896,6 +3916,7 @@ int main(int argc, char **argv) {
     test_token_entropy();
     test_token_near_miss();
     test_session_open_bounds();
+    test_job_last_no_response();
     test_token_confinement();
     test_session_open_replay();
     test_presence_label();
