@@ -212,6 +212,8 @@ Added in 0.6f3p10 (built and host-tested, not yet run on hardware):
 
     `E_STALE_ID` (an id not above the highest mutating id and no longer in the table of 16) now says in its message that the earlier send may have run and to read `status`, not to resend under a new id. It still answers `NOT_EXECUTED` with `retry: SAFE`, the default SPEC-v1 gives a refusal; changing that to `AFTER_STATUS` is the owner's ruling.
 
+    **JP1 and a `setup.ctrlg` that is already sending (2026-09-28, review A LOW-4).** JP1 is checked when a guarded request arrives, while it waits, and at its pickup, but not again while `setup.ctrlg` runs (up to 75 seconds: the reset, the wait for the drive, RECALIBRATE, 91h). A shunt fitted after the pickup does not stop that sequence. It is a write lock, and Ctrl+G's sequence writes nothing to the media (item 22), but a person who expects "JP1 stops the automation" should know the request in flight finishes.
+
     It must not go on a unit before palimpsest's CP3044 imaging is done and copied off (gate G-API-0), and the jumpers need their headers soldered and checked first (bench step B0a).
 
 The fork's build calls itself `0.6f3p10-palimpsest` and shows `v0.6f3p10 (fork)` in the setup screen (0.6f3p1 before items 6 to 15, 0.6f3p6 before 16 to 21, 0.6f3p7 before 22, 0.6f3p8 before 23 to 26, 0.6f3p9 before 27 to 32), so it can't be mistaken for a stock v0.6f3. Built with the Control API (items 33 to 36), it calls itself `0.6f4-palimpsest` and shows `v0.6f4 (fork+api)`, so it can't be mistaken for the 0.6f3p10 build either.
