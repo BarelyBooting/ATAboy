@@ -1802,7 +1802,11 @@ static void trip_screen_draw(void) {
                (unsigned)t.core);
     cdc_printf("Rule: %s\r\n",
                t.rule == IDE_TRIP_NO_IDENTIFY ? "no IDENTIFY after a Ctrl+G (any, since the ATAboy started)" :
-               t.rule == IDE_TRIP_NO_91H ? "no 91h in Ctrl+G's power-up default mode" : "?");
+               t.rule == IDE_TRIP_NO_91H ? "no 91h in Ctrl+G's power-up default mode" :
+#if ATABOY_CTL
+               t.rule == IDE_TRIP_FORBIDDEN ? "IDENTIFY forbidden by ATAboy Control" :
+#endif
+               "?");
     cdc_printf("Command log: entry %lu (READ BUFFER 4Ch still answers)\r\n", (unsigned long)t.log_seq);
     cdc_puts("\r\nThe bus is released and nothing more goes to the drive. USB answers\r\n"
              "NOT READY. Write this screen down, then unplug the ATAboy to recover.\r\n");

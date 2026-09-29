@@ -1675,6 +1675,23 @@ static void test_q7_tripwire() {
     check_trip_record(0xEC, IDE_TRIP_NO_IDENTIFY, "Rule: no IDENTIFY after a Ctrl+G");
 #endif
 
+#if ATABOY_CTL && defined(IDE_FAULT_TRIPWIRE)
+    // The rule identify.forbid sets (ATAboy Control, I-22) has its own name on
+    // the tripwire's screen, not "?" (review B L-1): straight at the command
+    // register, with no Ctrl+G.
+    fresh("Q7: ECh after identify.forbid, written directly");
+    CHECK(ide_identify_forbid() && ide_identify_forbidden() && !ide_mchs_no_identify(), "identify.forbid did not set its rule alone");
+    is_mounted = true;
+    n0 = sim.cmd_log.size();
+    w0 = sim.reg_writes;
+    bus_driven();
+    stopped = trip_attempt([] { ide_write_reg(7, 0xEC); });
+    CHECK(stopped && sim.cmd_log.size() == n0 && sim.reg_writes == w0, "stopped %d, %zu commands and %d register writes reached the drive",
+          stopped, sim.cmd_log.size() - n0, sim.reg_writes - w0);
+    check_trip_record(0xEC, IDE_TRIP_FORBIDDEN, "Rule: IDENTIFY forbidden by ATAboy Control");
+    identify_forbidden = false;                     // only a power cycle clears it in the firmware; the tests go on
+#endif
+
     // The same through ide.c's pass-through entry, as a broken SAT gate would
     // send it (F-1's refusal left out). The task file goes out; ECh does not.
 #if ATABOY_SAT

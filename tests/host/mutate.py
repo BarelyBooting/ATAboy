@@ -2148,6 +2148,8 @@ MUTANTS = [
      '"id not above max_mutating_id; an earlier send of it may have run: read status, do not resend under a new id"', '"id not above max_mutating_id"'),
     ('API: ctlw_raw writes a key with no value for nothing', 'ctl_json.c',
      '    if (n == 0) { ctlw_null(w, key); return; }      // never a key with no value (review A LOW-5)\n', ''),
+    ('API: the tripwire screen has no name for the identify.forbid rule', 'menus.c',
+     '               t.rule == IDE_TRIP_FORBIDDEN ? "IDENTIFY forbidden by ATAboy Control" :\n', ''),
     # The API build without the jumpers (CMake's default). These edit code that
     # is compiled only there (the #else branches), so only run.sh's
     # test_ctl_nojumpers can kill them (review C MED-5).
