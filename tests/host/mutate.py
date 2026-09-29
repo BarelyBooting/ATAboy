@@ -2135,6 +2135,15 @@ MUTANTS = [
      'c.pres.op == CTL_OP_SETUP_CTRLG && c.pres.m.then_mount ? "ctrlg+mount"', 'c.pres.op == CTL_OP_SETUP_CTRLG && 0 ? "ctrlg+mount"'),
     ('API S4: the presence row says ctrlg+mount without then_mount', 'ctl.c',
      'c.pres.op == CTL_OP_SETUP_CTRLG && c.pres.m.then_mount ? "ctrlg+mount"', 'c.pres.op == CTL_OP_SETUP_CTRLG ? "ctrlg+mount"'),
+    # Where the token is shown (review C LOW-1, LOW-2); E_STALE_ID's message (review A LOW-1).
+    ('API S4: status shows the lease token', 'ctl.c',
+     '    ctlw_bool(w, "held", c.lease.held);\n    if (c.lease.held) ctlw_str(w, "client", c.lease.client); else ctlw_null(w, "client");',
+     '    ctlw_bool(w, "held", c.lease.held); ctlw_str(w, "token", c.lease.token);\n    if (c.lease.held) ctlw_str(w, "client", c.lease.client); else ctlw_null(w, "client");'),
+    ('API S4: job.last shows the last lease\'s token', 'ctl.c',
+     '    ctlw_uint(w, "started_ms", c.jl_started);', '    ctlw_uint(w, "started_ms", c.jl_started); ctlw_str(w, "token", c.lease.old_token);'),
+    ('API S4: session.open is not replayed', 'ctl_policy.c',
+     'return op >= 0 && op < CTL_OP_COUNT && ctl_ops[op].tier != CTL_TIER_R;',
+     'return op >= 0 && op < CTL_OP_COUNT && ctl_ops[op].tier != CTL_TIER_R && op != CTL_OP_SESSION_OPEN;'),
     # The API build without the jumpers (CMake's default). These edit code that
     # is compiled only there (the #else branches), so only run.sh's
     # test_ctl_nojumpers can kill them (review C MED-5).

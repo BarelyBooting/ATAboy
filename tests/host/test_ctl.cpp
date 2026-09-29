@@ -2393,6 +2393,109 @@ static void test_session_open_bounds() {
     CHECK(wrong == 0, "%d idle_s values handled wrongly", wrong);
 }
 
+// The token appears in session.open's answer, and in nothing else (README item
+// 36; review C LOW-2): every Tier R op (with no arguments and with valid ones),
+// the refusals a token can be in the way of, a job's answer, job.last, the log
+// and the status, before and after a set-up job ran. The one deliberate
+// exception, a byte-identical resend of the open, is test_session_open_replay.
+static void test_token_confinement() {
+    fresh("stage 4: the token appears only in session.open's answer");
+    power_drive();
+    rand_script = { 0xC0FFEE0123456789ull, 0xDEADBEEF87654321ull };
+    open_lease(1);
+    const std::string T = lease_token;
+    CHECK(T == "c0ffee0123456789deadbeef87654321", "the pinned token: %s", T.c_str());
+    uint32_t id = 10;
+    size_t answers = 0;
+    int leaks = 0;
+    auto sweep = [&](const std::string &line, const char *what) {
+        std::vector<std::string> r = ask(line, 60);
+        answers += r.size();
+        for (auto &l : r) {
+            std::string low = l;
+            for (char &ch : low) ch = (char)tolower((unsigned char)ch);
+            if (l.find(T) != std::string::npos || low.find(T) != std::string::npos) { leaks++; printf("  the token is in the answer to %s\n", what); }
+        }
+    };
+    auto sweep_all = [&](const char *when) {
+        for (int op = 0; op < CTL_OP_COUNT; op++) {
+            if (ctl_ops[op].tier != CTL_TIER_R) continue;
+            sweep(req(id++, ctl_ops[op].name), (std::string(ctl_ops[op].name) + " " + when).c_str());
+        }
+        sweep(req(id++, "log.read", "{\"cursor\":0,\"max_entries\":128}"), "log.read cursor 0");
+        sweep(req(id++, "hashes.read", "{\"cursor\":0,\"max_entries\":96}"), "hashes.read cursor 0");
+        sweep(req(id++, "debug.e", "{\"include_data\":true}"), "debug.e with data");
+        sweep(reqt(id++, "session.close", "00112233445566778899aabbccddeeff", "{}"), "a close with another token");
+        sweep(reqt(id++, "setup.ctrlg", "00112233445566778899aabbccddeeff", ctrlg_args()), "a set-up with another token");
+        sweep(reqt(id++, "mount", "00112233445566778899aabbccddeeff", mount_args()), "a mount with another token");
+        sweep(reqt(id++, "mount", T.substr(0, 31), mount_args()), "a mount with a token one short");
+        sweep(req(id++, "session.open", "{\"client\":\"other\",\"tui_lock\":false,\"idle_s\":60}"), "a second open");
+        sweep(req(id++, "session.open", "{\"client\":\"x\",\"tui_lock\":true,\"idle_s\":60}"), "an open with tui_lock");
+        sweep(req(id++, "wp.on", "{\"expect_epoch\":\"x\"}"), "a schema error");
+    };
+    sweep_all("before a job");
+    hold2(false, 400);
+    send_only(reqt(id++, "setup.ctrlg", T, ctrlg_args()));
+    sweep(req(id++, "status"), "status with a request waiting");
+    hold2(true, 250);
+    pump(50);
+    for (auto &l : host_lines()) {
+        answers++;
+        if (l.find(T) != std::string::npos) { leaks++; printf("  the token is in a job's answer\n"); }
+    }
+    sweep_all("after a job");
+    sweep(reqt(id++, "session.close", T, "{}"), "the close");
+    sweep_all("after the close");
+    CHECK(leaks == 0 && answers >= 40, "%d answers carry the token, of %zu swept", leaks, answers);
+    // Not in the state the host can read back either: the log's entries carry no token bytes.
+    bool in_log = false;
+    for (uint32_t q = 1; q < log_next; q++) {
+        const uint8_t *e = (const uint8_t *)&log_ring[q % OBS_LOG_ENTRIES];
+        for (size_t k = 0; k + 8 <= sizeof(obs_log_entry_t); k++) {
+            uint64_t v = 0;
+            memcpy(&v, e + k, 8);
+            if (v == 0xC0FFEE0123456789ull || v == 0x89674523EEFFC0ull) in_log = true;
+        }
+    }
+    CHECK(!in_log, "the token's bytes are in the command log");
+}
+
+// A byte-identical resend of session.open is answered from the replay table
+// (SPEC-v1 3.5: a client that lost the answer may resend safely), and that
+// answer carries the token again, while the lease lives and after it has
+// ended (review C LOW-1, review A LOW-2; README item 36 says so). After the
+// lease ended the replayed token is dead.
+static void test_session_open_replay() {
+    fresh("stage 4: a resent session.open");
+    rand_script = { 0x1111222233334444ull, 0x5555666677778888ull };
+    std::string L = req(1, "session.open", "{\"client\":\"replay\",\"tui_lock\":false,\"idle_s\":300}");
+    J a = ask1(L);
+    const std::string T = a["result"]["token"].s;
+    CHECK(a["outcome"].is("DONE") && T == "11112222333344445555666677778888" && !a.get("replayed"), "the first open");
+    J b = ask1(L);
+    CHECK(b["outcome"].is("DONE") && b["replayed"].b && b["result"]["token"].is(T.c_str()) && c.lease.held, "the resend while it lives: %s",
+          b["outcome"].s.c_str());
+    // Another client repeating the id with another line is not handed it.
+    J o = ask1(req(1, "session.open", "{\"client\":\"other\",\"tui_lock\":false,\"idle_s\":300}"));
+    CHECK(is_refusal(o, "E_ID_REUSED") && !o.get("result"), "same id, another line: %s", o["err"]["code"].s.c_str());
+    J cl = ask1(reqt(2, "session.close", T, "{}"));
+    CHECK(cl["outcome"].is("DONE") && !c.lease.held, "close");
+    J d = ask1(L);
+    CHECK(d["outcome"].is("DONE") && d["replayed"].b && d["result"]["token"].is(T.c_str()) && !c.lease.held,
+          "the resend after the close is the stored answer, and opens nothing");
+    J e = ask1(reqt(3, "session.close", T, "{}"));
+    CHECK(is_refusal(e, "E_LEASE_REVOKED") && e["err"]["by"].is("CLOSED"), "the replayed token is dead: %s", e["err"]["code"].s.c_str());
+    // A lease opened afterwards has its own token, and the resend still gives the dead one.
+    rand_script = { 0x9999aaaabbbbccccull, 0xddddeeeeffff0000ull };
+    J n = ask1(req(4, "session.open", "{\"client\":\"replay\",\"tui_lock\":false,\"idle_s\":300}"));
+    J f = ask1(L);
+    CHECK(n["outcome"].is("DONE") && n["result"]["token"].is("9999aaaabbbbccccddddeeeeffff0000") && f["replayed"].b &&
+          f["result"]["token"].is(T.c_str()) && c.lease.held, "a later lease: the resend still gives the first token");
+    J g = ask1(reqt(5, "session.close", T, "{}"));
+    CHECK(is_refusal(g, "E_LEASE_INVALID") || is_refusal(g, "E_LEASE_REVOKED"), "the first token under a later lease: %s",
+          g["err"]["code"].s.c_str());
+}
+
 // What the presence row says a JP2 act approves (review A MED-3): a
 // setup.ctrlg sent with then_mount also lets a mount follow without a second
 // act, so its row says "ctrlg+mount", not "setup.ctrlg". Same width, so the
@@ -3791,6 +3894,8 @@ int main(int argc, char **argv) {
     test_token_entropy();
     test_token_near_miss();
     test_session_open_bounds();
+    test_token_confinement();
+    test_session_open_replay();
     test_presence_label();
     test_presence();
     test_withdrawal();
