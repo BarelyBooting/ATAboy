@@ -1922,6 +1922,28 @@ static void test_debounce() {
         ran++;
     }
     CHECK(ran == sizeof cases / sizeof cases[0] && ran >= 6, "the debounce table ran %zu cases", ran);
+    // A level change with NO gap (review delta-B LOW-6, D3): every case above
+    // starts its run from n = 0 (after a gap), so a run count that is carried
+    // over a level change instead of restarting was invisible here. JP2 settled
+    // at one level for 20 samples, then the other for 19 samples over 15 ms: the
+    // 19 are a fresh run of 19, not 20 + 19, and settle nothing.
+    for (int fitted = 0; fitted < 2; fitted++) {
+        char nm[96];
+        snprintf(nm, sizeof nm, "stage 3: JP2 %s after 20 settled samples of the other level", fitted ? "FITTED" : "OPEN");
+        fresh(nm);
+        pump(30);
+        jp2_fit(fitted == 0);
+        away(60);                                           // a gap: its run starts from nothing
+        samples_over(20, 19);
+        uint8_t first = fitted ? BJ_OPEN : BJ_FITTED;
+        CHECK(bj_jp2() == first, "JP2 first level settled: state %u, wanted %u", bj_jp2(), first);
+        jp2_fit(fitted != 0);                               // the change, no gap
+        samples_over(19, 15);
+        CHECK(bj_jp2() == first, "JP2 %s after 19 samples over 15 ms following a settled run of the other: state %u, wanted still %u",
+              fitted ? "fitted" : "open", bj_jp2(), first);
+        samples_over(20, 19);                               // and a full run of 20 does settle it
+        CHECK(bj_jp2() == (fitted ? BJ_FITTED : BJ_OPEN), "JP2 after a fresh 20: state %u", bj_jp2());
+    }
 }
 
 // JP2: the fit event (8.3, I-25, finding 5), timelines both ways.
