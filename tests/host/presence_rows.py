@@ -22,6 +22,27 @@ TEXT = 'JP2? setup.ctrlg #2147483647 0123abcd'
 ROW, COL0, COL1 = 12, 42, 78          # 0-based: row 13, columns 43 to 79 (1-based)
 
 
+# Review delta-B LOW-11: the scratch directory is removed when the run ends
+# (ATABOY_KEEP_TMP=1 keeps it to look at); before, every run left one in %TEMP%.
+_TMPS = []
+
+
+def _mkdtemp(prefix):
+    d = tempfile.mkdtemp(prefix=prefix)
+    _TMPS.append(d)
+    return d
+
+
+def _run():
+    try:
+        return main()
+    finally:
+        if not os.environ.get('ATABOY_KEEP_TMP'):
+            import shutil
+            for d in _TMPS:
+                shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     try:
         import pyte
@@ -29,7 +50,7 @@ def main():
         print('COULD NOT RUN: no pyte'); return 98
     src = sys.argv[1]
     defs = sys.argv[2:] or ['-DATABOY_CTL=1']
-    tmp = tempfile.mkdtemp(prefix='ataboy-presence-')
+    tmp = _mkdtemp('ataboy-presence-')
     exe = os.path.join(tmp, 'test_tui.exe')
     r = subprocess.run([os.environ.get('CXX', 'g++'), '-std=c++17', '-O1', '-w', *defs, '-I', os.path.join(HERE, 'mock'),
                         '-I', HERE, '-I', src, '-o', exe, os.path.join(HERE, 'test_tui.cpp')])
@@ -87,4 +108,4 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(_run())

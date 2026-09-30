@@ -122,6 +122,27 @@ def raw_request(ctl, exe, mode, op, args, rid=90):
         return None
 
 
+# Review delta-B LOW-11: the scratch directory is removed when the run ends
+# (ATABOY_KEEP_TMP=1 keeps it to look at); before, every run left one in %TEMP%.
+_TMPS = []
+
+
+def _mkdtemp(prefix):
+    d = tempfile.mkdtemp(prefix=prefix)
+    _TMPS.append(d)
+    return d
+
+
+def _run():
+    try:
+        return main()
+    finally:
+        if not os.environ.get('ATABOY_KEEP_TMP'):
+            import shutil
+            for d in _TMPS:
+                shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('exe')
@@ -149,7 +170,7 @@ def main():
         ports.append(p)
         return p
 
-    tmp = tempfile.mkdtemp(prefix='ataboy-e2e-')
+    tmp = _mkdtemp('ataboy-e2e-')
     tpath = os.path.join(tmp, 'transcript.jsonl')
     t0 = time.time()
     c, res = ctl.connect(serial, tpath, records_fn=lambda: records, opener=opener)
@@ -407,4 +428,4 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(_run())

@@ -99,6 +99,27 @@ def cells(scr):
     return [[scr.buffer[y][x] for x in range(80)] for y in range(24)]
 
 
+# Review delta-B LOW-11: the scratch directory is removed when the run ends
+# (ATABOY_KEEP_TMP=1 keeps it to look at); before, every run left one in %TEMP%.
+_TMPS = []
+
+
+def _mkdtemp(prefix):
+    d = tempfile.mkdtemp(prefix=prefix)
+    _TMPS.append(d)
+    return d
+
+
+def _run():
+    try:
+        return main()
+    finally:
+        if not os.environ.get('ATABOY_KEEP_TMP'):
+            import shutil
+            for d in _TMPS:
+                shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     old_src, new_src = sys.argv[1], sys.argv[2]
     expect = {}
@@ -117,7 +138,7 @@ def main():
             scr, rows = args[1].split(':')
             expect[scr] = {int(r) - 1 for r in rows.split(',')}
         args = args[2:]
-    tmp = tempfile.mkdtemp(prefix='ataboy-tui-')
+    tmp = _mkdtemp('ataboy-tui-')
     print(f'new tree built with: {" ".join(new_defs) or "(no defines)"}')
     old = build_and_capture(old_src, os.path.join(tmp, 'old'))
     new = build_and_capture(new_src, os.path.join(tmp, 'new'), new_defs)
@@ -175,4 +196,4 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(_run())
