@@ -3762,6 +3762,29 @@ static void test_banked_act() {
     hold2(false, 250); hold2(true, 250);
     J r = one_answer();
     CHECK(r["outcome"].is("DONE"), "the act after the arrival: %s", r["outcome"].s.c_str());
+    // ...and with the terminal closed while that old edge's event completes
+    // (review delta-B LOW-3, P2): an edge from before the request approves
+    // nothing, so it must not withdraw it either; NO_TERMINAL is asked at an act
+    // that WOULD approve, not at any fit event.
+    fresh("stage 4: an edge before the arrival, the terminal closed at its event");
+    power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    jp2_fit(true);
+    pump(100);
+    ev0 = bj_fit_events();
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    CHECK(c.pres.waiting, "not waiting on arrival");
+    cdc_connected = false;
+    pump(300);                                          // the old edge's event completes, no terminal
+    CHECK(bj_fit_events() == ev0 + 1 && c.pres.waiting && host_lines().empty() && sim.cmd_count[0x91] == 0,
+          "an edge from before the arrival withdrew it with the terminal closed (events +%u, waiting %d, %zu lines)",
+          bj_fit_events() - ev0, (int)c.pres.waiting, host_lines().size());
+    cdc_connected = true;
+    hold2(false, 250); hold2(true, 250);
+    r = one_answer();
+    CHECK(r["outcome"].is("DONE"), "the act after the terminal returned: %s %s", r["outcome"].s.c_str(), r["err"]["why"].s.c_str());
+    cdc_connected = false;
     // The edge sampled in the pass that reads the request: the same
     // millisecond, not after it (X60).
     fresh("stage 4: an edge in the arrival's own millisecond");
