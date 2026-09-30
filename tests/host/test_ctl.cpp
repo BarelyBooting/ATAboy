@@ -504,13 +504,54 @@ static void test_rate() {
     pump(1000);
     J k = ask1(req(30, "chip.info"));
     CHECK(k["outcome"].is("DONE"), "after the window");
-    // A line refused before the rate check (E_PARSE) does not count.
-    fresh("rate: parse errors not counted");
+    // Owner ruling 2026-09-29 on review A LOW-8, option (b): a malformed line
+    // (E_PARSE: a byte outside 0x20-0x7E, or outside the grammar) COUNTS toward
+    // the 20 a second and is still ANSWERED, once. Inside the limit it is E_PARSE
+    // as before; over it, E_RATE with id null (the answer a well-formed
+    // over-limit request with no readable id gets), never silence.
+    fresh("rate: malformed lines count and are answered");
     std::string noise;
-    for (int i = 0; i < 30; i++) noise += "AT\r\n";
+    for (int i = 0; i < 30; i++) noise += (i % 2) ? std::string("AT\r\n") : std::string("{\"v\":1,\"id\":1,\"op\":\"status\"\x01}\n");
     r = ask(noise, 200);
+    int pe = 0, re = 0, nulls = 0, first_rate = -1;
+    for (size_t i = 0; i < r.size(); i++) {
+        J q;
+        if (!parse_response(r[i], q)) continue;
+        pe += is_refusal(q, "E_PARSE");
+        if (is_refusal(q, "E_RATE")) { re++; if (first_rate < 0) first_rate = (int)i; }
+        nulls += q["id"].t == J::NUL;
+    }
+    CHECK(r.size() == 30 && pe == 20 && re == 10 && first_rate == 20 && nulls == 30,
+          "%zu answers to 30 malformed lines: %d E_PARSE, %d E_RATE (first at %d), %d with id null", r.size(), pe, re, first_rate, nulls);
     k = ask1(req(1, "chip.info"));
-    CHECK(r.size() == 30 && k["outcome"].is("DONE"), "%zu answers to noise, then %s", r.size(), k["outcome"].s.c_str());
+    CHECK(is_refusal(k, "E_RATE"), "a well-formed request in the same second as 20 malformed lines: %s", k["outcome"].s.c_str());
+    pump(1000);
+    k = ask1(req(2, "chip.info"));
+    CHECK(k["outcome"].is("DONE"), "after the window: %s", k["outcome"].s.c_str());
+    // The over-limit answer is a refusal like the others: not a parse error, and
+    // it changes nothing but the counters.
+    k = ask1(req(3, "status"));
+    CHECK(k["outcome"].is("DONE") && k["result"]["counters"]["parse_errors"].n == 20, "parse_errors %lld, not 20", (long long)k["result"]["counters"]["parse_errors"].n);
+    // A malformed line after the window has emptied is E_PARSE again.
+    pump(1000);
+    r = ask(std::string("AT\r\n"));
+    CHECK(r.size() == 1 && parse_response(r[0], k) && is_refusal(k, "E_PARSE"), "a malformed line in an empty window");
+    // Malformed lines and requests share one window: 15 + 5 admitted, the 21st refused.
+    fresh("rate: one window for both");
+    std::string mix;
+    for (int i = 0; i < 15; i++) mix += "AT\r\n";
+    for (int i = 1; i <= 6; i++) mix += req(i, "chip.info");
+    r = ask(mix, 200);
+    done = 0; rate = 0; pe = 0;
+    for (auto &l : r) { J q; if (parse_response(l, q)) { done += q["outcome"].is("DONE"); rate += is_refusal(q, "E_RATE"); pe += is_refusal(q, "E_PARSE"); } }
+    CHECK(r.size() == 21 && pe == 15 && done == 5 && rate == 1, "%zu answers: %d E_PARSE, %d DONE, %d E_RATE", r.size(), pe, done, rate);
+    // Empty lines are not requests: no answer and no count.
+    fresh("rate: empty lines do not count");
+    std::string blanks;
+    for (int i = 0; i < 40; i++) blanks += "\n";
+    r = ask(blanks, 200);
+    k = ask1(req(1, "chip.info"));
+    CHECK(r.empty() && k["outcome"].is("DONE"), "%zu answers to empty lines, then %s", r.size(), k["outcome"].s.c_str());
 }
 
 // ---- 8. the writer never blocks (SPEC-v1 3.1, I-17) --------------------------

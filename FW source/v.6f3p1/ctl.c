@@ -1469,23 +1469,31 @@ static void handle_line(uint32_t len) {
     char *line = c.line;
     if (len && line[len - 1] == '\r') len--;      // one optional \r before the \n
     if (len == 0) return;                         // an empty line: no answer (a host resyncs with \n)
+    // Every non-empty line counts toward the 20 a second, malformed or not
+    // (owner ruling 2026-09-29 on review A LOW-8, option (b)), and every one is
+    // answered: a malformed line inside the limit is E_PARSE as ever, and one
+    // over it is E_RATE with id null (its id cannot be read), never silence
+    // (SPEC 3.1 "never drops silently"; 11.3 one response per line).
+    bool admit = ctl_rate_admit(&c.rate, now_ms());
     for (uint32_t i = 0; i < len; i++) {
         if (line[i] < 0x20 || line[i] > 0x7E) {   // 0x00-0x1F, 0x7F, anything >= 0x80
-            send_error(false, 0, CTL_OUT_NOT_EXECUTED, CTL_RETRY_SAFE, CTL_E_PARSE,
-                       "a byte outside 0x20-0x7E", 0, 0, true);
+            if (!admit) refuse(false, 0, CTL_E_RATE, "more than 20 requests in 1 s", 0);
+            else send_error(false, 0, CTL_OUT_NOT_EXECUTED, CTL_RETRY_SAFE, CTL_E_PARSE,
+                            "a byte outside 0x20-0x7E", 0, 0, true);
             return;
         }
     }
     ctlj_doc_t *d = &c.doc;
     int pr = ctlj_parse(line, len, d);
     if (pr == CTLJ_E_PARSE) {
-        send_error(false, 0, CTL_OUT_NOT_EXECUTED, CTL_RETRY_SAFE, CTL_E_PARSE,
-                   "not a request in the v1 grammar", 0, 0, true);
+        if (!admit) refuse(false, 0, CTL_E_RATE, "more than 20 requests in 1 s", 0);
+        else send_error(false, 0, CTL_OUT_NOT_EXECUTED, CTL_RETRY_SAFE, CTL_E_PARSE,
+                        "not a request in the v1 grammar", 0, 0, true);
         return;
     }
     uint32_t id = 0;
     bool id_ok = read_id(d, &id);
-    if (!ctl_rate_admit(&c.rate, now_ms())) {
+    if (!admit) {
         refuse(id_ok, id, CTL_E_RATE, "more than 20 requests in 1 s", 0);
         return;
     }
