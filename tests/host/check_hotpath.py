@@ -4,9 +4,18 @@ path").
 
     python tests/host/check_hotpath.py <base ATAboy.elf> <api ATAboy.elf> [<api ATAboy.elf> ...]
 
-Disassembles both with arm-none-eabi-objdump, masks every 8-digit hex word
-(branch targets, literal-pool addresses of statics, which move when code is
-added elsewhere) and compares function by function the ones on that path. The
+Disassembles both with arm-none-eabi-objdump, masks every 8-digit hex word in
+an instruction (branch targets, and the addresses in `@ (...)` comments, which
+move when code is added elsewhere) and compares function by function the ones
+on that path. Literal-pool words (`.word 0x...`) are COMPARED, not masked, except
+those whose value is an ADDRESS in the image being read: inside its own flash
+image (0x10000000 to the end of its sections) or in SRAM (0x20000000 to
+0x20082000, the RP2350's 520 KB), which do move. A constant that is neither (a timeout, a mask, a
+divisor such as the 0x10624dd3 of ide_wait_until_ready, a peripheral address)
+must be equal in the two builds (review delta-B MED-3: before 2026-09-29 every
+`.word` was masked and one bit of that constant went unseen). The one remaining
+blind spot: a constant that happens to fall inside the flash image's or SRAM's
+address range is treated as an address. The
 set is derived from the base ELF's own symbol table by name, not typed in:
 every `ide_pio_*`, `ide_read_*`, `ide_seek_*`, `ide_wait_*`, `ide_write_reg`,
 `ide_write_control`, `obs_*` (except obs_marker: its only caller is log_mount, on a mount,
@@ -25,8 +34,32 @@ EXACT = ('ide_write_reg', 'ide_write_control')
 EXCEPT = ('obs_marker',)
 
 
+SRAM = (0x20000000, 0x20082000)   # RP2350's 520 KB (the board's part)
+
+
+def flash_end(elf, objdump):
+    """The end of the highest allocated section in the flash window, from `objdump -h`."""
+    out = subprocess.run([objdump, '-h', elf], capture_output=True, text=True).stdout
+    end = 0x10000000
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and re.fullmatch(r'[0-9a-f]{8}', f[2]) and re.fullmatch(r'[0-9a-f]{8}', f[3]):
+            size, vma = int(f[2], 16), int(f[3], 16)
+            if 0x10000000 <= vma < 0x11000000:
+                end = max(end, vma + size)
+    return end
+
+
+def mask_word(m, hi):
+    v = int(m.group(1), 16)
+    return '.word ADDR' if (0x10000000 <= v < hi or SRAM[0] <= v < SRAM[1]) else m.group(0)
+
+
 def funcs(elf, objdump):
     out = subprocess.run([objdump, '-d', '--no-show-raw-insn', elf], capture_output=True, text=True).stdout
+    if not out.strip():
+        raise OSError('objdump gave no disassembly of ' + elf)
+    hi = flash_end(elf, objdump)
     d, cur = {}, None
     for line in out.splitlines():
         m = re.match(r'^[0-9a-f]+ <(.+)>:$', line)
@@ -35,8 +68,8 @@ def funcs(elf, objdump):
         if cur and line.strip():
             t = line.split('\t', 1)
             if len(t) < 2: continue
-            s = re.sub(r'\b[0-9a-f]{8}\b', 'ADDR', t[1])
-            s = re.sub(r'\.word\s+0x[0-9a-f]+', '.word X', s)
+            s = re.sub(r'\.word\s+0x([0-9a-f]+)', lambda m: mask_word(m, hi), t[1])
+            s = re.sub(r'\b[0-9a-f]{8}\b', 'ADDR', s)
             d[cur].append(s)
     return d
 
