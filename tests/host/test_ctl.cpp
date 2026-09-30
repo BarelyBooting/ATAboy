@@ -2507,9 +2507,13 @@ static void test_session_open_bounds() {
     };
     auto close_it = [&] { ask1(reqt(id++, "session.close", lease_token, "{}")); };
     // client: 1 and 16 characters open and are reported back; 0, 17 and 64 are refused.
-    struct { size_t len; bool ok; } cl[] = { { 0, false }, { 1, true }, { 16, true }, { 17, false }, { 64, false } };
+    // A 16-character name comes BEFORE the shorter ones on purpose (review
+    // delta-B LOW-1, S4): the array is reused between leases, and a name that
+    // does not end with its own NUL shows the previous name's tail.
+    struct { size_t len; bool ok; } cl[] = { { 0, false }, { 16, true }, { 1, true }, { 6, true }, { 16, true }, { 2, true }, { 17, false }, { 64, false } };
     int wrong = 0;
     for (auto &k : cl) {
+        pump(1000);                                               // a fresh rate window: each row is up to four requests
         std::string name(k.len, 'c');
         if (k.len >= 2) name[k.len - 1] = 'z';                    // the last byte is the one an overrun would cost
         char before[sizeof c.lease];
@@ -2548,6 +2552,7 @@ static void test_session_open_bounds() {
         { "8589934622", false, 0 } };   // 2^33 + 30
     wrong = 0;
     for (auto &k : id_s) {
+        pump(1000);
         char before[sizeof c.lease];
         memcpy(before, &c.lease, sizeof before);
         J r = open_with("bounds", k.v);
