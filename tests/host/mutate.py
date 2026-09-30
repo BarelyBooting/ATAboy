@@ -2297,9 +2297,13 @@ MUTANTS = [
      '            } else if (!on_credit && !(cdc_connected',
      '            } else if (r->op == CTL_OP_SETUP_CTRLG && !(cdc_connected'),
     # review A LOW-1: the credit decided by a second reading of the clock (the fault the fix removed)
-    ('API LOW-1: the credit asked again with a second reading of the clock at the terminal check', 'ctl.c',
-     '            } else if (!on_credit && !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {',
-     '            } else if (!(r->op == CTL_OP_MOUNT && credit_live(now_ms())) && !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {'),
+    # Corrected 2026-09-30: the first version of this mutant put the SECOND reading into the terminal
+    # check (a lapsed credit is then refused NO_TERMINAL, which is stricter, not the fault) and it
+    # SURVIVED, correctly. The fault the fix removed is the other way round: the terminal check skipped
+    # on the first reading and the credit asked again with a second reading, so a lapsed credit waits.
+    ('API LOW-1: the credit asked again with a second reading of the clock (a lapsed credit waits)', 'ctl.c',
+     '    if (on_credit) {\n        c.credit.live = false;',
+     '    if (r->op == CTL_OP_MOUNT && credit_live(now_ms())) {\n        c.credit.live = false;'),
     ('API LOW-8: a plain junk line (not starting with {) is not counted toward the rate', 'ctl.c',
      '    bool admit = ctl_rate_admit(&c.rate, now_ms());\n',
      "    bool admit = line[0] != '{' ? true : ctl_rate_admit(&c.rate, now_ms());\n"),
