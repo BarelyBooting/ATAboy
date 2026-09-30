@@ -2343,6 +2343,30 @@ static void test_detach_lease() {
     CHECK(is_refusal(r, "E_NO_LEASE") && config.cyls == 980, "a token, no lease: %s", r["err"]["code"].s.c_str());
     r = ask1(req(7, "detach", named(0).c_str()));
     CHECK(r["outcome"].is("DONE") && config.cyls == 0, "tokenless detach after the lease ended: %s", r["err"]["code"].s.c_str());
+    // FORK-README item 36, consequence (3), pinned (review A LOW-3): the token is
+    // checked when detach ARRIVES and not again at its pickup, so a tokenless
+    // detach that arrived before any session opened still runs, and clears the
+    // set-up, if a session opens while it waits for core 1. Stated, not fixed
+    // (it is bounded by the 30 s pickup window); this test is what keeps the
+    // statement true, and fails if a pickup check is ever added without the
+    // statement and the owner's ruling changing with it.
+    fresh("stage 4: a detach that arrived before the lease still runs");
+    tui_setup_chs(980, 10, 17);
+    core1_runs = false;                             // core 1 is away: the detach waits for it
+    host_send(req(2, "detach", named(0).c_str()));
+    pump(5);
+    CHECK(ctl_job.state == CTL_JOB_QUEUED && !c.lease.held && host_lines().empty(), "the detach is not queued (state %u)", (unsigned)ctl_job.state);
+    r = open_lease(3);
+    CHECK(r["outcome"].is("DONE") && c.lease.held && ctl_setup_src != CTL_SRC_NONE && ctl_job.state == CTL_JOB_QUEUED,
+          "a session opened while it waited: %s", r["outcome"].s.c_str());
+    core1_runs = true;
+    pump(60);
+    std::vector<std::string> dq = host_lines();
+    J dj;
+    CHECK(dq.size() == 1 && parse_response(dq[0], dj) && dj["id"].n == 2 && dj["outcome"].is("DONE") && dj["result"]["detached"].b &&
+          config.cyls == 0 && ctl_setup_src == CTL_SRC_NONE && c.lease.held,
+          "the queued detach: %zu answers, %s %s, cyls %u, lease held %d", dq.size(), dj["outcome"].s.c_str(), dj["err"]["code"].s.c_str(),
+          (unsigned)config.cyls, (int)c.lease.held);
 }
 
 #if ATABOY_BOARD_JUMPERS
