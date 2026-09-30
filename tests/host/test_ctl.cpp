@@ -568,7 +568,7 @@ static void test_rate() {
     // Empty lines are not requests: no answer and no count.
     fresh("rate: empty lines do not count");
     std::string blanks;
-    for (int i = 0; i < 40; i++) blanks += "\n";
+    for (int i = 0; i < 40; i++) blanks += (i % 2) ? "\r\n" : "\n";      // review delta-B R5: a bare CR line is empty too
     r = ask(blanks, 200);
     k = ask1(req(1, "chip.info"));
     CHECK(r.empty() && k["outcome"].is("DONE"), "%zu answers to empty lines, then %s", r.size(), k["outcome"].s.c_str());
