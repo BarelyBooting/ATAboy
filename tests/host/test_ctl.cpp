@@ -521,16 +521,20 @@ static void test_rate() {
     std::string noise;
     for (int i = 0; i < 30; i++) noise += (i % 2) ? std::string("AT\r\n") : std::string("{\"v\":1,\"id\":1,\"op\":\"status\"\x01}\n");
     r = ask(noise, 200);
-    int pe = 0, re = 0, nulls = 0, first_rate = -1;
+    int pe = 0, re = 0, nulls = 0, first_rate = -1, safe = 0;
     for (size_t i = 0; i < r.size(); i++) {
         J q;
         if (!parse_response(r[i], q)) continue;
+        safe += q["retry"].is("SAFE");                  // review delta-B R2
         pe += is_refusal(q, "E_PARSE");
         if (is_refusal(q, "E_RATE")) { re++; if (first_rate < 0) first_rate = (int)i; }
         nulls += q["id"].t == J::NUL;
     }
     CHECK(r.size() == 30 && pe == 20 && re == 10 && first_rate == 20 && nulls == 30,
           "%zu answers to 30 malformed lines: %d E_PARSE, %d E_RATE (first at %d), %d with id null", r.size(), pe, re, first_rate, nulls);
+    // Every one of them, the over-limit E_RATE included, says retry SAFE (the
+    // line changed nothing; RESPONSE "A LOW-8"), not AFTER_STATUS or UNSAFE.
+    CHECK(safe == 30, "%d of 30 answers to malformed lines say retry SAFE", safe);
     k = ask1(req(1, "chip.info"));
     CHECK(is_refusal(k, "E_RATE"), "a well-formed request in the same second as 20 malformed lines: %s", k["outcome"].s.c_str());
     pump(1000);
