@@ -2226,6 +2226,28 @@ MUTANTS = [
     ('API S4: a token sent with detach is not checked', 'ctl.c',
      '    int t = ctlj_find(d, 0, "token");\n    if (t > 0) {\n        uint8_t by;',
      '    int t = ctlj_find(d, 0, "token");\n    if (t > 0) return true;\n    if (t > 0) {\n        uint8_t by;'),
+    # a guarded request waits for its act only with a terminal open and the TUI
+    # on the main menu (owner ruling 2026-09-29, review A MED-3 (2)).
+    ('API S4: a guarded request waits with no terminal check at all', 'ctl.c',
+     '            } else if (!(r->op == CTL_OP_MOUNT && credit_live(now_ms())) && !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {',
+     '            } else if (0) {'),
+    ('API S4: NO_TERMINAL looks only at the terminal, not the main menu', 'ctl.c',
+     '&& !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {', '&& !cdc_connected) {'),
+    ('API S4: NO_TERMINAL looks only at the main menu, not the terminal', 'ctl.c',
+     '&& !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {', '&& !(ctl_tui_state == CTL_TUI_MAIN)) {'),
+    ('API S4: the pair\'s credit mount needs a terminal too', 'ctl.c',
+     '            } else if (!(r->op == CTL_OP_MOUNT && credit_live(now_ms())) && !(cdc_connected',
+     '            } else if (!(cdc_connected'),
+    ('API S4: NO_TERMINAL is checked before the other preconditions', 'ctl.c',
+     '            e = ctl_mreq_check((uint8_t)r->op, &m, &field, &why);\n',
+     '            e = !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN) ? (why = "NO_TERMINAL", CTL_E_PRECONDITION) : ctl_mreq_check((uint8_t)r->op, &m, &field, &why);\n'),
+    ('API S4: NO_TERMINAL says another why', 'ctl.c',
+     'why = "NO_TERMINAL"; msg =', 'why = "NO_TERM"; msg ='),
+    ('API S4: NO_TERMINAL is E_LOCKED', 'ctl.c',
+     'e = CTL_E_PRECONDITION; why = "NO_TERMINAL"; msg =', 'e = CTL_E_LOCKED; why = "NO_TERMINAL"; msg ='),
+    ('API S4: NO_TERMINAL only for setup.ctrlg, not mount', 'ctl.c',
+     '            } else if (!(r->op == CTL_OP_MOUNT && credit_live(now_ms())) && !(cdc_connected',
+     '            } else if (r->op == CTL_OP_SETUP_CTRLG && !(cdc_connected'),
 ]
 
 

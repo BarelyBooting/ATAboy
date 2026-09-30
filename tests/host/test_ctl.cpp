@@ -2127,7 +2127,12 @@ static std::string reqt(uint32_t id, const char *op, const std::string &token, c
     return b;
 }
 static std::string lease_token;
+// A session in these tests is one with a terminal open on the setup screen's
+// port, the TUI on the main menu: a guarded request waits for its act only
+// then (owner ruling 2026-09-29, review A MED-3 (2)). The tests of "no
+// terminal" close it afterwards.
 static J open_lease(uint32_t id, unsigned idle_s = 300, const char *client = "test") {
+    cdc_connected = true;
     char a[96];
     snprintf(a, sizeof a, "{\"client\":\"%s\",\"tui_lock\":false,\"idle_s\":%u}", client, idle_s);
     J r = ask1(req(id, "session.open", a));
@@ -3140,15 +3145,22 @@ static void test_pickup() {
 }
 
 // No terminal on interface 0 (R-API-1 finding 1): the job neither draws nor
-// reads a key, ends within its time, and the TUI's queue is as it was.
+// reads a key, ends within its time, and the TUI's queue is as it was. Since
+// 2026-09-29 a request is only left waiting while a terminal is open on the
+// main menu (test_no_terminal_refusal), so here the terminal closes AFTER
+// the request is waiting and before the act: the person who took JP2 off and
+// on did so after closing it, and the job must still run without it.
 static void test_tier_m_no_terminal() {
     fresh("stage 4: Tier M with no terminal");
     power_drive();
+    open_lease(1);
+    hold2(false, 400);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args(980, 10, 17, "idp", "master", ",\"then_mount\":true")));
+    CHECK(c.pres.waiting, "the pair's set-up is not waiting");
     cdc_connected = false;
     tty.assign(4096, 'q');
     std::string tty0 = tty;
-    open_lease(1);
-    pair_setup(2);
+    hold2(true, 250);
     J a = one_answer();
     J m = ask1(reqt(3, "mount", lease_token, mount_args()), nullptr, 20);
     CHECK(a["outcome"].is("DONE") && m["outcome"].is("DONE") && tty == tty0 && job_tui_io == 0,
@@ -3156,12 +3168,12 @@ static void test_tier_m_no_terminal() {
     // A drive that does not answer: the job ends (FAILED), within 75 s, and draws nothing.
     fresh("stage 4: Tier M with no terminal, no drive");
     sim.hw_reset_wedges = true;                          // BSY for ever after RESET-
-    cdc_connected = false;
-    tty.assign(4096, 'q');
-    tty0 = tty;
     open_lease(1);
     hold2(false, 400);
     send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    cdc_connected = false;
+    tty.assign(4096, 'q');
+    tty0 = tty;
     hold2(true, 250);
     pump(80000);
     J f = one_answer();
@@ -3172,12 +3184,12 @@ static void test_tier_m_no_terminal() {
     // sent, nothing drawn, nothing waiting afterwards.
     fresh("stage 4: Tier M with no terminal, refused at pickup");
     power_drive();
-    cdc_connected = false;
-    tty.assign(4096, 'q');
-    tty0 = tty;
     open_lease(1);
     hold2(false, 400);
     send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    cdc_connected = false;
+    tty.assign(4096, 'q');
+    tty0 = tty;
     core1_runs = false;
     hold2(true, 250);
     busy_until_ns = mock_now_ns + 5000000000ull;
@@ -3189,6 +3201,108 @@ static void test_tier_m_no_terminal() {
           "refused at pickup: %s, commands %d, resets %d, tty %d, io %d", rf["err"]["code"].s.c_str(), sim.commands,
           sim.hw_resets, tty == tty0, job_tui_io);
     busy_until_ns = 0;
+    cdc_connected = false;
+}
+
+// A guarded request is refused, not left waiting, unless the person can see
+// the presence row: the TUI on the main menu with a terminal connected (owner
+// ruling 2026-09-29 on review A MED-3 (2)). E_PRECONDITION, why NO_TERMINAL,
+// nothing queued, nothing sent, the act that follows approves nothing.
+static void test_no_terminal_refusal() {
+    struct Case { const char *name; bool connected; uint8_t screen; } cases[] = {
+        { "no terminal", false, CTL_TUI_MAIN },
+        { "terminal, boot", true, CTL_TUI_BOOT },
+        { "terminal, features", true, CTL_TUI_FEATURES },
+        { "terminal, debug", true, CTL_TUI_DEBUG },
+        { "terminal, mounted screen", true, CTL_TUI_MOUNTED },
+        { "terminal, confirm box", true, CTL_TUI_CONFIRM },
+        { "terminal, error box", true, CTL_TUI_ERROR_BOX },
+        { "terminal, modal", true, CTL_TUI_MODAL },
+        { "no terminal, features", false, CTL_TUI_FEATURES },
+    };
+    for (const char *op : { "setup.ctrlg", "mount" }) {
+        for (auto &k : cases) {
+            fresh("stage 4: no terminal, no wait");
+            power_drive();
+            config.drive_write_protected = true;
+            open_lease(1);
+            if (!strcmp(op, "mount")) tui_setup_chs(980, 10, 17);
+            hold2(false, 400);
+            cdc_connected = k.connected;
+            core1_screen = k.screen;
+            if (k.screen == CTL_TUI_BOOT) { core1_runs = false; ctl_tui_state = CTL_TUI_BOOT; }
+            pump(3);
+            std::string line = !strcmp(op, "mount") ? reqt(2, "mount", lease_token, mount_args("TUI_DETECT_NORMAL"))
+                                                    : reqt(2, "setup.ctrlg", lease_token, ctrlg_args());
+            std::string d0 = state2();
+            host_send(line);
+            pump(20);
+            J r = one_answer();
+            CHECK(is_refusal(r, "E_PRECONDITION") && r["err"]["why"].is("NO_TERMINAL") && r["retry"].is("SAFE") &&
+                  !c.pres.waiting && ctl_job.state == CTL_JOB_EMPTY && sim.commands == 0 && state2() == d0,
+                  "%s %s: %s %s waiting %d", op, k.name, r["err"]["code"].s.c_str(), r["err"]["why"].s.c_str(), (int)c.pres.waiting);
+            // The act approves nothing: no request waits, nothing is queued, nothing is sent.
+            hold2(true, 250);
+            hold2(false, 30);
+            CHECK(!c.pres.waiting && ctl_job.state == CTL_JOB_EMPTY && sim.commands == 0 && host_lines().empty() && !is_mounted,
+                  "%s %s: the act after the refusal did something", op, k.name);
+            // The refusal is what the replay table keeps.
+            host_send(line);
+            pump(20);
+            J rp = one_answer();
+            CHECK(rp["replayed"].b && rp["err"]["why"].is("NO_TERMINAL") && !c.pres.waiting, "%s %s: the resend", op, k.name);
+            // status says nothing waits.
+            J st = status4(3);
+            CHECK(!st["result"]["presence"]["waiting"].b, "%s %s: status.presence", op, k.name);
+        }
+    }
+    // With a terminal on the main menu the same request waits, and the act runs it.
+    for (const char *op : { "setup.ctrlg", "mount" }) {
+        fresh("stage 4: a terminal on the main menu: the wait");
+        power_drive();
+        config.drive_write_protected = true;
+        open_lease(1);
+        if (!strcmp(op, "mount")) tui_setup_chs(980, 10, 17);
+        hold2(false, 400);
+        cdc_connected = true;
+        pump(3);
+        CHECK(ctl_tui_state == CTL_TUI_MAIN, "the published state %u", ctl_tui_state);
+        send_only(!strcmp(op, "mount") ? reqt(2, "mount", lease_token, mount_args("TUI_DETECT_NORMAL"))
+                                        : reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+        CHECK(c.pres.waiting && c.pres.id == 2, "%s: not waiting with a terminal on the main menu", op);
+        hold2(true, 250);
+        J ok = one_answer();
+        CHECK(ok["outcome"].is("DONE"), "%s: %s %s", op, ok["outcome"].s.c_str(), ok["err"]["code"].s.c_str());
+        cdc_connected = false;
+    }
+    // The refusal comes after every other check, so a request that fails for another reason keeps its own answer.
+    fresh("stage 4: no terminal, another refusal first");
+    power_drive();
+    config.drive_write_protected = true;
+    open_lease(1);
+    tui_setup_chs(980, 10, 17);
+    cdc_connected = false;
+    pump(3);
+    J st = ask1(reqt(2, "mount", lease_token, mount_args("TUI_DETECT_NORMAL", 979)));
+    CHECK(is_refusal(st, "E_STALE"), "a mount naming another geometry, no terminal: %s %s", st["err"]["code"].s.c_str(), st["err"]["why"].s.c_str());
+    J bad = ask1(reqt(3, "setup.ctrlg", std::string(32, '0'), ctrlg_args()));
+    CHECK(is_refusal(bad, "E_LEASE_INVALID"), "a wrong token, no terminal: %s", bad["err"]["code"].s.c_str());
+    J wr = ask1(reqt(4, "setup.ctrlg", lease_token, ctrlg_args(980, 10, 17, "idp", "slave")));
+    CHECK(is_refusal(wr, "E_PRECONDITION") && wr["err"]["why"].is("NOT_THE_DEVICE"), "another device, no terminal: %s %s",
+          wr["err"]["code"].s.c_str(), wr["err"]["why"].s.c_str());
+    // A mount on the pair's credit is not a wait: it needs no terminal (the credit was earned by one act,
+    // under a terminal, and taking it waits for nothing).
+    fresh("stage 4: the pair's mount, the terminal closed after the set-up");
+    cdc_connected = true;
+    open_lease(1);
+    pair_setup(2);
+    J a = one_answer();
+    CHECK(a["outcome"].is("DONE") && a["result"]["mount_credit"].b, "the set-up under a terminal: %s", a["outcome"].s.c_str());
+    cdc_connected = false;
+    pump(3);
+    J m = ask1(reqt(3, "mount", lease_token, mount_args()), nullptr, 20);
+    CHECK(m["outcome"].is("DONE") && is_mounted, "the credit's mount with the terminal closed: %s %s", m["outcome"].s.c_str(),
+          m["err"]["code"].s.c_str());
     cdc_connected = false;
 }
 
@@ -3928,6 +4042,7 @@ static void serve(int jp = 0) {
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
     power_up();
+    cdc_connected = true;       // a terminal on the main menu: a guarded request waits for its act only then (2026-09-29)
     port.got.clear();
     // A mounted drive's worth of log, so log.read has something to return.
     for (int i = 0; i < 5; i++) obs_marker(OBS_EV_MOUNT, 9, 0, 0, 0, (uint16_t)i, 0xA0);
@@ -4048,6 +4163,7 @@ int main(int argc, char **argv) {
     test_presence_wrap();
     test_credit_mount_only();
     test_mount_wp_off();
+    test_no_terminal_refusal();
     test_ctrlg_layers();
 #else
     test_tier_m_no_jumpers();

@@ -1080,6 +1080,15 @@ static void tier_m_arrival(uint32_t id, const uint8_t digest[32], const ctlj_doc
             if (e != CTL_E_NONE) {
                 msg = "a precondition is not met";
                 if (e == CTL_E_STALE) retry = CTL_RETRY_AFTER_STATUS;
+            } else if (!(r->op == CTL_OP_MOUNT && credit_live(now_ms())) && !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {
+                // A request that would wait for its act is refused unless the
+                // person can see the presence row: the TUI on the main menu
+                // with a terminal connected (owner ruling 2026-09-29, review A
+                // MED-3 (2)). Last, so any other refusal keeps its own answer;
+                // a mount on the pair's credit waits for nothing and is not
+                // asked. Checked at arrival: a terminal that closes during the
+                // wait does not end it (FORK-README item 36).
+                e = CTL_E_PRECONDITION; why = "NO_TERMINAL"; msg = "no terminal shows the presence row: the TUI must be on the main menu with a terminal connected";
             }
         }
     }

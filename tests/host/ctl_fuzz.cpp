@@ -524,6 +524,10 @@ int main(int argc, char **argv) {
     load_corpus(dir);
     if (corpus.empty()) { printf("COULD NOT RUN: no corpus in %s\n", dir); return 98; }
     power_up();
+    // A guarded request waits for its act only with a terminal open and the TUI on the main menu (2026-09-29): the fuzzer
+    // opens one, and the events below close it and leave the main menu now and then. Without this every Tier M line
+    // is refused NO_TERMINAL, which is what the coverage guard at the end refuses to let pass silently.
+    cdc_connected = true;
     runs_scanned = log_next;
 #if ATABOY_BOARD_JUMPERS
     after_task = jp_oracle;
@@ -559,12 +563,13 @@ int main(int argc, char **argv) {
 #endif
         bool events = below(12) == 0;
         if (events) {
-            switch (below(5)) {
+            switch (below(6)) {
             case 0: tud_cdc_line_state_cb(1, false, false); pump(2); tud_cdc_line_state_cb(1, true, false); break;
             case 1: ctl_on_usb_mount(); break;
             case 2: core1_runs = !core1_runs; break;
             case 3: mock_now_ns += (uint64_t)(51 + below(5000)) * 1000000ull; break;
-            case 4: core1_screen = (uint8_t)below(CTL_TUI_MODAL + 1); break;
+            case 4: core1_screen = below(3) ? (uint8_t)CTL_TUI_MAIN : (uint8_t)below(CTL_TUI_MODAL + 1); break;
+            case 5: cdc_connected = below(3) != 0; break;
             }
         }
         // The count oracle needs core 1 able to take a job before its 30 s.
@@ -594,6 +599,11 @@ int main(int argc, char **argv) {
     printf("\nTier M: %llu lines, %llu waited for an act, %llu ran (%llu on a credit), %llu late answers",
            (unsigned long long)fz_tier_m_lines, (unsigned long long)fz_waited, (unsigned long long)fz_tier_m_runs,
            (unsigned long long)fz_credit_runs, (unsigned long long)fz_late_answers);
+#endif
+#if ATABOY_BOARD_JUMPERS
+    // Coverage guard: a run of this size that never saw a guarded request wait for its act, or run, tested nothing of
+    // Tier M's flow (the change that made a wait need a terminal took both to 0 without any check failing).
+    if (iters >= 20000 && (fz_waited == 0 || fz_tier_m_runs == 0)) violation("no guarded request waited or ran: Tier M was not exercised", "", "");
 #endif
     printf("\n%llu checks, %d failed\n", (unsigned long long)lines_sent, violations);
     return violations > 255 ? 255 : violations;
