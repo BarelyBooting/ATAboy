@@ -2419,11 +2419,14 @@ static std::string token_of(uint64_t r0, uint64_t r1) {
 }
 static void test_token_entropy() {
     fresh("stage 4: the token is the RNG's 128 bits, in order");
-    const uint64_t A = 0x0123456789abcdefull, B = 0xfedcba9876543210ull;
+    // B has no structural relation to A (review delta-B LOW-8): with B == ~A and
+    // B ending in 0 a token built from r1 = ~r0, or ending in a constant digit,
+    // passed this first check and only the nibble loop below caught it.
+    const uint64_t A = 0x0123456789abcdefull, B = 0x9e3779b97f4a7c15ull;
     uint32_t id = 1;
     rand_script = { A, B };
     J r = open_lease(id++);
-    CHECK(r["outcome"].is("DONE") && lease_token == "0123456789abcdeffedcba9876543210" && rand_script.empty(),
+    CHECK(r["outcome"].is("DONE") && lease_token == "0123456789abcdef9e3779b97f4a7c15" && rand_script.empty(),
           "pinned draws A then B gave token %s", lease_token.c_str());
     // Every one of the 32 digits follows its own nibble: flip that nibble in
     // the draw, and exactly that digit of the token changes.
