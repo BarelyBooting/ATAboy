@@ -2665,7 +2665,10 @@ static void test_token_confinement() {
         for (size_t k = 0; k + 8 <= sizeof(obs_log_entry_t); k++) {
             uint64_t v = 0;
             memcpy(&v, e + k, 8);
-            if (v == 0xC0FFEE0123456789ull || v == 0x89674523EEFFC0ull) in_log = true;
+            // Both draws, in either byte order (review delta-B LOW-10: the byte-reversed
+            // constant here was mistyped, and the second draw was never looked for).
+            for (uint64_t draw : { 0xC0FFEE0123456789ull, 0xDEADBEEF87654321ull })
+                if (v == draw || v == __builtin_bswap64(draw)) in_log = true;
         }
     }
     CHECK(!in_log, "the token's bytes are in the command log");
