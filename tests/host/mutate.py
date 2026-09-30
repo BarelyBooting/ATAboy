@@ -2378,6 +2378,22 @@ PROGRAMS = ['test_read', 'test_read_pipelined', 'transcripts', 'transcript_golde
 TIMEOUT_S = 900
 
 
+def rm_tree(path):
+    """Remove a scratch tree. On Windows the copied source has read-only directories (boards, test),
+    which `shutil.rmtree(..., ignore_errors=True)` silently leaves behind as a skeleton in %TEMP%
+    (72 of them after one targeted run: review delta-B LOW-11, second part); clear the attribute and retry."""
+    def fix(func, p, exc):
+        try:
+            os.chmod(p, 0o777)
+            func(p)
+        except OSError:
+            pass
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=fix)
+    else:
+        shutil.rmtree(path, onerror=fix)
+
+
 def run_tests(srcdir, outdir):
     """run.sh on srcdir; None if it did not finish within TIMEOUT_S.
 
@@ -2438,7 +2454,7 @@ def main():
     try:
         base = run_tests(SRC, base_dir)
     finally:
-        shutil.rmtree(base_dir, ignore_errors=True)     # review delta-B LOW-11: it was never removed
+        rm_tree(base_dir)     # review delta-B LOW-11: it was never removed
     if base is None:
         print('the unmutated sources timed out'); return 2
     last = ' / '.join(l for l in base.stdout.splitlines() if 'checks,' in l) or base.stderr[-500:]
@@ -2468,7 +2484,7 @@ def main():
         if text.count(old) != 1:
             bad_setup.append((name, f'text found {text.count(old)} times'))
             print(f'NOT APPLIED  {name}')
-            shutil.rmtree(tmp, ignore_errors=True); continue
+            rm_tree(tmp); continue
         open(path, 'wb').write(text.replace(old, new).encode('utf-8'))
         p = run_tests(src, os.path.join(tmp, 'out'))
         if p is None:
@@ -2476,7 +2492,7 @@ def main():
             # in "killed". Rerun it alone; it counts only if a check then fails.
             timed_out.append(name)
             print(f'TIMEOUT      {name}\n             no result after {TIMEOUT_S} s (not counted as killed)')
-            shutil.rmtree(tmp, ignore_errors=True); continue
+            rm_tree(tmp); continue
         out = p.stdout.strip().splitlines()
         sums = [l for l in out if 'checks,' in l]
         summary = ' / '.join(sums)
@@ -2496,11 +2512,11 @@ def main():
             else:
                 bad_setup.append((name, 'did not build: ' + (p.stderr.strip().splitlines() or ['?'])[-1]))
                 print(f'NO RESULT    {name}')
-            shutil.rmtree(tmp, ignore_errors=True); continue
+            rm_tree(tmp); continue
         if p.returncode == 0 and len(sums) != len(PROGRAMS):
             bad_setup.append((name, f'{len(sums)} of {len(PROGRAMS)} test programs reported'))
             print(f'NO RESULT    {name}')
-            shutil.rmtree(tmp, ignore_errors=True); continue
+            rm_tree(tmp); continue
         if p.returncode != 0:
             killed.append(name)
             first = next((l for l in out if l.startswith('FAIL')), '')
@@ -2508,7 +2524,7 @@ def main():
         else:
             survived.append(name)
             print(f'SURVIVED     {name}  ({summary})')
-        shutil.rmtree(tmp, ignore_errors=True)
+        rm_tree(tmp)
     print(f'\n{len(killed)} killed, {len(survived)} survived, {len(timed_out)} timed out (not kills), {len(bad_setup)} not run, of {len(chosen)}'
           + (f' (filtered from {len(MUTANTS)})' if words or shard else '')
           + (f', shard {shard[0]}/{shard[1]}' if shard else ''))
