@@ -2532,7 +2532,20 @@ static void test_session_open_bounds() {
     struct { const char *v; bool ok; uint32_t s; } id_s[] = {
         { "0", false, 0 }, { "29", false, 0 }, { "30", true, 30 }, { "31", true, 31 }, { "599", true, 599 }, { "600", true, 600 },
         { "601", false, 0 }, { "4294967", false, 0 }, { "4294968", false, 0 }, { "4294967296", false, 0 },
-        { "9007199254740991", false, 0 } };
+        { "9007199254740991", false, 0 },
+        // Review delta-B MED-2 (S5): values that TRUNCATE, in 32 bits, to a valid
+        // idle_s (2^32 + 30 -> 30, 2^32 + 600 -> 600) and their neighbours; the
+        // three old rows above all truncate to something out of range as well, so
+        // they could not tell a 64-bit compare from a 32-bit one.
+        { "4294967295", false, 0 },     // 2^32 - 1
+        { "4294967297", false, 0 },     // 2^32 + 1
+        { "4294967325", false, 0 },     // 2^32 + 29
+        { "4294967326", false, 0 },     // 2^32 + 30
+        { "4294967327", false, 0 },     // 2^32 + 31
+        { "4294967895", false, 0 },     // 2^32 + 599
+        { "4294967896", false, 0 },     // 2^32 + 600
+        { "4294967897", false, 0 },     // 2^32 + 601
+        { "8589934622", false, 0 } };   // 2^33 + 30
     wrong = 0;
     for (auto &k : id_s) {
         char before[sizeof c.lease];
