@@ -11,6 +11,10 @@ reported as such and makes the run fail, so it is never counted as killed.
     python tests/host/mutate.py WORD ...   only the mutants whose name contains a WORD
     --shard i/n                            every n-th chosen mutant from i
     --timeout SECONDS                      per run of run.sh (default 900)
+    --check-anchors                        only check that every mutant's text applies
+                                           exactly once (seconds, no build); exit 1 if
+                                           any does not. Run it after any edit to
+                                           FW source (review delta-B MED-4).
 
 Three results are kept apart and never added together: KILLED (a check
 failed, or a program crashed after building), SURVIVED, and the two states
@@ -1442,8 +1446,11 @@ MUTANTS = [
      'if (!known) { *field = "args"; return CTL_E_SCHEMA; }', 'if (0) { *field = "args"; return CTL_E_SCHEMA; }'),
     ('API: argument ranges not checked', 'ctl_policy.c',
      'if (s->type == CTLJ_INT && (v->num < s->lo || v->num > s->hi)) return CTL_E_RANGE;', ''),
+    # Re-anchored 2026-09-29 (review delta-B MED-4): ea93cc9 made the token optional for detach
+    # (`bool optional = ...`), so the old anchor `if (ctl_op_needs_token(r->op) != (token > 0)) {`
+    # no longer existed and this mutant was NOT APPLIED. It mutates the same compare, behind `!optional`.
     ('API: a token accepted where none belongs', 'ctl_policy.c',
-     'if (ctl_op_needs_token(r->op) != (token > 0)) {', 'if (ctl_op_needs_token(r->op) && token < 0) {'),
+     'if (!optional && ctl_op_needs_token(r->op) != (token > 0)) {', 'if (!optional && ctl_op_needs_token(r->op) && token < 0) {'),
     ('API: a duplicate key let through after the v check', 'ctl.c',
      'if (e != CTL_E_PROTO_VERSION && pr == CTLJ_E_DUP) {', 'if (0 && pr == CTLJ_E_DUP) {'),
     ('API X1: wp.off in the op table', 'ctl_policy.c',
@@ -1971,8 +1978,10 @@ MUTANTS = [
     ('API S4 X50: the credit usable after 60 s', 'ctl.c',
      '           now - c.credit.end_ms <= CTL_MOUNT_CREDIT_S * 1000u && ctl_epoch == c.credit.epoch;',
      '           ctl_epoch == c.credit.epoch;'),
+    # The next six were re-anchored 2026-09-29 (review A LOW-1): tier_m_arrival now decides
+    # `on_credit` once from one reading of the clock, so their old text no longer existed.
     ('API S4 X50: the credit usable by an op other than mount', 'ctl.c',
-     '    if (r->op == CTL_OP_MOUNT && credit_live(now)) {', '    if (credit_live(now)) {'),
+     '    const bool on_credit = r->op == CTL_OP_MOUNT && credit_live(now);', '    const bool on_credit = credit_live(now);'),
     ('API S4 X50: the credit usable after an epoch change', 'ctl.c',
      '           now - c.credit.end_ms <= CTL_MOUNT_CREDIT_S * 1000u && ctl_epoch == c.credit.epoch;',
      '           now - c.credit.end_ms <= CTL_MOUNT_CREDIT_S * 1000u;'),
@@ -1997,9 +2006,9 @@ MUTANTS = [
     ('API S4: the credit from the set-up\'s queueing, not its end', 'ctl.c',
      '            c.credit.end_ms = j->ended_ms;', '            c.credit.end_ms = j->queued_ms;'),
     ('API S4 X65: a mount with a live credit put in the presence slot', 'ctl.c',
-     '    if (r->op == CTL_OP_MOUNT && credit_live(now)) {', '    if (0) {'),
+     '    if (on_credit) {', '    if (0) {'),
     ('API S4 X65: a mount with no live credit queued without an act', 'ctl.c',
-     '    if (r->op == CTL_OP_MOUNT && credit_live(now)) {', '    if (r->op == CTL_OP_MOUNT) {'),
+     '    if (on_credit) {', '    if (r->op == CTL_OP_MOUNT) {'),
     ('API S4: status mount_credit_ms_left always 0', 'ctl.c',
      '    ctlw_uint(w, "mount_credit_ms_left", credit_ms_left(now_ms()));', '    ctlw_uint(w, "mount_credit_ms_left", 0);'),
     ('API S4 X68: a mount-name mismatch cancels the credit', 'ctl.c',
@@ -2229,14 +2238,14 @@ MUTANTS = [
     # a guarded request waits for its act only with a terminal open and the TUI
     # on the main menu (owner ruling 2026-09-29, review A MED-3 (2)).
     ('API S4: a guarded request waits with no terminal check at all', 'ctl.c',
-     '            } else if (!(r->op == CTL_OP_MOUNT && credit_live(now_ms())) && !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {',
+     '            } else if (!on_credit && !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {',
      '            } else if (0) {'),
     ('API S4: NO_TERMINAL looks only at the terminal, not the main menu', 'ctl.c',
      '&& !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {', '&& !cdc_connected) {'),
     ('API S4: NO_TERMINAL looks only at the main menu, not the terminal', 'ctl.c',
      '&& !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {', '&& !(ctl_tui_state == CTL_TUI_MAIN)) {'),
     ('API S4: the pair\'s credit mount needs a terminal too', 'ctl.c',
-     '            } else if (!(r->op == CTL_OP_MOUNT && credit_live(now_ms())) && !(cdc_connected',
+     '            } else if (!on_credit && !(cdc_connected',
      '            } else if (!(cdc_connected'),
     ('API S4: NO_TERMINAL is checked before the other preconditions', 'ctl.c',
      '            e = ctl_mreq_check((uint8_t)r->op, &m, &field, &why);\n',
@@ -2249,8 +2258,12 @@ MUTANTS = [
      '            refuse(true, r.id, CTL_E_STALE_ID, "id not above max_mutating_id; an earlier send of it may have run: read status, do not resend under a new id", "id");\n',
      '            send_error(true, r.id, CTL_OUT_NOT_EXECUTED, CTL_RETRY_AFTER_STATUS, CTL_E_STALE_ID, "id not above max_mutating_id; an earlier send of it may have run: read status, do not resend under a new id", 0, "id", true);\n'),
     ('API S4: NO_TERMINAL only for setup.ctrlg, not mount', 'ctl.c',
-     '            } else if (!(r->op == CTL_OP_MOUNT && credit_live(now_ms())) && !(cdc_connected',
+     '            } else if (!on_credit && !(cdc_connected',
      '            } else if (r->op == CTL_OP_SETUP_CTRLG && !(cdc_connected'),
+    # review A LOW-1: the credit decided by a second reading of the clock (the fault the fix removed)
+    ('API LOW-1: the credit asked again with a second reading of the clock at the terminal check', 'ctl.c',
+     '            } else if (!on_credit && !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {',
+     '            } else if (!(r->op == CTL_OP_MOUNT && credit_live(now_ms())) && !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {'),
     ('API LOW-8: a plain junk line (not starting with {) is not counted toward the rate', 'ctl.c',
      '    bool admit = ctl_rate_admit(&c.rate, now_ms());\n',
      "    bool admit = line[0] != '{' ? true : ctl_rate_admit(&c.rate, now_ms());\n"),
@@ -2355,12 +2368,32 @@ def run_tests(srcdir, outdir):
     return subprocess.CompletedProcess(p.args, p.returncode, out, err)
 
 
+def check_anchors():
+    """Every mutant's `old` text is found exactly once in its file and differs from `new`."""
+    bad, cache = [], {}
+    names = {}
+    for name, fname, old, new in MUTANTS:
+        if fname not in cache:
+            cache[fname] = open(os.path.join(SRC, fname), 'rb').read().decode('utf-8').replace('\r\n', '\n')
+        n = cache[fname].count(old)
+        if n != 1: bad.append((name, f'text found {n} times in {fname}'))
+        elif old == new: bad.append((name, 'old and new are the same text'))
+        names[name] = names.get(name, 0) + 1
+    for nm, k in names.items():
+        if k > 1: bad.append((nm, f'name used {k} times (a filter by name would run them all)'))
+    for nm, why in bad: print(f'  BAD ANCHOR: {nm}: {why}')
+    print(f'{len(MUTANTS) - len(bad)} of {len(MUTANTS)} mutants apply exactly once, {len(bad)} do not')
+    return 1 if bad else 0
+
+
 def main():
     global TIMEOUT_S
     args = sys.argv[1:]
     if '--timeout' in args:
         i = args.index('--timeout'); TIMEOUT_S = int(args[i + 1]); del args[i:i + 2]
     sys.argv[1:] = args
+    if '--check-anchors' in args:
+        return check_anchors()
     base_dir = tempfile.mkdtemp(prefix='ataboy-host-')
     try:
         base = run_tests(SRC, base_dir)
