@@ -2361,7 +2361,11 @@ def main():
     if '--timeout' in args:
         i = args.index('--timeout'); TIMEOUT_S = int(args[i + 1]); del args[i:i + 2]
     sys.argv[1:] = args
-    base = run_tests(SRC, tempfile.mkdtemp(prefix='ataboy-host-'))
+    base_dir = tempfile.mkdtemp(prefix='ataboy-host-')
+    try:
+        base = run_tests(SRC, base_dir)
+    finally:
+        shutil.rmtree(base_dir, ignore_errors=True)     # review delta-B LOW-11: it was never removed
     if base is None:
         print('the unmutated sources timed out'); return 2
     last = ' / '.join(l for l in base.stdout.splitlines() if 'checks,' in l) or base.stderr[-500:]
@@ -2390,7 +2394,8 @@ def main():
         text = open(path, 'rb').read().decode('utf-8').replace('\r\n', '\n')
         if text.count(old) != 1:
             bad_setup.append((name, f'text found {text.count(old)} times'))
-            print(f'NOT APPLIED  {name}'); continue
+            print(f'NOT APPLIED  {name}')
+            shutil.rmtree(tmp, ignore_errors=True); continue
         open(path, 'wb').write(text.replace(old, new).encode('utf-8'))
         p = run_tests(src, os.path.join(tmp, 'out'))
         if p is None:
@@ -2421,7 +2426,8 @@ def main():
             shutil.rmtree(tmp, ignore_errors=True); continue
         if p.returncode == 0 and len(sums) != len(PROGRAMS):
             bad_setup.append((name, f'{len(sums)} of {len(PROGRAMS)} test programs reported'))
-            print(f'NO RESULT    {name}'); continue
+            print(f'NO RESULT    {name}')
+            shutil.rmtree(tmp, ignore_errors=True); continue
         if p.returncode != 0:
             killed.append(name)
             first = next((l for l in out if l.startswith('FAIL')), '')
