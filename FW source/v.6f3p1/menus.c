@@ -1817,6 +1817,13 @@ static void trip_screen_draw(void) {
 // core 1, and by the menu loop when core 0 was the one that tripped.
 void trip_screen_forever(void) __attribute__((noreturn));
 void trip_screen_forever(void) {
+#if ATABOY_CTL
+    // The loop's idle point (ctl_core1_idle), the only place ctl_tui_state is
+    // published, is never reached again: without this it would keep saying MAIN
+    // while the trip screen is what the person sees, and a guarded request would
+    // pass the NO_TERMINAL check (review A LOW-4). MODAL refuses it.
+    ctl_tui_busy();
+#endif
     bool shown = false;
     for (;;) {
         bool connected = cdc_connected;

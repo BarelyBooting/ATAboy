@@ -1025,10 +1025,16 @@ static void test_garbage_changes_nothing() {
 }
 
 // ---- 13. core 1's real loop takes a job at its idle point (its own run) -------
+#if ATABOY_BOARD_JUMPERS
+static void core1_trip_stage();
+#endif
 static void core1_done() {
     CHECK(ctl_job.state == CTL_JOB_EMPTY && c.jl_present && c.jl_id == 61, "the job did not run from core1_entry (state %u)",
           (unsigned)ctl_job.state);
     CHECK(ctl_tui_state == CTL_TUI_MAIN, "published state %u", ctl_tui_state);
+#if ATABOY_BOARD_JUMPERS
+    core1_trip_stage();                             // the tripwire screen takes over; does not return
+#endif
     printf("%d checks, %d failed\n", checks, failures);
     exit(failures > 255 ? 255 : failures);
 }
@@ -4048,6 +4054,36 @@ static void test_tier_m_no_jumpers() {
     CHECK(seen >= 2 && wrong == 0, "hello without jumpers: %d Tier M ops, %d not LOCKED for JUMPERS_UNSUPPORTED", seen, wrong);
     // Nothing waited, nothing was queued, nothing reached the drive.
     CHECK(!c.pres.waiting && ctl_job.state == CTL_JOB_EMPTY && sim.cmd_count[0x91] == 0 && sim.hw_resets == 0, "nothing sent");
+}
+#endif
+
+// ---- 13b. after a tripwire stop core 1 shows the trip screen, not the presence row ----
+// (review A LOW-4). Runs at the end of the "core1" run above: the loop had published
+// MAIN, then trip_screen_forever() takes over and never returns to the loop's idle
+// point, which is the only place ctl_tui_state was ever updated. It must say MODAL
+// from then on, or a guarded request passes the NO_TERMINAL check while the person
+// sees the trip screen and no row (and the approved job is never picked up).
+#if ATABOY_BOARD_JUMPERS
+static void core1_trip_hook() {
+    CHECK(ctl_tui_state == CTL_TUI_MODAL, "after the trip screen took over, ctl_tui_state is %u, not MODAL (%u)", ctl_tui_state, CTL_TUI_MODAL);
+    (void)host_lines();                             // the answer to the job that ran before the trip screen
+    power_drive();
+    config.drive_write_protected = true;
+    open_lease(70);
+    hold2(false, 400);
+    J r = ask1(reqt(71, "setup.ctrlg", lease_token, ctrlg_args()));
+    CHECK(is_refusal(r, "E_PRECONDITION") && r["err"]["why"].is("NO_TERMINAL") && !c.pres.waiting && ctl_job.state == CTL_JOB_EMPTY,
+          "a guarded request with the trip screen shown: %s %s, waiting %d", r["outcome"].s.c_str(), r["err"]["why"].s.c_str(), (int)c.pres.waiting);
+    J st = status4(72);
+    CHECK(st["result"]["tui"]["state"].is("MODAL"), "status.tui.state after the trip screen: %s", st["result"]["tui"]["state"].s.c_str());
+    printf("%d checks, %d failed\n", checks, failures);
+    exit(failures > 255 ? 255 : failures);
+}
+static void core1_trip_stage() {
+    cdc_connected = true;
+    on_idle = core1_trip_hook;
+    idle_after_ns = 0;
+    trip_screen_forever();
 }
 #endif
 
