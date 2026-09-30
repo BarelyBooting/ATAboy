@@ -3375,6 +3375,36 @@ static void test_no_terminal_refusal() {
     J wr = ask1(reqt(4, "setup.ctrlg", lease_token, ctrlg_args(980, 10, 17, "idp", "slave")));
     CHECK(is_refusal(wr, "E_PRECONDITION") && wr["err"]["why"].is("NOT_THE_DEVICE"), "another device, no terminal: %s %s",
           wr["err"]["code"].s.c_str(), wr["err"]["why"].s.c_str());
+    // ...and the other refusals that come before it (review delta-B LOW-2, A5):
+    // a stale expect_epoch, JP1, and above all E_INFLIGHT while another request
+    // waits (the terminal closed after it began to wait), each with no terminal.
+    J se = ask1(reqt(5, "setup.ctrlg", lease_token, ctrlg_args(980, 10, 17, "idp", "master", (",\"expect_epoch\":" + std::to_string(epoch_now() + 1)).c_str())));
+    CHECK(is_refusal(se, "E_STALE") && se["err"]["field"].is("expect_epoch"), "a stale expect_epoch, no terminal: %s %s",
+          se["err"]["code"].s.c_str(), se["err"]["why"].s.c_str());
+    fresh("stage 4: no terminal, E_INFLIGHT first");
+    power_drive();
+    config.drive_write_protected = true;
+    open_lease(1);
+    hold2(false, 400);
+    pump(3);
+    send_only(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    CHECK(c.pres.waiting && c.pres.id == 2, "the first request does not wait");
+    cdc_connected = false;                      // the terminal closes; the wait itself is not cut short
+    pump(3);
+    J inf = ask1(reqt(3, "setup.ctrlg", lease_token, ctrlg_args()));
+    CHECK(is_refusal(inf, "E_INFLIGHT") && c.pres.waiting && c.pres.id == 2, "a second request while one waits, no terminal: %s %s",
+          inf["err"]["code"].s.c_str(), inf["err"]["why"].s.c_str());
+    fresh("stage 4: no terminal, E_LOCKED first");
+    power_drive();
+    config.drive_write_protected = true;
+    open_lease(1);
+    hold2(false, 400);
+    cdc_connected = false;
+    jp1_fit(true);
+    pump(3);
+    J lk = ask1(reqt(2, "setup.ctrlg", lease_token, ctrlg_args()));
+    CHECK(is_refusal(lk, "E_LOCKED"), "JP1 fitted, no terminal: %s %s", lk["err"]["code"].s.c_str(), lk["err"]["why"].s.c_str());
+    jp1_fit(false);
     // A mount on the pair's credit is not a wait: it needs no terminal (the credit was earned by one act,
     // under a terminal, and taking it waits for nothing).
     fresh("stage 4: the pair's mount, the terminal closed after the set-up");
