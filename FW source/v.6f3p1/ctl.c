@@ -1131,6 +1131,18 @@ static void pres_poll(uint32_t now, bool fit, uint32_t edge_ms) {
     // After, by the difference: the millisecond clock wraps every 49.7 days,
     // and an edge just before a wrap is not later than an arrival after it.
     if (fit && (int32_t)(edge_ms - c.pres.arrival_ms) > 0 && ctl_job.state == CTL_JOB_EMPTY) {
+        // The condition of tier_m_arrival, asked again at the act (owner ruling
+        // 2026-09-29, review A MED-3 (2) gap): an act approves only what the
+        // person can see, so with no terminal connected or the TUI off the main
+        // menu now the request is withdrawn and the act approves nothing. Only
+        // the moment of the act is asked: a screen that passes through a modal
+        // box while the request waits does not cancel it. Only refuses more.
+        if (!(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {
+            pres_withdraw(CTL_E_PRECONDITION, CTL_BY_NONE,
+                          "no terminal shows the presence row: the TUI must be on the main menu with a terminal connected",
+                          "NO_TERMINAL");
+            return;
+        }
         c.pres.waiting = false;
         presence_publish();
         mailbox_put(c.pres.op, c.pres.id, c.pres.digest, &c.pres.m, c.pres.lease_gen, false, c.pres.slot);
