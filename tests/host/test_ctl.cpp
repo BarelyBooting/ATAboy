@@ -614,8 +614,9 @@ static void test_replay_dispatch() {
     // A lower id not in the table: E_STALE_ID; a higher one runs.
     J d = ask1(req(6, "wp.on"));
     executed = executed_ids({ 6, 7 });
-    CHECK(is_refusal(d, "E_STALE_ID") && executed == 1 && d["err"]["msg"].s.find("may have run") != std::string::npos,
-          "stale id: %s", d["err"]["msg"].s.c_str());
+    // retry stays SAFE, the default SPEC-v1 gives a refusal (owner ruling 2026-09-29, review A LOW-1).
+    CHECK(is_refusal(d, "E_STALE_ID") && executed == 1 && d["err"]["msg"].s.find("may have run") != std::string::npos &&
+          d["retry"].is("SAFE"), "stale id: %s, retry %s", d["err"]["msg"].s.c_str(), d["retry"].s.c_str());
     J e = ask1(req(8, "wp.on"));
     executed = executed_ids({ 6, 7, 8 });
     CHECK(e["outcome"].is("DONE") && executed == 2, "a higher id");
@@ -636,8 +637,8 @@ static void test_replay_dispatch() {
     // Past 16 entries the oldest ended one is forgotten: its resend is E_STALE_ID.
     for (uint32_t id = 20; id < 40; id++) { ask1(req(id, "wp.on")); pump(60); }
     J old = ask1(l7);
-    CHECK(is_refusal(old, "E_STALE_ID") && old["err"]["msg"].s.find("may have run") != std::string::npos, "an evicted id: %s",
-          old["err"]["code"].s.c_str());
+    CHECK(is_refusal(old, "E_STALE_ID") && old["err"]["msg"].s.find("may have run") != std::string::npos && old["retry"].is("SAFE"),
+          "an evicted id: %s, retry %s", old["err"]["code"].s.c_str(), old["retry"].s.c_str());
 }
 
 // ---- 10. the Tier R ops -----------------------------------------------------
