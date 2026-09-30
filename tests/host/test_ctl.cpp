@@ -3050,6 +3050,41 @@ static void test_pair() {
     J m2 = one_answer();
     CHECK(m2["outcome"].is("DONE") && !m2["result"]["used_credit"].b, "the mount's own act: %s", m2["outcome"].s.c_str());
 
+    // The credit's edge, read ONCE (review A LOW-1): the clock moves on with every
+    // read here, so a decision made from two reads of it can straddle the 60 s.
+    // With the terminal closed a mount on the credit is not asked for a terminal
+    // and one not on it is refused NO_TERMINAL; it must never WAIT for an act
+    // that would be withdrawn anyway (the arrival check skipped, the credit gone).
+    {
+        int on_credit = 0, refused = 0, waited = 0;
+        for (int step = 0; step <= 60; step++) {
+            fresh("stage 4: the credit's edge, read once");
+            open_lease(1);
+            pair_setup(2);
+            (void)one_answer();
+            cdc_connected = false;
+            pump(3);
+            uint64_t edge_ns = ((uint64_t)c.credit.end_ms + 60000u) * 1000000ull;
+            uint64_t now_ns = mock_now_ns;
+            if (edge_ns > now_ns + 5000000ull) pump((uint32_t)((edge_ns - now_ns) / 1000000ull) - 5);
+            mock_now_ns = edge_ns - 400000ull + (uint64_t)step * 20000ull;        // -0.4 ms .. +0.8 ms around the edge
+            mock_read_step_ns = 250000;                                        // each read of the clock is 0.25 ms later
+            host_send(reqt(3, "mount", lease_token, mount_args()));
+            one_task();
+            mock_read_step_ns = 0;
+            task_max_ns = 0;
+            std::vector<std::string> got = host_lines();
+            J r;
+            bool refusal = got.size() == 1 && parse_response(got[0], r) && is_refusal(r, "E_PRECONDITION") && r["err"]["why"].is("NO_TERMINAL");
+            if (c.pres.waiting) waited++;
+            else if (refusal) refused++;
+            else on_credit++;
+            pump(50);
+        }
+        CHECK(waited == 0, "%d mounts arrived on a credit that lapsed between two reads of the clock and WAITED with no terminal", waited);
+        CHECK(on_credit > 0 && refused > 0, "the sweep did not straddle the edge: %d on the credit, %d refused", on_credit, refused);
+    }
+
     // The 60 s: at 59 s it runs on the credit, at 61 s it waits for an act.
     for (uint32_t after : { 59000u, 61000u }) {
         fresh("stage 4: the credit's 60 s");

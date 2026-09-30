@@ -1063,6 +1063,11 @@ static void tier_m_arrival(uint32_t id, const uint8_t digest[32], const ctlj_doc
     const char *why = 0, *field = 0, *msg = "";
     ctl_mreq_t m = { 0 };
     uint8_t retry = CTL_RETRY_SAFE;
+    // Whether the credit carries this mount is decided ONCE, from one reading of
+    // the clock: asked twice (review A LOW-1) a credit that lapsed between the
+    // two reads skipped the NO_TERMINAL check and then waited for an act.
+    const uint32_t now = now_ms();
+    const bool on_credit = r->op == CTL_OP_MOUNT && credit_live(now);
     int e = lease_check(d, r->token, &by);
     if (e != CTL_E_NONE) {
         msg = e == CTL_E_LEASE_REVOKED ? "that lease has ended" : e == CTL_E_NO_LEASE ? "no lease is held" : "not the lease's token";
@@ -1080,7 +1085,7 @@ static void tier_m_arrival(uint32_t id, const uint8_t digest[32], const ctlj_doc
             if (e != CTL_E_NONE) {
                 msg = "a precondition is not met";
                 if (e == CTL_E_STALE) retry = CTL_RETRY_AFTER_STATUS;
-            } else if (!(r->op == CTL_OP_MOUNT && credit_live(now_ms())) && !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {
+            } else if (!on_credit && !(cdc_connected && ctl_tui_state == CTL_TUI_MAIN)) {
                 // A request that would wait for its act is refused unless the
                 // person can see the presence row: the TUI on the main menu
                 // with a terminal connected (owner ruling 2026-09-29, review A
@@ -1098,8 +1103,7 @@ static void tier_m_arrival(uint32_t id, const uint8_t digest[32], const ctlj_doc
         if (slot >= 0) ctl_replay_finish(&c.replay, slot, c.resp, n);
         return;
     }
-    uint32_t now = now_ms();
-    if (r->op == CTL_OP_MOUNT && credit_live(now)) {
+    if (on_credit) {
         c.credit.live = false;                              // single use: taken now, checked again at pickup
         mailbox_put(CTL_OP_MOUNT, id, digest, &m, c.lease.gen, true, slot);
         return;

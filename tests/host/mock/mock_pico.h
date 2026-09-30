@@ -10,7 +10,12 @@
 // ---- virtual clock (nanoseconds) ------------------------------------------
 extern uint64_t mock_now_ns;
 typedef uint64_t absolute_time_t;
-static inline absolute_time_t get_absolute_time(void) { return mock_now_ns / 1000; }
+// Every read of the clock can move it on by mock_read_step_ns (0: never, the
+// default, so nothing changes). Only test_ctl's credit boundary test sets it:
+// the mock clock does not otherwise move inside one pass, so two reads of the
+// clock in one pass could never straddle a boundary (review A LOW-1).
+inline uint64_t mock_read_step_ns = 0;
+static inline absolute_time_t get_absolute_time(void) { uint64_t t = mock_now_ns; mock_now_ns += mock_read_step_ns; return t / 1000; }
 static inline uint32_t to_ms_since_boot(absolute_time_t t) { return (uint32_t)(t / 1000); }
 static inline uint64_t to_us_since_boot(absolute_time_t t) { return t; }
 static inline void busy_wait_us_32(uint32_t us) { mock_now_ns += (uint64_t)us * 1000; }
