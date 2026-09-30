@@ -480,6 +480,23 @@ static void one_line(std::string body, bool count_oracle) {
         if (!e.empty()) { violation(("envelope: " + e).c_str(), line, r); continue; }
         codes[j["outcome"].is("DONE") ? std::string("DONE") : j["err"]["code"].s]++;
         bool done = j["outcome"].is("DONE");
+        // Review delta-B R7: E_RATE carries the id of a well-formed over-limit
+        // request (a client reads a null id as a protocol violation); null only
+        // where the id cannot be read: a byte outside 0x20-0x7E, a line the
+        // grammar refuses, or an id that is not 1..CTL_MAX_ID.
+        if (j["err"]["code"].s == "E_RATE") {
+            static ctlj_doc_t rd;
+            bool readable = false;
+            uint64_t want = 0;
+            bool clean = true;
+            for (unsigned char ch : stripped) if (ch < 0x20 || ch > 0x7E) clean = false;
+            if (clean && ctlj_parse(stripped.data(), stripped.size(), &rd) != CTLJ_E_PARSE) {
+                int n = ctlj_find(&rd, 0, "id");
+                if (n >= 0 && rd.node[n].type == CTLJ_INT && rd.node[n].num >= 1 && rd.node[n].num <= CTL_MAX_ID) { readable = true; want = rd.node[n].num; }
+            }
+            if (readable && !(j["id"].t == J::INT && j["id"].n == want)) violation("E_RATE for a line with a readable id did not carry it", line, r);
+            if (!readable && j["id"].t != J::NUL) violation("E_RATE for a line with no readable id carries one", line, r);
+        }
         if (done && !j.get("replayed")) {
             static ctlj_doc_t pd;
             if (ctlj_parse(stripped.data(), stripped.size(), &pd) == CTLJ_OK) {

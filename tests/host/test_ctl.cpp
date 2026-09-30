@@ -499,8 +499,16 @@ static void test_rate() {
     for (int i = 1; i <= 21; i++) burst += req(i, "chip.info");
     std::vector<std::string> r = ask(burst, 200);
     int done = 0, rate = 0;
-    for (auto &l : r) { J k; if (parse_response(l, k)) { done += k["outcome"].is("DONE"); rate += is_refusal(k, "E_RATE"); } }
+    long long rate_id = -1;
+    for (auto &l : r) {
+        J k;
+        if (parse_response(l, k)) { done += k["outcome"].is("DONE"); if (is_refusal(k, "E_RATE")) { rate++; rate_id = k["id"].t == J::INT ? (long long)k["id"].n : 0; } }
+    }
     CHECK(r.size() == 21 && done == 20 && rate == 1, "%zu answers, %d DONE, %d E_RATE", r.size(), done, rate);
+    // Review delta-B R7: an over-limit well-formed request is answered under ITS
+    // OWN id (21), never id null: a client reads a null id as a protocol
+    // violation (DESYNC), and E_RATE is a retryable refusal.
+    CHECK(rate_id == 21, "the E_RATE answer to request 21 carries id %lld (0 = null)", rate_id);
     pump(1000);
     J k = ask1(req(30, "chip.info"));
     CHECK(k["outcome"].is("DONE"), "after the window");
@@ -543,8 +551,16 @@ static void test_rate() {
     for (int i = 1; i <= 6; i++) mix += req(i, "chip.info");
     r = ask(mix, 200);
     done = 0; rate = 0; pe = 0;
-    for (auto &l : r) { J q; if (parse_response(l, q)) { done += q["outcome"].is("DONE"); rate += is_refusal(q, "E_RATE"); pe += is_refusal(q, "E_PARSE"); } }
+    rate_id = -1;
+    for (auto &l : r) {
+        J q;
+        if (parse_response(l, q)) {
+            done += q["outcome"].is("DONE"); pe += is_refusal(q, "E_PARSE");
+            if (is_refusal(q, "E_RATE")) { rate++; rate_id = q["id"].t == J::INT ? (long long)q["id"].n : 0; }
+        }
+    }
     CHECK(r.size() == 21 && pe == 15 && done == 5 && rate == 1, "%zu answers: %d E_PARSE, %d DONE, %d E_RATE", r.size(), pe, done, rate);
+    CHECK(rate_id == 6, "the over-limit request (id 6) is answered E_RATE under id %lld (0 = null)", rate_id);
     // Empty lines are not requests: no answer and no count.
     fresh("rate: empty lines do not count");
     std::string blanks;
